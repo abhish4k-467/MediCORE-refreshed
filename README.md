@@ -5,12 +5,12 @@ Ingest supplier emails, extract attached PDF catalogs, normalize item data, rank
 ## Architecture
 
 - Backend: Python 3.12, FastAPI, uv
-- Workers: Celery with Redis broker
-- LLM: Groq chat completions
+- Workers: Celery with Valkey broker
+- LLM: OpenRouter chat completions
 - PDF extraction: PyMuPDF with pdfplumber fallback
 - Database: Supabase Postgres with pgvector
 - Storage: Supabase Storage for source PDFs
-- Cache/session: Redis
+- Cache/session: Valkey
 - Frontend: Next.js chat and dashboard UI
 - Dev email mode: IMAP polling
 - Production email mode: Gmail Pub/Sub push webhook
@@ -132,16 +132,40 @@ SUPABASE_DB_PASSWORD=your-database-password
 ### Applying Migrations
 Apply migrations using the Supabase SQL editor or direct CLI/TCP tools. The migration scripts in `supabase/migrations/` (such as `002_login_register.sql`) are designed to be fully idempotent, dropping old RLS policies automatically before recreating them to prevent conflicts.
 
+### VPS/Docker Valkey Configuration
+
+MediCORE uses Valkey as the Redis-compatible broker/cache for Celery and chat result caching. The Python dependency is still named `redis` because that is the standard Redis-protocol client and works with Valkey.
+
+Set these variables in production:
+
+```env
+VALKEY_PASSWORD=generate-a-long-random-secret
+VALKEY_URL=redis://:generate-a-long-random-secret@valkey:6379/0
+```
+
+If Valkey runs outside Docker, replace `valkey` with the Valkey host name or private IP. The Docker Compose file binds Valkey to `127.0.0.1:6379` for local terminal workers; do not bind it to `0.0.0.0` or expose port `6379` publicly.
+
+### OpenRouter Configuration
+
+MediCORE uses OpenRouter for extraction, supplier-email classification, query planning, and ProcuraAI answers.
+
+```env
+OPENROUTER_API_KEY=your-openrouter-api-key
+OPENROUTER_MODEL=openai/gpt-4o-mini
+OPENROUTER_SITE_URL=https://your-frontend-domain.com
+OPENROUTER_APP_NAME=MediCORE
+```
+
 ### Railway/Vercel Test Deployment:
 - Deploy FastAPI using `backend/Dockerfile`
-- Deploy Redis or use Upstash
+- Deploy Valkey or use a Redis-compatible managed service
 - Use Supabase free tier with pgvector enabled
 - Deploy `frontend` to Vercel
 - Inject environment variables from `.env.example`
 
 ### AWS Production Deployment:
 - Run API and Celery worker as separate ECS/Fargate services
-- Use ElastiCache or Upstash Redis
+- Use Valkey, ElastiCache, or another Redis-compatible broker
 - Use Supabase Pro, enable RLS policies in `supabase/migrations/`
 - Configure Gmail Pub/Sub webhook to `/webhooks/gmail`
 ## IMAP Email Test
@@ -169,7 +193,7 @@ uv run python -c "from backend.app.db import SessionLocal; from backend.app.serv
 Full worker test:
 
 ```powershell
-redis-cli ping
+docker compose exec valkey valkey-cli -a your-valkey-password ping
 uv run uvicorn backend.app.main:app --host 0.0.0.0 --reload --port 8000
 uv run python -m celery -A backend.app.tasks worker --loglevel=info --pool=solo
 ```

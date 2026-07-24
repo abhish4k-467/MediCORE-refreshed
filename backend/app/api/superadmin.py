@@ -8,6 +8,7 @@ from backend.app.auth import get_current_superadmin
 from backend.app.models import Profile, CatalogEmail, AIQueryLog
 from backend.app.services.email_sender import send_smtp_email
 from backend.app.config import get_settings
+from backend.app.security import escape_html
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -42,11 +43,13 @@ def approve_workspace(id: str, background_tasks: BackgroundTasks, db: Session = 
     admin_email = db.execute(text("SELECT email FROM auth.users WHERE id = :id"), {"id": id}).scalar()
     if admin_email:
         # Send approval notification email
+        safe_full_name = escape_html(profile.full_name)
+        safe_organisation = escape_html(profile.organisation)
         email_html = f"""
         <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#17211c;max-width:500px;margin:0 auto;padding:24px;border:1px solid #dce4df;border-radius:12px;">
           <h2 style="color:#0f7a5f;margin:0 0 16px 0;">Workspace Approved!</h2>
-          <p>Hi {profile.full_name},</p>
-          <p>Good news! Your workspace registration for <strong>{profile.organisation}</strong> has been approved by the MediCORE Superadmin.</p>
+          <p>Hi {safe_full_name},</p>
+          <p>Good news! Your workspace registration for <strong>{safe_organisation}</strong> has been approved by the MediCORE Superadmin.</p>
           <p>You can now log in to your dashboard and begin managing your suppliers.</p>
           <p style="margin:24px 0;">
             <a href="{settings.frontend_origin}/login" style="background-color:#0f7a5f;color:white;padding:12px 24px;text-decoration:none;border-radius:8px;font-weight:600;display:inline-block;">Log In to MediCORE</a>
@@ -140,21 +143,22 @@ def get_global_analytics(db: Session = Depends(get_db), current_user: dict = Dep
 
 @router.get("/telemetry")
 def get_engine_telemetry(current_user: dict = Depends(get_current_superadmin)):
-    """Retrieve Celery and Redis system telemetry."""
-    redis_status = "Offline"
+    """Retrieve Celery and Valkey system telemetry."""
+    valkey_status = "Offline"
     queue_backlog = 0
     
     try:
-        r = redis.Redis.from_url(settings.redis_url, socket_timeout=2)
+        r = redis.Redis.from_url(settings.queue_url, socket_timeout=2)
         r.ping()
-        redis_status = "Online"
+        valkey_status = "Online"
         queue_backlog = r.llen("celery") or 0
     except Exception as e:
-        logger.error(f"Failed to check Redis telemetry: {e}")
+        logger.error(f"Failed to check Valkey telemetry: {e}")
         
     return {
-        "redis_status": redis_status,
-        "celery_status": "Active" if redis_status == "Online" else "Inactive",
+        "valkey_status": valkey_status,
+        "redis_status": valkey_status,
+        "celery_status": "Active" if valkey_status == "Online" else "Inactive",
         "queue_backlog": queue_backlog,
         "avg_processing_speed": "4.2s / catalog",
         "engine_version": "v1.2.0"

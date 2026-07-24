@@ -8,7 +8,7 @@ from redis.exceptions import RedisError
 from sqlalchemy.orm import Session
 
 from backend.app.schemas import ChatResponse
-from backend.app.services.llm import GroqClient
+from backend.app.services.llm import OpenRouterClient
 from backend.app.services.query_whitelist import validate_operation
 from backend.app.services.ranking import SupplierRanker
 
@@ -17,7 +17,7 @@ class NaturalLanguageQueryEngine:
     def __init__(self, db: Session, cache: Redis) -> None:
         self.db = db
         self.cache = cache
-        self.llm = GroqClient()
+        self.llm = OpenRouterClient()
         self.ranker = SupplierRanker(db)
 
     def _answer(
@@ -26,7 +26,7 @@ class NaturalLanguageQueryEngine:
         tenant_id: Any | None = None,
         user_id: Any | None = None,
     ) -> ChatResponse:
-        cache_key = f"chat:answer:v4:{tenant_id}:{question.strip().lower()}"
+        cache_key = f"chat:answer:v9:{tenant_id}:{question.strip().lower()}"
         cached = self._cache_get(cache_key)
         if cached:
             payload = json.loads(cached)
@@ -46,11 +46,15 @@ class NaturalLanguageQueryEngine:
             )
 
         validate_operation(plan.operation)
+        plan = self._ground_plan_in_catalog(question, plan, tenant_id=tenant_id)
         self._log_query(question, tenant_id=tenant_id, user_id=user_id, operation_type=plan.operation)
         rows = self._execute_plan(plan, tenant_id=tenant_id)
+        rows = self.ranker._dedupe_supplier_item_rows(rows, plan.normalized_name)
         try:
             answer = self.llm.summarize_answer(question, rows)
         except Exception:
+            answer = self._fallback_summary(question, rows)
+        if rows and self._looks_like_false_negative(answer):
             answer = self._fallback_summary(question, rows)
         response = ChatResponse(answer=answer, rows=rows)
         self._cache_set(cache_key, response.model_dump_json())
@@ -98,6 +102,66 @@ class NaturalLanguageQueryEngine:
             return self.ranker.ranked_items(plan, tenant_id=tenant_id)
         return []
 
+    def _looks_like_false_negative(self, answer: str) -> bool:
+        lowered = (answer or "").lower()
+        return any(
+            phrase in lowered
+            for phrase in (
+                "couldn't find",
+                "could not find",
+                "no matching",
+                "no data",
+                "not find any",
+                "couldn't locate",
+            )
+        )
+
+    def _ground_plan_in_catalog(self, question: str, plan, tenant_id: Any | None = None):
+        matched_item = self._match_catalog_item_name(question, tenant_id=tenant_id)
+        if matched_item:
+            return plan.model_copy(update={"normalized_name": matched_item, "operation": plan.operation if plan.operation != "supplier_activity" else "catalog_search"})
+        return plan
+
+    def _match_catalog_item_name(self, question: str, tenant_id: Any | None = None) -> str | None:
+        from uuid import UUID
+        from backend.app.models import CatalogItem
+
+        normalized_question = re.sub(r"[^a-z0-9\s]+", " ", question.lower())
+        query_tokens = {
+            token
+            for token in normalized_question.split()
+            if len(token) >= 3 and token not in {"find", "give", "supplier", "suppliers", "price", "sort", "show", "best", "for", "and", "the"}
+        }
+        if not query_tokens:
+            return None
+
+        query = self.db.query(CatalogItem.normalized_name, CatalogItem.ingredient_name).distinct()
+        if tenant_id:
+            query = query.filter(CatalogItem.tenant_id == (UUID(str(tenant_id)) if isinstance(tenant_id, str) else tenant_id))
+
+        best_name: str | None = None
+        best_score = 0
+        for normalized_name, ingredient_name in query.limit(500):
+            candidates = [normalized_name or "", ingredient_name or ""]
+            for candidate in candidates:
+                candidate_lower = candidate.lower()
+                candidate_tokens = {
+                    token
+                    for token in re.sub(r"[^a-z0-9\s]+", " ", candidate_lower).split()
+                    if len(token) >= 3
+                }
+                overlap = query_tokens & candidate_tokens
+                score = len(overlap) * 10
+                if candidate_lower and candidate_lower in normalized_question:
+                    score += 100
+                if any(token in candidate_lower for token in query_tokens):
+                    score += 25
+                if score > best_score:
+                    best_score = score
+                    best_name = normalized_name or ingredient_name
+
+        return best_name if best_score >= 10 else None
+
     def _cache_get(self, key: str) -> str | None:
         try:
             return self.cache.get(key)
@@ -116,6 +180,8 @@ class NaturalLanguageQueryEngine:
         normalized_question = question.lower()
         known_items = [
             "ascorbic acid",
+            "nicotinamide",
+            "vitamin b3",
             "paracetamol",
             "citric acid",
             "sodium benzoate",
@@ -142,18 +208,35 @@ class NaturalLanguageQueryEngine:
             return "I couldn't find any matching data or records in the database for your query. Please check the spelling or try searching for another supplier or chemical ingredient."
 
         best = rows[0]
+        price = best.get("price_display") or (
+            f"{best.get('price_per_unit')} {best.get('currency')}/{best.get('unit')}"
+            if best.get("price_per_unit") is not None
+            else "price not mentioned"
+        )
+        qty = best.get("quantity_display") or (
+            f"{best.get('available_qty')} {best.get('unit')}"
+            if best.get("available_qty") is not None
+            else "quantity not mentioned"
+        )
         lines = [
             (
-                f"Best: {best['supplier_name']} - {best['normalized_name']} at "
-                f"{best['price_per_unit']} {best['currency']}/{best['unit']}, "
-                f"{best['available_qty']} {best['unit']} available."
+                f"Found {self._display_item_name(best)} from {best.get('supplier_name')}: "
+                f"{price}, {qty} available."
             ),
-            f"Why: lowest ranked price.",
+            "Sorted by available catalogue price.",
         ]
         if len(rows) > 1:
             next_best = rows[1]
+            next_price = next_best.get("price_display") or (
+                f"{next_best.get('price_per_unit')} {next_best.get('currency')}/{next_best.get('unit')}"
+                if next_best.get("price_per_unit") is not None
+                else "price not mentioned"
+            )
             lines.append(
-                f"Next: {next_best['supplier_name']} at "
-                f"{next_best['price_per_unit']} {next_best['currency']}/{next_best['unit']}."
+                f"Next: {next_best.get('supplier_name')} at {next_price}."
             )
         return "\n".join(lines)
+
+    def _display_item_name(self, row: dict[str, Any]) -> str:
+        name = row.get("normalized_name") or row.get("ingredient_name") or "item"
+        return f"{name} (U)" if row.get("is_updated") else str(name)

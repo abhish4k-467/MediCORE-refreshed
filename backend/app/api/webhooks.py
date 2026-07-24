@@ -1,3 +1,5 @@
+import secrets
+
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from backend.app.config import get_settings
@@ -12,7 +14,9 @@ async def gmail_push(
     x_webhook_token: str | None = Header(default=None),
 ) -> dict[str, str]:
     settings = get_settings()
-    if settings.gmail_webhook_token and x_webhook_token != settings.gmail_webhook_token:
+    if not settings.gmail_webhook_token:
+        raise HTTPException(status_code=503, detail="Webhook is not configured")
+    if not x_webhook_token or not secrets.compare_digest(x_webhook_token, settings.gmail_webhook_token):
         raise HTTPException(status_code=401, detail="Invalid webhook token")
 
     payload = await request.json()

@@ -67,36 +67,11 @@ def get_current_user(
                 if admin_profile and admin_profile.status == "Disabled":
                     status_str = "Disabled"
         else:
-            meta = response.user.user_metadata or {}
-            role_val = meta.get("role", "admin")
-            if role_val == "employee":
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You are not authorised to use MediCORE"
-                )
-            try:
-                from uuid import UUID as PyUUID
-                tenant_val = meta.get("tenant_id")
-                tenant_uuid = PyUUID(tenant_val) if tenant_val else user_uuid
-                
-                profile = Profile(
-                    id=user_uuid,
-                    full_name=meta.get("full_name", "") or response.user.email.split("@")[0],
-                    organisation=meta.get("organisation", "MediCORE Organisation"),
-                    role=role_val,
-                    tenant_id=tenant_uuid,
-                    status="Active"
-                )
-                db.add(profile)
-                db.commit()
-                db.refresh(profile)
-                logger.info(f"Self-healed missing profile for user {user_uuid}")
-                custom_role = profile.role or "admin"
-                tenant_id = str(profile.tenant_id)
-                status_str = profile.status or "Active"
-            except Exception as se:
-                db.rollback()
-                logger.error(f"Failed to auto-create profile: {se}")
+            logger.warning("Authenticated user %s has no server-side profile", user_uuid)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are not authorised to use MediCORE"
+            )
             
         if status_str in ("Disabled", "Pending Approval"):
             detail_msg = "You are not authorised to use MediCORE"

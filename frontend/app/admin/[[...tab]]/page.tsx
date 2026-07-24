@@ -64,20 +64,29 @@ export default function AdminWorkspacePage({ params }: { params: Promise<{ tab?:
 
   useEffect(() => {
     // Verify session and role on component mount
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
       if (!session) {
         router.push("/login");
         return;
       }
-      
-      const role = session.user.user_metadata?.role;
-      if (role !== "admin") {
+
+      try {
+        const response = await fetch(`${getApiUrl()}/api/profile`, {
+          headers: { Authorization: `Bearer ${session.access_token}` },
+        });
+        if (!response.ok) {
+          throw new Error("Profile verification failed.");
+        }
+        const profile = await response.json();
+        if (profile.role !== "admin") {
+          router.push(profile.role === "superadmin" ? "/superadmin" : "/login");
+          return;
+        }
+        setAdminName(profile.full_name || session.user.email?.split("@")[0] || "Admin");
+        setSessionLoading(false);
+      } catch {
         router.push("/login");
-        return;
       }
-      
-      setAdminName(session.user.user_metadata?.full_name || "Admin");
-      setSessionLoading(false);
     });
   }, [router]);
 

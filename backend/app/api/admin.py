@@ -12,6 +12,7 @@ from backend.app.auth import get_current_admin, get_current_user
 from backend.app.models import Profile, Supplier, CatalogItem, CatalogEmail, EmployeeInvitation, PasswordReset, EmailAccount, AIQueryLog
 from backend.app.services.email_sender import send_smtp_email
 from backend.app.config import get_settings
+from backend.app.security import escape_html
 from fastapi import BackgroundTasks
 
 router = APIRouter()
@@ -181,14 +182,16 @@ def invite_employee(
     
     admin_profile = db.query(Profile).filter(Profile.id == admin_uuid).first()
     org_name = admin_profile.organisation if (admin_profile and admin_profile.organisation) else "MediCORE"
+    safe_payload_name = escape_html(payload.name)
+    safe_org_name = escape_html(org_name)
 
     # Send invitation email via background Celery task
     activation_link = f"{settings.frontend_origin}/activate?token={token}"
     email_html = f"""
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#17211c;max-width:500px;margin:0 auto;padding:24px;border:1px solid #dce4df;border-radius:12px;">
       <h2 style="color:#0f7a5f;margin:0 0 16px 0;">You're invited to join MediCORE</h2>
-      <p>Hi {payload.name},</p>
-      <p>You've been invited to use MediCORE by {org_name}.</p>
+      <p>Hi {safe_payload_name},</p>
+      <p>You've been invited to use MediCORE by {safe_org_name}.</p>
       <p style="margin:24px 0;">
         <a href="{activation_link}" style="background-color:#0f7a5f;color:white;padding:12px 24px;text-decoration:none;border-radius:8px;font-weight:600;display:inline-block;">Activate Account</a>
       </p>
@@ -261,7 +264,7 @@ def complete_activation(payload: CompleteActivationRequest, db: Session = Depend
         err_msg = str(e)
         if "already exists" in err_msg.lower() or "unique" in err_msg.lower():
             raise HTTPException(status_code=400, detail="An account with this email address has already been created.")
-        raise HTTPException(status_code=500, detail=f"Failed to activate account: {err_msg}")
+        raise HTTPException(status_code=500, detail="Failed to activate account.")
 
 
 # 5. List Employees for current admin's organisation
@@ -478,10 +481,11 @@ def reset_password(
         raise HTTPException(status_code=400, detail="Could not determine user email for password reset notification.")
         
     reset_link = f"{settings.frontend_origin}/reset-password?token={token}"
+    safe_profile_name = escape_html(profile.full_name)
     email_html = f"""
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#17211c;max-width:500px;margin:0 auto;padding:24px;border:1px solid #dce4df;border-radius:12px;">
       <h2 style="color:#0f7a5f;margin:0 0 16px 0;">Reset Your MediCORE Password</h2>
-      <p>Hi {profile.full_name},</p>
+      <p>Hi {safe_profile_name},</p>
       <p>Your administrator has requested a password reset for your MediCORE account.</p>
       <p style="margin:24px 0;">
         <a href="{reset_link}" style="background-color:#0f7a5f;color:white;padding:12px 24px;text-decoration:none;border-radius:8px;font-weight:600;display:inline-block;">Reset Password</a>
@@ -530,4 +534,4 @@ def complete_password_reset(payload: ResetPasswordCompleteRequest, db: Session =
         return {"success": True, "message": "Password updated successfully."}
     except Exception as e:
         logger.error("Failed to update password in Supabase: %s", e)
-        raise HTTPException(status_code=500, detail=f"Failed to reset password: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to reset password.")

@@ -1,8 +1,10 @@
 import email
 import email.utils
 from email.header import decode_header
+from html.parser import HTMLParser
 import imaplib
 import logging
+import re
 import tempfile
 
 import httpx
@@ -17,14 +19,60 @@ from sqlalchemy.orm import Session
 from backend.app.config import get_settings
 from backend.app.db import get_supabase
 from backend.app.models import CatalogEmail, CatalogItem, Supplier
-from backend.app.services.catalog_table_parser import extract_pack_size, parse_catalog_table_text
+from backend.app.services.catalog_table_parser import (
+    CATALOG_TABLE_PARSER_VERSION,
+    extract_pack_size,
+    parse_catalog_table_text,
+)
 from backend.app.services.embeddings import embed_catalog_item_text
 from backend.app.services.gmail_api import GmailApiClient
-from backend.app.services.llm import GroqClient
+from backend.app.services.llm import OpenRouterClient
 from backend.app.services.normalizer import normalize_item
 from backend.app.services.pdf_extract import extract_pdf_text
+from backend.app.schemas import clean_optional_text
 
 logger = logging.getLogger(__name__)
+
+MAX_DOCUMENT_BYTES = 30 * 1024 * 1024
+
+SUPPLIER_INTENT_TERMS = (
+    "catalog",
+    "catalogue",
+    "price",
+    "pricing",
+    "quote",
+    "quotation",
+    "rfq",
+    "offer",
+    "coa",
+    "certificate of analysis",
+    "specification",
+    "availability",
+    "stock",
+    "ingredient",
+    "chemical",
+    "api",
+    "excipient",
+    "raw material",
+    "bulk",
+)
+
+IRRELEVANT_MAIL_TERMS = (
+    "unsubscribe",
+    "newsletter",
+    "webinar",
+    "event",
+    "promotion",
+    "promotional",
+    "marketing",
+    "sale ends",
+    "limited time",
+    "digest",
+    "no-reply",
+    "noreply",
+    "do-not-reply",
+    "donotreply",
+)
 
 
 def get_supplier_domain(sender: str) -> str:
@@ -45,14 +93,29 @@ def get_supplier_domain(sender: str) -> str:
 def _nullable_float(value: Any) -> float | None:
     if value is None:
         return None
-    return round(float(value), 2)
+    return float(value)
+
+
+class _HTMLTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        cleaned = " ".join(data.split())
+        if cleaned:
+            self.parts.append(cleaned)
+
+    def text(self) -> str:
+        return "\n".join(self.parts)
 
 
 class EmailIngestionService:
     def __init__(self, db: Session) -> None:
         self.db = db
         self.settings = get_settings()
-        self.llm = GroqClient()
+        self.llm = OpenRouterClient()
+        logger.info("MediCORE extraction engine ready: parser=%s", CATALOG_TABLE_PARSER_VERSION)
 
     def _extract_sender(self, message: Message) -> tuple[str, str]:
         from_header = message.get("From", "")
@@ -182,7 +245,6 @@ class EmailIngestionService:
         gmail = GmailApiClient()
         for message_id, message in gmail.fetch_unread_pdf_messages():
             processed += self._process_message(message, raw_email_id=message_id)
-            gmail.mark_read(message_id)
         return processed
 
     def _process_message(
@@ -212,7 +274,7 @@ class EmailIngestionService:
                     "mime_type": att["mime_type"],
                     "is_body": False
                 })
-            if not parse_targets and body_text.strip():
+            if body_text.strip():
                 parse_targets.append({
                     "name": "email_body.txt",
                     "payload": body_text.encode("utf-8"),
@@ -227,6 +289,30 @@ class EmailIngestionService:
 
         supplier = self._upsert_supplier(sender, display_name=display_name, tenant_id=tenant_id)
         count = 0
+        active_tenant_id = tenant_id or supplier.tenant_id
+        catalog_email = (
+            self.db.query(CatalogEmail)
+            .filter(CatalogEmail.raw_email_id == raw_email_id)
+            .filter(CatalogEmail.tenant_id == active_tenant_id)
+            .first()
+        )
+        if catalog_email:
+            logger.info("Reprocessing existing source email record id=%s", raw_email_id)
+            catalog_email.processing_status = "processing"
+            catalog_email.subject = subject
+        else:
+            catalog_email = CatalogEmail(
+                id=uuid4(),
+                tenant_id=active_tenant_id,
+                supplier_id=supplier.id,
+                raw_email_id=raw_email_id,
+                subject=subject,
+                pdf_url=None,
+                received_at=email_date,
+                processing_status="processing",
+            )
+            self.db.add(catalog_email)
+        self.db.flush()
 
         for target in parse_targets:
             target_name = str(target["name"]).replace("\\", "/").split("/")[-1].strip()
@@ -235,38 +321,17 @@ class EmailIngestionService:
             payload = target["payload"]
             ext = target["ext"]
             mime_type = target["mime_type"]
+            if len(payload) > MAX_DOCUMENT_BYTES:
+                logger.warning("Skipping %s because it exceeds the 30 MB processing limit", target_name)
+                continue
 
             logger.info("Processing target %s (%s bytes)", target_name, len(payload))
             with tempfile.TemporaryDirectory() as tmp_dir:
                 file_path = Path(tmp_dir) / target_name
                 file_path.write_bytes(payload)
-                attachment_email_id = f"{raw_email_id}:{target_name}"
-                catalog_email = (
-                    self.db.query(CatalogEmail)
-                    .filter(CatalogEmail.raw_email_id == attachment_email_id)
-                    .filter(CatalogEmail.tenant_id == (tenant_id or supplier.tenant_id))
-                    .first()
-                )
-                if catalog_email:
-                    logger.info("Reprocessing existing email record id=%s with no extracted items", attachment_email_id)
-                    catalog_email.processing_status = "processing"
-                    catalog_email.subject = subject
-                    if not catalog_email.pdf_url:
-                        catalog_email.pdf_url = self._upload_file(file_path, raw_email_id, mime_type)
-                else:
-                    pdf_url = self._upload_file(file_path, raw_email_id, mime_type)
-                    catalog_email = CatalogEmail(
-                        id=uuid4(),
-                        tenant_id=tenant_id or supplier.tenant_id,
-                        supplier_id=supplier.id,
-                        raw_email_id=attachment_email_id,
-                        subject=subject,
-                        pdf_url=pdf_url,
-                        received_at=email_date,
-                        processing_status="processing",
-                    )
-                    self.db.add(catalog_email)
-                self.db.flush()
+                uploaded_url = self._upload_file(file_path, raw_email_id, mime_type)
+                if not catalog_email.pdf_url:
+                    catalog_email.pdf_url = uploaded_url
 
                 text = self._extract_text_from_file(file_path, ext)
                 logger.info("Extracted %s characters of text from %s", len(text), target_name)
@@ -275,9 +340,20 @@ class EmailIngestionService:
                     target_name,
                     reference_date=catalog_email.received_at,
                 )
-                count += self._store_catalog_items(catalog_email, supplier, extracted, text, tenant_id=tenant_id)
-                catalog_email.processing_status = "completed"
-                self._touch_supplier_last_email(supplier, catalog_email.received_at)
+                count += self._store_catalog_items(
+                    catalog_email,
+                    supplier,
+                    extracted,
+                    text,
+                    tenant_id=tenant_id,
+                    source_name=target_name,
+                )
+        if count > 0:
+            catalog_email.processing_status = "completed"
+            self._touch_supplier_last_email(supplier, catalog_email.received_at)
+        else:
+            catalog_email.processing_status = "empty"
+            logger.warning("No catalogue rows were stored for email id=%s", raw_email_id)
         self.db.commit()
         logger.info("Committed %s catalogue item(s) for email id=%s", count, raw_email_id)
         return count
@@ -317,6 +393,9 @@ class EmailIngestionService:
                 file_path = Path(tmp_dir) / f"{catalog_email.id}{ext}"
                 response = httpx.get(catalog_email.pdf_url, timeout=60)
                 response.raise_for_status()
+                if len(response.content) > MAX_DOCUMENT_BYTES:
+                    logger.warning("Skipping reprocess for %s because stored file exceeds 30 MB", catalog_email.raw_email_id)
+                    continue
                 file_path.write_bytes(response.content)
                 catalog_email.processing_status = "processing"
                 if force:
@@ -358,58 +437,196 @@ class EmailIngestionService:
                 logger.exception("LLM extraction failed for %s", source_name)
                 return []
 
+        parser_text = self._preferred_parser_text(text)
+
         # Otherwise, try the OCR regex table parser first for structured catalogs
         parsed = [
             normalize_item(item)
-            for item in parse_catalog_table_text(text, reference_date=reference_date)
+            for item in parse_catalog_table_text(parser_text, reference_date=reference_date)
         ]
+        parsed = self._dedupe_extracted_items(parsed)
         logger.info("OCR table parser extracted %s catalogue row(s) from %s", len(parsed), source_name)
-        if parsed:
+
+        if len(parsed) >= 20:
+            logger.info(
+                "Using %s deterministic parser row(s) for structured catalogue %s; skipping LLM fallback",
+                len(parsed),
+                source_name,
+            )
+            return parsed
+
+        if not getattr(self, "llm", None):
             return parsed
 
         try:
-            extracted = [normalize_item(item) for item in self.llm.extract_catalog_items(text, reference_date=reference_date)]
+            llm_items = [normalize_item(item) for item in self.llm.extract_catalog_items(text, reference_date=reference_date)]
+            extracted = self._dedupe_extracted_items([*parsed, *llm_items])
             logger.info("LLM fallback extracted %s catalogue row(s) from %s", len(extracted), source_name)
             return extracted
         except Exception:
             logger.exception("LLM extraction failed for %s", source_name)
-            return []
+            return parsed
 
-    def _store_catalog_items(self, catalog_email: CatalogEmail, supplier: Supplier, items, text: str, tenant_id: Any | None = None) -> int:
+    def _preferred_parser_text(self, text: str) -> str:
+        marker = "[GRID CELL TABLE OCR]\n"
+        if marker not in text:
+            return text
+        grid_text = text.split(marker, 1)[1].split("\n\n", 1)[0].strip()
+        return grid_text or text
+
+    def _dedupe_extracted_items(self, items) -> list:
+        deduped = []
+        seen: set[tuple] = set()
+        for item in items:
+            key = (
+                (item.normalized_name or item.ingredient_name).strip().lower(),
+                str(item.price_per_unit),
+                (item.currency or "").upper(),
+                str(item.available_qty) if item.available_qty is not None else None,
+                (item.unit or "").strip().lower(),
+                item.lead_time_text or item.lead_time_days,
+                str(item.moq) if item.moq is not None else None,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    def _store_catalog_items(
+        self,
+        catalog_email: CatalogEmail,
+        supplier: Supplier,
+        items,
+        text: str,
+        tenant_id: Any | None = None,
+        source_name: str | None = None,
+    ) -> int:
         count = 0
         active_tenant_id = tenant_id or supplier.tenant_id
         for item in items:
-            # Store all extracted items to maintain full historical snapshots of catalog emails
-            # and ensure they are not filtered out of lists.
+            item = self._with_source_note(item, text)
+            if not self._has_required_grounded_values(item):
+                logger.warning(
+                    "Skipping extracted item with missing required grounded values: %s",
+                    item.model_dump(mode="json"),
+                )
+                continue
+
+            if not self._catalog_item_changed(catalog_email, supplier, item, active_tenant_id):
+                logger.info(
+                    "Skipping unchanged catalogue item supplier=%s item=%s",
+                    supplier.email_domain,
+                    item.normalized_name or item.ingredient_name,
+                )
+                continue
+
             item_text = (
                 f"{item.normalized_name} {item.ingredient_name} "
                 f"{item.available_qty} {item.unit} {item.price_per_unit} {item.currency}"
             )
-            raw_payload = item.model_dump(mode="json")
+            raw_payload = self._compact_payload(item.model_dump(mode="json"))
             raw_payload["source"] = "email_extracted_catalogue"
-            raw_payload["pack_size"] = self._pack_size_for_item(text, item.ingredient_name)
-            raw_payload.update(self._notes_payload(item.notes))
-            self.db.add(
-                CatalogItem(
-                    id=uuid4(),
-                    tenant_id=active_tenant_id,
-                    catalog_email_id=catalog_email.id,
-                    supplier_id=supplier.id,
-                    ingredient_name=item.ingredient_name,
-                    normalized_name=item.normalized_name or item.ingredient_name.lower(),
-                    price_per_unit=item.price_per_unit,
-                    currency=item.currency,
-                    available_qty=item.available_qty,
-                    unit=item.unit,
-                    valid_until=item.valid_until,
-                    lead_time_days=item.lead_time_days,
-                    moq=item.moq,
-                    embedding=self._safe_embedding(item_text),
-                    raw_payload=raw_payload,
+            if clean_optional_text(source_name):
+                raw_payload["source_document"] = clean_optional_text(source_name)
+            pack_size = clean_optional_text(self._pack_size_for_item(text, item.ingredient_name))
+            if pack_size:
+                raw_payload["pack_size"] = pack_size
+            raw_payload.update(self._compact_payload(self._notes_payload(item.notes)))
+            raw_payload.update(self._compact_payload(self._exact_display_payload(item, text)))
+            existing_item = self._single_existing_supplier_item(catalog_email, supplier, item, active_tenant_id)
+            if existing_item:
+                logger.info(
+                    "Updating existing catalogue item supplier=%s item=%s from email id=%s",
+                    supplier.email_domain,
+                    item.normalized_name or item.ingredient_name,
+                    catalog_email.raw_email_id,
                 )
-            )
+                raw_payload["is_updated"] = True
+                existing_item.catalog_email_id = catalog_email.id
+                existing_item.ingredient_name = item.ingredient_name
+                existing_item.normalized_name = item.normalized_name or item.ingredient_name.lower()
+                existing_item.price_per_unit = item.price_per_unit
+                existing_item.currency = item.currency
+                existing_item.available_qty = item.available_qty
+                existing_item.unit = item.unit
+                existing_item.valid_until = item.valid_until
+                existing_item.lead_time_days = item.lead_time_days
+                existing_item.moq = item.moq
+                existing_item.embedding = self._safe_embedding(item_text)
+                existing_item.raw_payload = raw_payload
+            else:
+                self.db.add(
+                    CatalogItem(
+                        id=uuid4(),
+                        tenant_id=active_tenant_id,
+                        catalog_email_id=catalog_email.id,
+                        supplier_id=supplier.id,
+                        ingredient_name=item.ingredient_name,
+                        normalized_name=item.normalized_name or item.ingredient_name.lower(),
+                        price_per_unit=item.price_per_unit,
+                        currency=item.currency,
+                        available_qty=item.available_qty,
+                        unit=item.unit,
+                        valid_until=item.valid_until,
+                        lead_time_days=item.lead_time_days,
+                        moq=item.moq,
+                        embedding=self._safe_embedding(item_text),
+                        raw_payload=raw_payload,
+                    )
+                )
             count += 1
         return count
+
+    def _with_source_note(self, item, text: str):
+        notes = item.notes or ""
+        if "source=" in notes.lower() or "source:" in notes.lower():
+            return item
+
+        ingredient = (item.ingredient_name or item.normalized_name or "").lower()
+        if item.price_per_unit is None:
+            for line in text.splitlines():
+                normalized_line = " ".join(line.split())
+                if ingredient and ingredient in normalized_line.lower():
+                    safe_line = normalized_line[:500].replace("'", "")
+                    joined_notes = f"{notes}; source='{safe_line}'" if notes else f"source='{safe_line}'"
+                    return item.model_copy(update={"notes": joined_notes})
+            return item
+        for line in text.splitlines():
+            normalized_line = " ".join(line.split())
+            line_lower = normalized_line.lower()
+            if ingredient and ingredient in line_lower and self._price_appears_in_line(item.price_per_unit, normalized_line):
+                safe_line = normalized_line[:500].replace("'", "")
+                joined_notes = f"{notes}; source='{safe_line}'" if notes else f"source='{safe_line}'"
+                return item.model_copy(update={"notes": joined_notes})
+        return item
+
+    def _price_appears_in_line(self, value: Any, line: str) -> bool:
+        try:
+            number = float(value)
+        except Exception:
+            return False
+
+        compact_line = line.replace(",", "")
+        variants = {
+            str(int(number)) if number.is_integer() else str(number).rstrip("0").rstrip("."),
+            f"{number:.2f}",
+            f"{number:.4f}".rstrip("0").rstrip("."),
+        }
+        return any(variant in compact_line for variant in variants)
+
+    def _has_required_grounded_values(self, item) -> bool:
+        if not (item.ingredient_name or "").strip():
+            return False
+        if item.price_per_unit is not None and float(item.price_per_unit) <= 0:
+            return False
+        if item.available_qty is not None and float(item.available_qty) < 0:
+            return False
+        if item.available_qty is not None and not (item.unit or "").strip():
+            return False
+        notes = (item.notes or "").lower()
+        grounded_markers = ("source=", "source:", "original_price=", "original_quantity=", "lead_time=")
+        return any(marker in notes for marker in grounded_markers)
 
     def _catalog_item_changed(
         self,
@@ -436,14 +653,38 @@ class EmailIngestionService:
 
         return any(
             [
-                round(float(previous.price_per_unit), 4) != round(float(item.price_per_unit), 4),
+                _nullable_float(previous.price_per_unit) != _nullable_float(item.price_per_unit),
                 (previous.currency or "").upper() != (item.currency or "").upper(),
-                round(float(previous.available_qty), 2) != round(float(item.available_qty or 0), 2),
+                _nullable_float(previous.available_qty) != _nullable_float(item.available_qty),
                 (previous.unit or "").lower() != (item.unit or "").lower(),
                 (previous.lead_time_days or None) != (item.lead_time_days or None),
+                (previous.raw_payload or {}).get("lead_time_text") != (item.lead_time_text or None),
                 _nullable_float(previous.moq) != _nullable_float(item.moq),
             ]
         )
+
+    def _single_existing_supplier_item(
+        self,
+        catalog_email: CatalogEmail,
+        supplier: Supplier,
+        item,
+        tenant_id: Any,
+    ) -> CatalogItem | None:
+        normalized_name = item.normalized_name or item.ingredient_name.lower()
+        previous_items = (
+            self.db.query(CatalogItem)
+            .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
+            .filter(
+                CatalogItem.tenant_id == tenant_id,
+                CatalogItem.supplier_id == supplier.id,
+                CatalogItem.normalized_name == normalized_name,
+                CatalogItem.catalog_email_id != catalog_email.id,
+            )
+            .order_by(CatalogEmail.received_at.desc())
+            .limit(2)
+            .all()
+        )
+        return previous_items[0] if len(previous_items) == 1 else None
 
     def _touch_supplier_last_email(self, supplier: Supplier, received_at: datetime) -> None:
         if supplier.last_email_date is None or received_at > supplier.last_email_date:
@@ -470,8 +711,96 @@ class EmailIngestionService:
         for part in notes.split(";"):
             key, separator, value = part.strip().partition("=")
             if separator and key and value:
-                payload[key.strip()] = value.strip()
+                cleaned_value = clean_optional_text(value.strip().strip("'\""))
+                if cleaned_value:
+                    payload[key.strip()] = cleaned_value
         return payload
+
+    def _compact_payload(self, payload: dict) -> dict:
+        cleaned: dict = {}
+        for key, value in payload.items():
+            if isinstance(value, str):
+                cleaned_value = clean_optional_text(value)
+                if cleaned_value is not None:
+                    cleaned[key] = cleaned_value
+            elif value is not None:
+                cleaned[key] = value
+        return cleaned
+
+    def _exact_display_payload(self, item, text: str) -> dict[str, str]:
+        payload: dict[str, str] = {}
+        notes_payload = self._notes_payload(item.notes)
+
+        if item.lead_time_text:
+            payload["lead_time_text"] = str(item.lead_time_text)
+        elif notes_payload.get("lead_time"):
+            payload["lead_time_text"] = notes_payload["lead_time"]
+
+        source_price = self._source_number_text(text, item.ingredient_name, item.price_per_unit)
+        payload["price_display"] = self._richer_display_value(notes_payload.get("original_price"), source_price)
+
+        source_quantity = self._source_number_text(text, item.ingredient_name, item.available_qty)
+        if notes_payload.get("original_quantity"):
+            original_quantity = notes_payload["original_quantity"]
+            if item.unit and not re.search(r"[A-Za-z]", original_quantity):
+                note_quantity = f"{original_quantity} {item.unit}"
+            else:
+                note_quantity = original_quantity
+            payload["quantity_display"] = self._richer_display_value(note_quantity, source_quantity)
+        else:
+            payload["quantity_display"] = source_quantity
+
+        if item.moq is not None:
+            payload["moq_display"] = notes_payload.get("moq") or str(item.moq)
+        return {key: value for key, value in payload.items() if value}
+
+    def _richer_display_value(self, preferred: str | None, fallback: str | None) -> str | None:
+        preferred = clean_optional_text(preferred)
+        fallback = clean_optional_text(fallback)
+        if not preferred:
+            return fallback
+        if not fallback:
+            return preferred
+
+        def richness(value: str) -> int:
+            score = len(value)
+            if re.search(r"(?:USD|INR|EUR|GBP|AED|CNY|JPY|CAD|AUD|SGD|CHF|Rs\.?|₹|\$|€|£)", value, flags=re.IGNORECASE):
+                score += 30
+            if "/" in value or re.search(r"\b(?:kg|g|mg|lb|bag|drum|mt|ton)\b", value, flags=re.IGNORECASE):
+                score += 20
+            if "(" in value and ")" in value:
+                score += 10
+            return score
+
+        return fallback if richness(fallback) > richness(preferred) else preferred
+
+    def _source_number_text(self, text: str, ingredient_name: str, value: Any) -> str | None:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except Exception:
+            return None
+        exact_value = str(numeric).rstrip("0").rstrip(".")
+        for line in text.splitlines():
+            if ingredient_name.lower() not in line.lower():
+                continue
+            compact = line.replace(",", "")
+            match = re.search(rf"(?<!\d){re.escape(exact_value)}(?:\.0+)?(?!\d)", compact)
+            if match:
+                value_text = match.group(0)
+                display_match = re.search(
+                    rf"(?:(?:USD|INR|EUR|GBP|AED|CNY|JPY|CAD|AUD|SGD|CHF|Rs\.?|₹|\$|€|£)\s*)?"
+                    rf"{re.escape(value_text)}"
+                    rf"(?:\s*(?:/[A-Za-z][A-Za-z0-9-]*|[A-Za-z][A-Za-z0-9-]*))?"
+                    rf"(?:\s*\([A-Za-z0-9 .,/+-]+\))?",
+                    compact,
+                    flags=re.IGNORECASE,
+                )
+                if display_match:
+                    return " ".join(display_match.group(0).split())
+                return value_text
+        return exact_value
 
     def _email_has_items(self, raw_email_id: str, tenant_id: Any | None = None) -> bool:
         query = (
@@ -495,6 +824,21 @@ class EmailIngestionService:
             logger.warning("Failed parsing Date header from email, falling back to current time")
         return datetime.now(UTC)
 
+    def _message_fingerprint(
+        self,
+        message: Message,
+        sender: str,
+        subject: str,
+        received_at: datetime | None = None,
+    ) -> str:
+        message_id = (message.get("Message-ID") or message.get("Message-Id") or "").strip().strip("<>")
+        if message_id:
+            return f"message-id:{message_id.lower()}"
+
+        normalized_subject = " ".join((subject or "").lower().split())
+        received_marker = received_at.isoformat() if received_at else ""
+        return f"fallback:{sender.strip().lower()}|{normalized_subject}|{received_marker}"
+
     def _csv_terms(self, raw: str | None) -> list[str]:
         return [term.strip().lower() for term in (raw or "").split(",") if term.strip()]
 
@@ -511,8 +855,74 @@ class EmailIngestionService:
             for term in terms
         )
 
+    def _is_irrelevant_or_marketing_email(
+        self,
+        *,
+        message: Message,
+        sender: str,
+        subject: str,
+        body_text: str,
+        labels: str,
+        list_unsubscribe: str,
+        precedence: str,
+    ) -> bool:
+        sender_lower = sender.lower()
+        subject_lower = subject.lower()
+        labels_lower = labels.lower()
+        body_sample = body_text[:4000].lower()
+        combined = f"{sender_lower} {subject_lower} {body_sample}"
+        strong_supplier_terms = [term for term in SUPPLIER_INTENT_TERMS if term not in {"offer", "price", "pricing"}]
+
+        marketing_headers = (
+            "promotions" in labels_lower
+            or "category-promo" in labels_lower
+            or precedence.lower() in {"bulk", "list"}
+            or bool(list_unsubscribe)
+            or bool(message.get("List-Id"))
+        )
+        has_supplier_intent = self._text_matches_any(combined, strong_supplier_terms)
+        has_irrelevant_terms = self._text_matches_any(combined, list(IRRELEVANT_MAIL_TERMS))
+
+        if marketing_headers and not has_supplier_intent:
+            return True
+        if has_irrelevant_terms and not has_supplier_intent:
+            return True
+        if sender_lower.startswith(("no-reply@", "noreply@", "do-not-reply@", "donotreply@")):
+            return True
+        return False
+
+    def _has_supplier_catalogue_intent(
+        self,
+        subject: str,
+        body_text: str,
+        attachments: list[dict],
+    ) -> bool:
+        attachment_names = " ".join(str(att.get("filename", "")) for att in attachments)
+        text = f"{subject} {attachment_names} {body_text[:8000]}".lower()
+        if self._text_matches_any(text, list(SUPPLIER_INTENT_TERMS)):
+            return True
+
+        # Structured attachments from a supplier mailbox are often terse, e.g. "July rates.xlsx".
+        return any(str(att.get("ext", "")).lower() in {".xlsx", ".xls", ".csv", ".pdf", ".docx", ".doc"} for att in attachments)
+
     def _mark_seen(self, client: imaplib.IMAP4, msg_uid: bytes) -> None:
-        client.uid("store", msg_uid, "+FLAGS", "\\Seen")
+        logger.debug("Leaving IMAP message uid=%s unread in the employee mailbox", msg_uid)
+
+    def _restore_unseen_after_processing(self, client: imaplib.IMAP4, msg_uid: bytes) -> None:
+        try:
+            client.uid("store", msg_uid, "-FLAGS.SILENT", "\\Seen")
+            logger.debug("Restored IMAP message uid=%s to unread after MediCORE processing", msg_uid)
+        except Exception:
+            logger.warning("Unable to restore IMAP message uid=%s to unread", msg_uid, exc_info=True)
+
+    def _semantic_supplier_subject_match(self, subject: str, keywords: list[str]) -> bool:
+        if self._has_supplier_catalogue_intent(subject, "", []):
+            return True
+        try:
+            return self.llm.classify_supplier_subject(subject, keywords)
+        except Exception:
+            logger.exception("Semantic supplier subject classification failed; using local heuristic")
+            return False
 
     def _upsert_supplier(self, sender: str, display_name: str | None = None, tenant_id: Any | None = None) -> Supplier:
         domain = get_supplier_domain(sender)
@@ -592,6 +1002,9 @@ class EmailIngestionService:
             payload = part.get_payload(decode=True)
             if not payload:
                 continue
+            if len(payload) > MAX_DOCUMENT_BYTES:
+                logger.warning("Skipping attachment %s because it exceeds the 30 MB processing limit", filename)
+                continue
 
             mime_type = part.get_content_type()
             attachments.append({
@@ -603,22 +1016,52 @@ class EmailIngestionService:
         return attachments
 
     def _get_email_body_text(self, message: Message) -> str:
-        body = ""
+        plain_parts: list[str] = []
+        html_parts: list[str] = []
         if message.is_multipart():
             for part in message.walk():
                 content_type = part.get_content_type()
                 content_disposition = str(part.get("Content-Disposition"))
-                if content_type == "text/plain" and "attachment" not in content_disposition:
+                if "attachment" in content_disposition:
+                    continue
+                if content_type in ("text/plain", "text/html"):
                     payload = part.get_payload(decode=True)
                     if payload:
-                        body += payload.decode(errors="ignore")
+                        charset = part.get_content_charset() or "utf-8"
+                        decoded = payload.decode(charset, errors="ignore")
+                        if content_type == "text/plain":
+                            plain_parts.append(decoded)
+                        else:
+                            html_parts.append(self._html_to_text(decoded))
         else:
             payload = message.get_payload(decode=True)
             if payload:
-                body += payload.decode(errors="ignore")
-        return body.strip()
+                charset = message.get_content_charset() or "utf-8"
+                decoded = payload.decode(charset, errors="ignore")
+                if message.get_content_type() == "text/html":
+                    html_parts.append(self._html_to_text(decoded))
+                else:
+                    plain_parts.append(decoded)
+        return "\n".join(part.strip() for part in [*plain_parts, *html_parts] if part.strip()).strip()
+
+    def _html_to_text(self, html: str) -> str:
+        parser = _HTMLTextExtractor()
+        try:
+            parser.feed(html)
+            return parser.text()
+        except Exception:
+            return ""
 
     def _extract_docx_text(self, file_path: Path) -> str:
+        try:
+            import mammoth
+            with file_path.open("rb") as docx_file:
+                result = mammoth.extract_raw_text(docx_file)
+            if result.value.strip():
+                return result.value
+        except Exception:
+            logger.info("Mammoth DOCX extraction failed for %s; falling back to XML", file_path.name)
+
         import zipfile
         import xml.etree.ElementTree as ET
         try:
@@ -632,8 +1075,33 @@ class EmailIngestionService:
             logger.exception("Error extracting text from docx file %s: %s", file_path.name, e)
             return ""
 
+    def _extract_spreadsheet_text(self, file_path: Path, ext: str) -> str:
+        try:
+            import pandas as pd
+            if ext == ".csv":
+                frames = {"csv": pd.read_csv(file_path)}
+            else:
+                frames = pd.read_excel(file_path, sheet_name=None)
+
+            lines: list[str] = []
+            for sheet_name, frame in frames.items():
+                lines.append(f"Sheet: {sheet_name}")
+                frame = frame.dropna(how="all").dropna(axis=1, how="all")
+                if frame.empty:
+                    continue
+                lines.append(frame.to_csv(index=False))
+            return "\n".join(lines).strip()
+        except Exception as e:
+            logger.exception("Error extracting tabular text from %s: %s", file_path.name, e)
+            if ext == ".csv":
+                try:
+                    return file_path.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    return ""
+            return ""
+
     def _extract_image_text(self, file_path: Path) -> str:
-        from PIL import Image
+        from PIL import Image, ImageEnhance, ImageFilter, ImageOps
         try:
             import pytesseract
         except ImportError:
@@ -644,8 +1112,46 @@ class EmailIngestionService:
             return ""
 
         try:
+            grid_table_text = ""
+            try:
+                from backend.app.services.image_grid_extractor import extract_grid_table_from_image
+                grid_result = extract_grid_table_from_image(file_path)
+                if grid_result:
+                    grid_table_text = "[GRID CELL TABLE OCR]\n" + grid_result.table_text
+            except Exception:
+                logger.debug("Grid-cell OCR failed for %s; continuing with regular OCR", file_path.name, exc_info=True)
+
             image = Image.open(file_path)
-            text = pytesseract.image_to_string(image)
+            image = ImageOps.exif_transpose(image)
+            if image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+
+            variants = []
+            base = image.convert("L")
+            variants.append(("gray", base))
+            scale = 2 if max(base.size) < 2400 else 1
+            if scale > 1:
+                variants.append(("gray_2x", base.resize((base.width * scale, base.height * scale))))
+
+            enhanced = ImageOps.autocontrast(base)
+            enhanced = ImageEnhance.Contrast(enhanced).enhance(1.8)
+            enhanced = enhanced.filter(ImageFilter.SHARPEN)
+            variants.append(("enhanced", enhanced))
+            variants.append(("threshold", enhanced.point(lambda px: 255 if px > 170 else 0)))
+
+            texts: list[str] = []
+            for name, variant in variants:
+                for config in ("--oem 3 --psm 6", "--oem 3 --psm 11"):
+                    try:
+                        page_text = pytesseract.image_to_string(variant, config=config)
+                        if page_text.strip():
+                            texts.append(f"[OCR {name} {config}]\n{page_text.strip()}")
+                    except Exception:
+                        logger.debug("OCR variant failed for %s using %s", name, config, exc_info=True)
+
+            if grid_table_text:
+                texts.insert(0, grid_table_text)
+            text = "\n\n".join(dict.fromkeys(texts))
             logger.info("OCR extracted %s characters from image %s", len(text), file_path.name)
             return text
         except Exception as e:
@@ -657,7 +1163,16 @@ class EmailIngestionService:
             from backend.app.services.pdf_extract import extract_pdf_text
             return extract_pdf_text(file_path)
 
-        elif ext in (".docx", ".doc", ".xlsx", ".xls"):
+        elif ext in (".xlsx", ".xls"):
+            return self._extract_spreadsheet_text(file_path, ext)
+
+        elif ext == ".csv":
+            return self._extract_spreadsheet_text(file_path, ext)
+
+        elif ext == ".docx":
+            return self._extract_docx_text(file_path)
+
+        elif ext == ".doc":
             try:
                 from markitdown import MarkItDown
                 md = MarkItDown()
@@ -665,14 +1180,12 @@ class EmailIngestionService:
                 return result.markdown
             except Exception as e:
                 logger.exception("Error extracting text using markitdown from %s: %s", file_path.name, e)
-                if ext == ".docx":
-                    return self._extract_docx_text(file_path)
                 return ""
 
         elif ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"):
             return self._extract_image_text(file_path)
 
-        elif ext in (".txt", ".csv"):
+        elif ext == ".txt":
             try:
                 return file_path.read_text(encoding="utf-8", errors="ignore")
             except Exception:
@@ -688,6 +1201,21 @@ class EmailIngestionService:
             {"content-type": mime_type, "upsert": "true"},
         )
         return supabase.storage.from_(self.settings.supabase_storage_bucket).get_public_url(object_path)
+
+    def _imap_search_args_for_approach(self, approach: str, account: Any) -> tuple[str, ...]:
+        """Return IMAP UID SEARCH args without relying on the user's read/unread state."""
+        if approach == "approach_1":
+            # The Suppliers label is the employee's explicit review boundary. A seen
+            # message added to that label is still new to MediCORE until we log it.
+            return ("ALL",)
+
+        created_at = getattr(account, "created_at", None)
+        if not created_at:
+            return ("ALL",)
+
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        return ("SINCE", created_at.strftime("%d-%b-%Y"))
 
     def poll_account_inbox(self, account_id: UUID, force_retry_failed: bool = False) -> int:
         from backend.app.models import EmailAccount, EmailFilter
@@ -747,11 +1275,35 @@ class EmailIngestionService:
                 from backend.app.models import EmailSyncSetting
                 sync_setting = self.db.query(EmailSyncSetting).filter(EmailSyncSetting.user_id == account.user_id).first()
                 approach = sync_setting.ingestion_approach if sync_setting else "approach_1"
+                pending_email_ids: set[str] = set()
+                ignored_email_ids: set[str] = set()
+                ignored_email_fingerprints: set[str] = set()
+                if sync_setting:
+                    try:
+                        import json
+                        approval_items = json.loads(sync_setting.pending_approvals or "[]")
+                        pending_email_ids = {
+                            str(item.get("email_id"))
+                            for item in approval_items
+                            if isinstance(item, dict) and item.get("email_id") and not item.get("ignored")
+                        }
+                        ignored_email_ids = {
+                            str(item.get("email_id"))
+                            for item in approval_items
+                            if isinstance(item, dict) and item.get("email_id") and item.get("ignored")
+                        }
+                        ignored_email_fingerprints = {
+                            str(item.get("fingerprint"))
+                            for item in approval_items
+                            if isinstance(item, dict) and item.get("fingerprint") and item.get("ignored")
+                        }
+                    except Exception:
+                        pending_email_ids = set()
+                        ignored_email_ids = set()
+                        ignored_email_fingerprints = set()
 
                 mailbox = "INBOX"
-                search_criteria = "UNSEEN"
                 if approach == "approach_1":
-                    search_criteria = "ALL"
                     matched_mailbox = None
                     try:
                         status, mailboxes = client.list()
@@ -821,11 +1373,18 @@ class EmailIngestionService:
                         raise
 
                 # Search by UID so stored message IDs remain stable even when mailbox sequence numbers change.
-                _, message_ids = client.uid("search", None, search_criteria)
+                search_args = self._imap_search_args_for_approach(approach, account)
+                _, message_ids = client.uid("search", None, *search_args)
                 ids = message_ids[0].split() if message_ids and message_ids[0] else []
                 # Process newest first
                 ids.reverse()
-                logger.info("Account %s has %s messages in %s (criteria: %s)", account.email_address, len(ids), mailbox, search_criteria)
+                logger.info(
+                    "Account %s has %s candidate messages in %s (criteria: %s)",
+                    account.email_address,
+                    len(ids),
+                    mailbox,
+                    " ".join(search_args),
+                )
 
                 # Fetch already processed email IDs cache to optimize DB lookup
                 processed_email_ids = set()
@@ -846,11 +1405,17 @@ class EmailIngestionService:
                     raw_id_str = f"{account.id}:{mailbox}:{msg_id_str}"
                     if raw_id_str in processed_email_ids:
                         continue
+                    if raw_id_str in pending_email_ids:
+                        continue
 
                     try:
                         logger.info("Fetching message id=%s for account %s", raw_id_str, account.email_address)
                         _, data = client.uid("fetch", msg_id, "(BODY.PEEK[])")
                         if not data or not isinstance(data[0], tuple):
+                            continue
+                        if len(data[0][1]) > MAX_DOCUMENT_BYTES:
+                            logger.warning("Skipping email id=%s because raw RFC822 payload exceeds 30 MB", raw_id_str)
+                            self._create_skipped_email_record(raw_id_str, "unknown@supplier.com", "Unknown", "Oversized email", "ignored: email exceeds 30 MB", active_tenant_id)
                             continue
 
                         message = email.message_from_bytes(data[0][1])
@@ -859,20 +1424,29 @@ class EmailIngestionService:
                         email_date = self._message_received_at(message)
                         display_name, sender = self._extract_sender(message)
                         subject = message.get("Subject") or ""
+                        email_fingerprint = self._message_fingerprint(message, sender, subject, email_date)
 
-                        # Check Promotions/Newsletters first
-                        if active_filter and active_filter.skip_promotions_tab:
-                            labels = message.get("X-Gmail-Labels", "")
-                            list_unsubscribe = message.get("List-Unsubscribe", "")
-                            precedence = message.get("Precedence", "")
-                            if "promotions" in labels.lower() or "category-promo" in labels.lower() or list_unsubscribe or precedence.lower() in ("bulk", "list"):
-                                logger.info("Skipping email id=%s because it matches promotions/bulk tab signature", raw_id_str)
-                                self._mark_seen(client, msg_id)
-                                continue
+                        labels = message.get("X-Gmail-Labels", "")
+                        list_unsubscribe = message.get("List-Unsubscribe", "")
+                        precedence = message.get("Precedence", "")
 
                         # Collect all attachments and email body text
                         attachments = self._collect_attachments(message)
                         body_text = self._get_email_body_text(message)
+
+                        if self._is_irrelevant_or_marketing_email(
+                            message=message,
+                            sender=sender,
+                            subject=subject,
+                            body_text=body_text,
+                            labels=labels,
+                            list_unsubscribe=list_unsubscribe,
+                            precedence=precedence,
+                        ):
+                            logger.info("Skipping non-supplier/marketing email id=%s from=%s subject=%r", raw_id_str, sender, subject)
+                            self._create_skipped_email_record(raw_id_str, sender, display_name, subject, "ignored: marketing or irrelevant", active_tenant_id, email_date)
+                            self._mark_seen(client, msg_id)
+                            continue
 
                         # Build parse targets
                         parse_targets = []
@@ -885,7 +1459,7 @@ class EmailIngestionService:
                                 "is_body": False
                             })
 
-                        if not parse_targets and body_text.strip():
+                        if body_text.strip():
                             parse_targets.append({
                                 "name": "email_body.txt",
                                 "payload": body_text.encode("utf-8"),
@@ -897,6 +1471,7 @@ class EmailIngestionService:
                         # Filter: Require attachment
                         if active_filter and active_filter.require_attachment and not attachments:
                             logger.info("Skipping email id=%s because attachment is required but none found", raw_id_str)
+                            self._create_skipped_email_record(raw_id_str, sender, display_name, subject, "ignored: attachment required", active_tenant_id, email_date)
                             self._mark_seen(client, msg_id)
                             continue
 
@@ -904,31 +1479,59 @@ class EmailIngestionService:
                             sender_terms = self._csv_terms(active_filter.sender_keywords)
                             if sender_terms and not self._sender_matches_any(sender, display_name, sender_terms):
                                 logger.info("Skipping email id=%s because sender filter did not match", raw_id_str)
+                                self._create_skipped_email_record(raw_id_str, sender, display_name, subject, "ignored: sender filter", active_tenant_id, email_date)
                                 self._mark_seen(client, msg_id)
                                 continue
 
                             subject_terms = self._csv_terms(active_filter.subject_keywords)
                             if subject_terms and not self._text_matches_any(subject, subject_terms):
                                 logger.info("Skipping email id=%s because subject filter did not match", raw_id_str)
+                                self._create_skipped_email_record(raw_id_str, sender, display_name, subject, "ignored: subject filter", active_tenant_id, email_date)
                                 self._mark_seen(client, msg_id)
                                 continue
+
+                        approach2_keywords: list[str] = []
+                        approach2_semantic_subject_match = False
+                        if approach == "approach_2" and sync_setting:
+                            approach2_keywords = self._csv_terms(sync_setting.keyword_filters)
+                            approach2_semantic_subject_match = self._semantic_supplier_subject_match(subject, approach2_keywords)
+
+                        if not self._has_supplier_catalogue_intent(subject, body_text, attachments) and not approach2_semantic_subject_match:
+                            logger.info("Skipping email id=%s because no supplier catalogue intent was detected", raw_id_str)
+                            self._create_skipped_email_record(raw_id_str, sender, display_name, subject, "ignored: no supplier catalogue intent", active_tenant_id, email_date)
+                            self._mark_seen(client, msg_id)
+                            continue
 
                         # Check Ingestion Approach 2
                         if approach == "approach_2" and sync_setting:
                             domain = get_supplier_domain(sender)
                             trusted_list = self._csv_terms(sync_setting.trusted_suppliers)
-                            keywords = self._csv_terms(sync_setting.keyword_filters)
-                            if keywords and not self._text_matches_any(subject, keywords):
-                                logger.info("Skipping email id=%s because approval-mode subject keywords did not match", raw_id_str)
+                            if raw_id_str in ignored_email_ids or email_fingerprint in ignored_email_fingerprints:
+                                logger.info("Skipping email id=%s because user denied processing previously", raw_id_str)
+                                self._create_skipped_email_record(raw_id_str, sender, display_name, subject, "ignored: denied by user", active_tenant_id, email_date)
+                                self._mark_seen(client, msg_id)
+                                continue
+                            if not approach2_semantic_subject_match:
+                                logger.info("Skipping email id=%s because approach-2 semantic subject check did not match", raw_id_str)
+                                self._create_skipped_email_record(raw_id_str, sender, display_name, subject, "ignored: semantic subject mismatch", active_tenant_id, email_date)
                                 self._mark_seen(client, msg_id)
                                 continue
 
                             is_trusted = (sender.lower() in trusted_list) or (domain in trusted_list)
-                            if not is_trusted:
-                                # Approval mode is intentionally subject-first. Body matches are too noisy for newsletters.
-                                matches_keywords = not keywords or self._text_matches_any(subject, keywords)
-
-                                if matches_keywords and parse_targets:
+                            supplier_exists = (
+                                self.db.query(Supplier.id)
+                                .join(CatalogEmail, CatalogEmail.supplier_id == Supplier.id)
+                                .join(CatalogItem, CatalogItem.catalog_email_id == CatalogEmail.id)
+                                .filter(
+                                    Supplier.tenant_id == active_tenant_id,
+                                    Supplier.email_domain == domain,
+                                    CatalogEmail.processing_status == "completed",
+                                )
+                                .first()
+                                is not None
+                            )
+                            if not is_trusted and not supplier_exists:
+                                if parse_targets:
                                     # New supplier alert! Add to pending_approvals and DO NOT mark read
                                     import json
                                     try:
@@ -936,9 +1539,14 @@ class EmailIngestionService:
                                     except Exception:
                                         pending_list = []
 
-                                    if not any(item["email_id"] == raw_id_str for item in pending_list):
+                                    if not any(
+                                        isinstance(item, dict)
+                                        and (item.get("email_id") == raw_id_str or item.get("fingerprint") == email_fingerprint)
+                                        for item in pending_list
+                                    ):
                                         pending_list.append({
                                             "email_id": raw_id_str,
+                                            "fingerprint": email_fingerprint,
                                             "sender": sender,
                                             "supplier_name": display_name or sender,
                                             "subject": subject,
@@ -946,12 +1554,14 @@ class EmailIngestionService:
                                             "reason": "Subject keyword matched; supplier approval required",
                                         })
                                         sync_setting.pending_approvals = json.dumps(pending_list)
+                                        pending_email_ids.add(raw_id_str)
                                         self.db.commit()
                                         logger.info("Added email id=%s to pending_approvals for %s", raw_id_str, sender)
                                     continue
                                 else:
                                     # Doesn't match keywords or has no supported content, skip and mark as seen
                                     logger.info("Skipping non-supplier email id=%s from=%s subject=%r", raw_id_str, sender, subject)
+                                    self._create_skipped_email_record(raw_id_str, sender, display_name, subject, "ignored: no parseable supplier content", active_tenant_id, email_date)
                                     self._mark_seen(client, msg_id)
                                     continue
 
@@ -959,13 +1569,14 @@ class EmailIngestionService:
                         if parse_targets:
                             try:
                                 processed += self._process_message(message, raw_email_id=raw_id_str, parse_targets=parse_targets, tenant_id=active_tenant_id)
+                                self._restore_unseen_after_processing(client, msg_id)
                             except Exception as pe:
                                 logger.exception("Failed processing email payload for raw_email_id=%s", raw_id_str)
                                 self._create_failed_email_record(raw_id_str, sender, display_name, subject, f"Failed: {str(pe)}", tenant_id=active_tenant_id, email_date=email_date)
 
-                            self._mark_seen(client, msg_id)
                         else:
                             logger.info("Skipping email id=%s because it had no parseable payload", raw_id_str)
+                            self._create_skipped_email_record(raw_id_str, sender, display_name, subject, "ignored: no parseable payload", active_tenant_id, email_date)
                             self._mark_seen(client, msg_id)
 
                     except Exception as inner_e:
@@ -1022,4 +1633,42 @@ class EmailIngestionService:
         except Exception as e:
             self.db.rollback()
             logger.error("Failed to write fallback/failed email record to DB: %s", e)
+
+    def _create_skipped_email_record(
+        self,
+        raw_email_id: str,
+        sender: str,
+        display_name: str,
+        subject: str,
+        reason: str,
+        tenant_id: Any,
+        email_date: datetime | None = None,
+    ) -> None:
+        try:
+            existing = (
+                self.db.query(CatalogEmail)
+                .filter(CatalogEmail.raw_email_id == raw_email_id)
+                .filter(CatalogEmail.tenant_id == tenant_id)
+                .first()
+            )
+            if existing:
+                return
+
+            supplier = self._upsert_supplier(sender, display_name=display_name, tenant_id=tenant_id)
+            self.db.add(
+                CatalogEmail(
+                    id=uuid4(),
+                    tenant_id=tenant_id or supplier.tenant_id,
+                    supplier_id=supplier.id,
+                    raw_email_id=raw_email_id,
+                    subject=subject,
+                    pdf_url=None,
+                    received_at=email_date or datetime.now(UTC),
+                    processing_status=reason[:50],
+                )
+            )
+            self.db.commit()
+        except Exception as e:
+            self.db.rollback()
+            logger.error("Failed to write skipped email tombstone to DB: %s", e)
 

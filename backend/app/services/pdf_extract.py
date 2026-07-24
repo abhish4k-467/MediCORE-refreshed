@@ -51,6 +51,14 @@ def _extract_with_ocr(pdf_path: Path) -> str:
             pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
             image = Image.open(io.BytesIO(pix.tobytes("png")))
             try:
+                from backend.app.services.image_grid_extractor import extract_grid_table_from_pil_image
+                grid_result = extract_grid_table_from_pil_image(image, f"{pdf_path.name} page {page_number}")
+                if grid_result:
+                    text_parts.append("[GRID CELL TABLE OCR]\n" + grid_result.table_text)
+            except Exception:
+                logger.debug("Grid-cell OCR failed for %s page %s", pdf_path.name, page_number, exc_info=True)
+
+            try:
                 page_text = pytesseract.image_to_string(image, config="--psm 6")
             except pytesseract.TesseractNotFoundError:
                 logger.warning(

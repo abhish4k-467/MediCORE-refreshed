@@ -39,7 +39,7 @@ create table if not exists email_filters (
 create table if not exists email_sync_settings (
     id uuid primary key default uuid_generate_v4(),
     user_id uuid not null references auth.users(id) on delete cascade unique,
-    poll_interval_minutes integer not null default 3,
+    poll_interval_minutes integer not null default 15,
     auto_extract_catalog boolean not null default true,
     notify_on_new_catalog boolean not null default true,
     ingestion_approach text not null default 'approach_2',

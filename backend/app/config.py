@@ -1,6 +1,9 @@
 from functools import lru_cache
+from pathlib import Path
 
-from pydantic import AnyHttpUrl, Field
+from urllib.parse import urlparse, urlunparse
+
+from pydantic import AnyHttpUrl, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,10 +29,14 @@ class Settings(BaseSettings):
     supabase_pooler_port: int = 6543
     supabase_pooler_user: str = ""
 
+    valkey_url: str = ""
     redis_url: str = "redis://localhost:6379/0"
 
-    groq_api_key: str = Field(default="replace-me", repr=False)
-    groq_model: str = "llama-3.1-8b-instant"
+    openrouter_api_key: str = Field(default="", repr=False)
+    openrouter_model: str = "openai/gpt-4o-mini"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_site_url: str = ""
+    openrouter_app_name: str = "MediCORE"
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
 
     email_mode: str = "imap"
@@ -51,6 +58,45 @@ class Settings(BaseSettings):
     smtp_password: str = Field(default="", repr=False)
     smtp_sender: str = "medicore.ai@gmail.com"
     superadmin_email_id: str = "prisik.da45@gmail.com"
+
+    @property
+    def queue_url(self) -> str:
+        configured_url = self.valkey_url or self.redis_url
+        parsed_url = urlparse(configured_url)
+        if (
+            self.environment.lower() != "production"
+            and parsed_url.hostname == "valkey"
+            and not Path("/.dockerenv").exists()
+        ):
+            return urlunparse(
+                parsed_url._replace(netloc=parsed_url.netloc.replace("valkey", "localhost", 1))
+            )
+        return configured_url
+
+    @model_validator(mode="after")
+    def validate_production_settings(self) -> "Settings":
+        if self.environment.lower() != "production":
+            return self
+
+        missing: list[str] = []
+        if self.supabase_service_role_key in {"", "replace-me"}:
+            missing.append("SUPABASE_SERVICE_ROLE_KEY")
+        if self.openrouter_api_key in {"", "replace-me"}:
+            missing.append("OPENROUTER_API_KEY")
+        if not self.gmail_webhook_token:
+            missing.append("GMAIL_WEBHOOK_TOKEN")
+        if self.frontend_origin.startswith("http://"):
+            missing.append("FRONTEND_ORIGIN must use https:// in production")
+        queue_url = self.queue_url
+        parsed_queue_url = urlparse(queue_url)
+        if parsed_queue_url.hostname in {"localhost", "127.0.0.1"}:
+            missing.append("VALKEY_URL must point to the production Valkey service")
+        if not parsed_queue_url.password:
+            missing.append("VALKEY_URL must include a password in production")
+
+        if missing:
+            raise ValueError("Invalid production configuration: " + ", ".join(missing))
+        return self
 
 
 

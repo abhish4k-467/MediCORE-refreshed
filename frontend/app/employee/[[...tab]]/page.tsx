@@ -46,16 +46,22 @@ type ChatMessage = {
 type SupplierItem = {
   ingredient_name: string;
   normalized_name: string;
-  price_per_unit: number;
+  price_per_unit: number | null;
   currency: string;
-  available_qty: number;
-  unit: string;
+  available_qty: number | null;
+  unit: string | null;
   valid_until?: string;
   lead_time_days?: number | null;
+  lead_time_text?: string | null;
   moq?: number | null;
   pack_size?: string | null;
+  price_display?: string | null;
+  quantity_display?: string | null;
+  moq_display?: string | null;
+  source_document?: string | null;
   catalog_email_id?: string | null;
   received_at?: string | null;
+  is_updated?: boolean;
 };
 
 type SupplierApiRow = {
@@ -260,7 +266,71 @@ function formatCompactCurrency(value: number): string {
 }
 
 function formatQuantity(value: number): string {
-  return new Intl.NumberFormat("en-IN", { maximumFractionDigits: 0 }).format(value);
+  return new Intl.NumberFormat("en-IN", { maximumFractionDigits: 4 }).format(value);
+}
+
+function safePrice(value: number | null | undefined, currency?: string): number {
+  return value == null ? Number.POSITIVE_INFINITY : getBasePrice(value, currency || "INR");
+}
+
+function safeQty(value: number | null | undefined): number {
+  return value == null ? 0 : value;
+}
+
+function isMissingDisplayValue(value: unknown): boolean {
+  if (value == null) return true;
+  return ["", "na", "n/a", "none", "null", "-", "--"].includes(String(value).trim().toLowerCase());
+}
+
+function displayText(value: unknown): string {
+  return isMissingDisplayValue(value) ? "-" : String(value);
+}
+
+function displayItemName(item: Pick<SupplierItem, "ingredient_name" | "normalized_name" | "is_updated"> | Record<string, unknown>): string {
+  const rawName = (item as any).normalized_name ?? (item as any).ingredient_name;
+  const name = displayText(rawName);
+  return name !== "-" && (item as any).is_updated ? `${name} (U)` : name;
+}
+
+function isNumericOnlyDisplay(value: unknown): boolean {
+  if (isMissingDisplayValue(value)) return false;
+  return /^[+-]?\d+(?:\.\d+)?$/.test(String(value).trim());
+}
+
+function displayPrice(item: Pick<SupplierItem, "price_display" | "price_per_unit" | "currency" | "unit">): string {
+  if (!isMissingDisplayValue(item.price_display) && !isNumericOnlyDisplay(item.price_display)) return String(item.price_display);
+  if (item.price_per_unit == null) return "-";
+  return `${formatMoney(item.price_per_unit, item.currency)}/${item.unit || "unit"}`;
+}
+
+function displayQuantity(item: Pick<SupplierItem, "quantity_display" | "available_qty" | "unit">): string {
+  if (!isMissingDisplayValue(item.quantity_display) && !isNumericOnlyDisplay(item.quantity_display)) return String(item.quantity_display);
+  if (item.available_qty == null) return "-";
+  return `${formatQuantity(item.available_qty)} ${item.unit || ""}`.trim();
+}
+
+function displayRichness(row: Record<string, unknown>): number {
+  const value = `${row.price_display ?? ""} ${row.quantity_display ?? ""}`;
+  let score = value.length;
+  if (/(USD|INR|EUR|GBP|\$|₹|€|£)/i.test(value)) score += 30;
+  if (/\/|\b(kg|g|mg|bag|drum)\b/i.test(value)) score += 20;
+  return score;
+}
+
+function shouldPreferAssistantRow(next: Record<string, unknown>, current: Record<string, unknown>): boolean {
+  if (Boolean(next.is_updated) !== Boolean(current.is_updated)) return Boolean(next.is_updated);
+  const nextTime = new Date(String(next.received_at ?? 0)).getTime();
+  const currentTime = new Date(String(current.received_at ?? 0)).getTime();
+  if (Number.isFinite(nextTime) && Number.isFinite(currentTime) && nextTime !== currentTime) return nextTime > currentTime;
+  return displayRichness(next) > displayRichness(current);
+}
+
+function displayLeadTime(item: Pick<SupplierItem, "lead_time_text" | "lead_time_days">): string {
+  return !isMissingDisplayValue(item.lead_time_text) ? String(item.lead_time_text) : (item.lead_time_days != null ? `${item.lead_time_days} days` : "-");
+}
+
+function displayMoq(item: Pick<SupplierItem, "moq_display" | "moq" | "unit">): string {
+  return !isMissingDisplayValue(item.moq_display) ? String(item.moq_display) : (item.moq != null ? `${formatQuantity(Number(item.moq))} ${item.unit || ""}`.trim() : "-");
 }
 
 function formatShortDate(value: string | null | undefined): string {
@@ -383,6 +453,12 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const [syncSuccess, setSyncSuccess] = useState(false);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (!syncNotice) return;
+    const timer = window.setTimeout(() => setSyncNotice(null), 3000);
+    return () => window.clearTimeout(timer);
+  }, [syncNotice]);
+
   async function handleSyncRealtimeEmails() {
     setIsSyncingEmails(true);
     setSyncSuccess(false);
@@ -397,17 +473,32 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         },
       });
       if (response.ok) {
-        await response.json().catch(() => null);
-        await refreshWorkspaceData();
+        const result = await response.json().catch(() => null);
         setSyncSuccess(true);
+        const processed = Number(result?.processed || 0);
+        const pending = Number(result?.pending_approvals || 0);
+        const queuedAccounts = Number(result?.queued_accounts || 0);
+        if (result?.status === "queued") {
+          setSyncNotice(queuedAccounts > 0 ? `Email sync started for ${queuedAccounts} account${queuedAccounts === 1 ? "" : "s"}. New catalogue rows will appear shortly.` : "No connected email accounts found.");
+          window.setTimeout(() => {
+            refreshWorkspaceData().catch((err) => console.error("Delayed workspace refresh failed", err));
+          }, 2500);
+        } else if (pending > 0) {
+          setSyncNotice(`${pending} new supplier approval${pending === 1 ? "" : "s"} waiting. Approve trusted suppliers in Email Settings.`);
+        } else {
+          setSyncNotice(processed > 0 ? `Processed ${processed} catalogue item${processed === 1 ? "" : "s"}.` : "No new supplier catalogue emails found.");
+        }
         setTimeout(() => {
           setSyncSuccess(false);
         }, 2000);
       } else {
-        console.error("Email sync failed", response.status, await response.text().catch(() => ""));
+        const errorPayload = await response.json().catch(() => null);
+        console.error("Email sync failed", response.status, errorPayload);
+        setSyncNotice(errorPayload?.detail || "Email sync failed. Check connected inbox settings and try again.");
       }
     } catch (err) {
       console.error(err);
+      setSyncNotice("Email sync failed. Check connected inbox settings and try again.");
     } finally {
       setIsSyncingEmails(false);
     }
@@ -493,7 +584,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
 
   const pendingApprovalsList = useMemo(() => {
     try {
-      return JSON.parse(syncSettings.pending_approvals || "[]");
+      const approvals = JSON.parse(syncSettings.pending_approvals || "[]");
+      return Array.isArray(approvals) ? approvals.filter((item: any) => !item?.ignored) : [];
     } catch (e) {
       return [];
     }
@@ -617,7 +709,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
 
     return catalogEmails.map((email) => {
       const items = itemsByEmail.get(email.id) ?? [];
-      const sortedItems = [...items].sort((left, right) => getBasePrice(left.price_per_unit, left.currency) - getBasePrice(right.price_per_unit, right.currency));
+      const sortedItems = [...items].sort((left, right) => safePrice(left.price_per_unit, left.currency) - safePrice(right.price_per_unit, right.currency));
       const meta = supplierMeta.get(email.supplier_name);
       const bestItem = sortedItems[0];
       const hasExtractedItems = sortedItems.length > 0;
@@ -686,7 +778,28 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     return inboxThreads.find((thread) => thread.id === selectedInboxThreadId) ?? inboxThreads[0];
   }, [inboxThreads, selectedInboxThreadId]);
 
-  const assistantRows = rows as Array<Record<string, unknown>>;
+  const assistantRows = useMemo(() => {
+    const map = new Map<string, Record<string, unknown>>();
+    const lastUserQuery = [...messages].reverse().find((message) => message.role === "user")?.text ?? "";
+    const queryTokens = new Set(
+      lastUserQuery
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .split(/\s+/)
+        .filter((token) => token.length >= 3 && !["price", "supplier", "suppliers", "show", "find", "give", "for", "the"].includes(token))
+    );
+    for (const row of rows as Array<Record<string, unknown>>) {
+      const rowName = String(row.normalized_name ?? row.ingredient_name ?? "").toLowerCase();
+      const matchedToken = Array.from(queryTokens).find((token) => rowName.includes(token));
+      const itemKey = matchedToken || rowName.replace(/[^a-z0-9]+/g, " ").trim();
+      const key = `${String(row.email_domain ?? row.supplier_name ?? "").toLowerCase()}-${itemKey}`;
+      const current = map.get(key);
+      if (!current || shouldPreferAssistantRow(row, current)) {
+        map.set(key, row);
+      }
+    }
+    return Array.from(map.values());
+  }, [messages, rows]);
 
   const latestSupplierRows = useMemo(() => {
     const map = new Map<string, SupplierTableRow>();
@@ -717,12 +830,12 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
 
     const deals = Array.from(itemGroups.entries())
       .map(([name, items]) => {
-        const sorted = [...items].sort((left, right) => getBasePrice(left.price_per_unit, left.currency) - getBasePrice(right.price_per_unit, right.currency));
+        const sorted = [...items].sort((left, right) => safePrice(left.price_per_unit, left.currency) - safePrice(right.price_per_unit, right.currency));
         const best = sorted[0];
         return { name, best };
       })
       .filter((deal) => deal.best)
-      .sort((left, right) => getBasePrice(left.best.price_per_unit, left.best.currency) - getBasePrice(right.best.price_per_unit, right.best.currency));
+      .sort((left, right) => safePrice(left.best.price_per_unit, left.best.currency) - safePrice(right.best.price_per_unit, right.best.currency));
 
     const activities = inboxThreads.slice(0, 5).map((thread, index) => ({
       tone: index === 2 ? "warning" : index % 2 === 0 ? "strong" : "soft",
@@ -764,7 +877,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     const search = supplierSearch.trim().toLowerCase();
     const summaries = Array.from(supplierNames).map((supplierName) => {
       const items = supplierMap.get(supplierName) ?? [];
-      const sortedByPrice = [...items].sort((left, right) => getBasePrice(left.price_per_unit, left.currency) - getBasePrice(right.price_per_unit, right.currency));
+      const sortedByPrice = [...items].sort((left, right) => safePrice(left.price_per_unit, left.currency) - safePrice(right.price_per_unit, right.currency));
       const latestEmail = (emailBySupplier.get(supplierName) ?? []).slice().sort((left, right) => {
         return new Date(right.received_at).getTime() - new Date(left.received_at).getTime();
       })[0];
@@ -773,8 +886,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       const latestItems = latestEmail
         ? items.filter((item) => item.catalog_email_id === latestEmail.id)
         : items;
-      const sortedLatestByPrice = [...latestItems].sort((left, right) => getBasePrice(left.price_per_unit, left.currency) - getBasePrice(right.price_per_unit, right.currency));
-      const totalQty = latestItems.reduce((total, item) => total + item.available_qty, 0);
+      const sortedLatestByPrice = [...latestItems].sort((left, right) => safePrice(left.price_per_unit, left.currency) - safePrice(right.price_per_unit, right.currency));
+      const totalQty = latestItems.reduce((total, item) => total + safeQty(item.available_qty), 0);
 
       return {
         supplier_name: supplierName,
@@ -836,15 +949,15 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       : selectedCatalog.items;
 
     if (filteredByEmail.length === 0) return [];
-    const minQty = Math.min(...filteredByEmail.map((item) => item.available_qty));
-    const bestPrice = Math.min(...filteredByEmail.map((item) => item.price_per_unit));
+    const minQty = Math.min(...filteredByEmail.map((item) => safeQty(item.available_qty)));
+    const bestPrice = Math.min(...filteredByEmail.map((item) => safePrice(item.price_per_unit, item.currency)));
     return filteredByEmail.filter((item) => {
       const matchesSearch = !search
         || (item.ingredient_name || "").toLowerCase().includes(search)
         || (item.normalized_name || "").toLowerCase().includes(search);
       if (!matchesSearch) return false;
-      if (catalogFilter === "best") return item.price_per_unit <= bestPrice * 1.08;
-      if (catalogFilter === "low-stock") return item.available_qty <= minQty * 1.35;
+      if (catalogFilter === "best") return safePrice(item.price_per_unit, item.currency) <= bestPrice * 1.08;
+      if (catalogFilter === "low-stock") return safeQty(item.available_qty) <= minQty * 1.35;
       return true;
     });
   }, [catalogFilter, catalogSearch, selectedCatalog, selectedCatalogEmailId]);
@@ -886,20 +999,21 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     const bySupplier = new Map<string, SupplierTableRow>();
     for (const row of matchedRows) {
       const current = bySupplier.get(row.supplier_name);
-      if (!current || getBasePrice(row.price_per_unit, row.currency) < getBasePrice(current.price_per_unit, current.currency)) {
+      if (!current || safePrice(row.price_per_unit, row.currency) < safePrice(current.price_per_unit, current.currency)) {
         bySupplier.set(row.supplier_name, row);
       }
     }
 
     const rows = Array.from(bySupplier.values());
-    const minPrice = Math.min(...rows.map((row) => getBasePrice(row.price_per_unit, row.currency)), 0);
-    const maxPrice = Math.max(...rows.map((row) => getBasePrice(row.price_per_unit, row.currency)), 1);
-    const maxQty = Math.max(...rows.map((row) => row.available_qty), 1);
+    const finitePrices = rows.map((row) => safePrice(row.price_per_unit, row.currency)).filter(Number.isFinite);
+    const minPrice = finitePrices.length ? Math.min(...finitePrices) : 0;
+    const maxPrice = finitePrices.length ? Math.max(...finitePrices) : 1;
+    const maxQty = Math.max(...rows.map((row) => safeQty(row.available_qty)), 1);
 
     const scored = rows.map((row) => {
-      const rowPriceBase = getBasePrice(row.price_per_unit, row.currency);
-      const priceScore = maxPrice === minPrice ? 100 : ((maxPrice - rowPriceBase) / (maxPrice - minPrice)) * 100;
-      const qtyScore = (row.available_qty / maxQty) * 100;
+      const rowPriceBase = safePrice(row.price_per_unit, row.currency);
+      const priceScore = Number.isFinite(rowPriceBase) ? (maxPrice === minPrice ? 100 : ((maxPrice - rowPriceBase) / (maxPrice - minPrice)) * 100) : 0;
+      const qtyScore = (safeQty(row.available_qty) / maxQty) * 100;
       const overallScore = Math.round(priceScore * 0.65 + qtyScore * 0.35);
       return {
         ...row,
@@ -911,12 +1025,12 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
 
     const sorted = scored.sort((left, right) => {
       if (compareSort === "lowest-price") {
-        return getBasePrice(left.price_per_unit, left.currency) - getBasePrice(right.price_per_unit, right.currency);
+        return safePrice(left.price_per_unit, left.currency) - safePrice(right.price_per_unit, right.currency);
       }
       if (compareSort === "highest-qty") {
-        return right.available_qty - left.available_qty;
+        return safeQty(right.available_qty) - safeQty(left.available_qty);
       }
-      return right.overallScore - left.overallScore || getBasePrice(left.price_per_unit, left.currency) - getBasePrice(right.price_per_unit, right.currency);
+      return right.overallScore - left.overallScore || safePrice(left.price_per_unit, left.currency) - safePrice(right.price_per_unit, right.currency);
     });
 
     return {
@@ -1124,7 +1238,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       try {
         const [suppliersRes, itemsRes, emailsRes] = await Promise.all([
           authFetch(`${apiBaseUrl}/api/suppliers`),
-          authFetch(`${apiBaseUrl}/api/catalogs/items?limit=200&latest_only=false`),
+          authFetch(`${apiBaseUrl}/api/catalogs/items?limit=5000&latest_only=true`),
           authFetch(`${apiBaseUrl}/api/catalogs/emails?limit=50`),
         ]);
 
@@ -1175,10 +1289,11 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   useEffect(() => {
     if (!authUser) return;
     const intervalId = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
       setDataRefreshKey((current) => current + 1);
       fetchEmailSyncSettings();
       fetchConnectedAccounts();
-    }, 30000);
+    }, 300000);
     return () => window.clearInterval(intervalId);
   }, [authUser, apiBaseUrl]);
 
@@ -1235,6 +1350,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     if (!trimmed) return;
     setMessages((current) => [...current, { role: "user", text: trimmed }]);
     setInput("");
+    setRows([]);
     
     // Trigger typing response indicator
     setIsTypingResponse(true);
@@ -1452,7 +1568,13 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     } catch (e) {
       currentPending = [];
     }
-    const newPending = currentPending.filter((p: any) => p.email_id !== item.email_id);
+    const ignoredRecord = {
+      ...item,
+      ignored: true,
+      ignored_at: new Date().toISOString(),
+    };
+    const withoutCurrent = currentPending.filter((p: any) => p.email_id !== item.email_id);
+    const newPending = [...withoutCurrent, ignoredRecord];
 
     await saveEmailSyncSettings({
       pending_approvals: JSON.stringify(newPending)
@@ -1576,6 +1698,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
           setDataRefreshKey((current) => current + 1);
         }, 1500);
       } else {
+        const errorPayload = await res.json().catch(() => null);
+        setSyncNotice(errorPayload?.detail || "Email sync failed. Check connected inbox settings and try again.");
         setSyncingAccountsState(prev => ({ ...prev, [id]: false }));
       }
     } catch (error) {
@@ -1702,7 +1826,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
           <button
             type="button"
             onClick={handleSyncRealtimeEmails}
-            disabled={isSyncingEmails || syncSuccess}
+            disabled={isSyncingEmails}
             style={{
               display: "flex",
               alignItems: "center",
@@ -1714,17 +1838,17 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
               fontSize: "12px",
               fontWeight: 500,
               color: syncSuccess ? "#0d6a50" : "var(--ink)",
-              cursor: (isSyncingEmails || syncSuccess) ? "not-allowed" : "pointer",
+              cursor: isSyncingEmails ? "not-allowed" : "pointer",
               transition: "all 0.2s",
             }}
             onMouseOver={(e) => {
-              if (!isSyncingEmails && !syncSuccess) {
+              if (!isSyncingEmails) {
                 e.currentTarget.style.background = "#fafcfb";
                 e.currentTarget.style.borderColor = "var(--accent)";
               }
             }}
             onMouseOut={(e) => {
-              if (!isSyncingEmails && !syncSuccess) {
+              if (!isSyncingEmails) {
                 e.currentTarget.style.background = "none";
                 e.currentTarget.style.borderColor = "var(--line)";
               }
@@ -2100,11 +2224,11 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                     ) : dashboardData.deals.map((deal, index) => (
                       <article className={`deal-row ${index === 2 ? "warning" : ""}`} key={deal.name}>
                         <div>
-                          <strong>{deal.best.ingredient_name}</strong>
-                          <span>{deal.best.supplier_name} - {formatQuantity(deal.best.available_qty)} {deal.best.unit}</span>
+                          <strong>{displayItemName(deal.best)}</strong>
+                          <span>{deal.best.supplier_name} - {displayQuantity(deal.best)}</span>
                         </div>
                         <div className="deal-price">
-                          <strong>{formatMoney(deal.best.price_per_unit, deal.best.currency)}/{deal.best.unit}</strong>
+                          <strong>{displayPrice(deal.best)}</strong>
                           <small>Best listed</small>
                         </div>
                       </article>
@@ -2122,29 +2246,6 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                   <div className="inbox-panel-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                     <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                       <h2>Inbox</h2>
-                      <button
-                        type="button"
-                        onClick={handleSyncRealtimeEmails}
-                        disabled={isSyncingEmails}
-                        className="refresh-inbox-button"
-                        title="Sync/Refresh Inbox"
-                        style={{
-                          background: "none",
-                          border: "none",
-                          cursor: isSyncingEmails ? "not-allowed" : "pointer",
-                          color: "var(--accent)",
-                          display: "inline-flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          padding: "4px",
-                          borderRadius: "4px",
-                          transition: "background 0.2s, transform 0.2s",
-                        }}
-                        onMouseOver={(e) => e.currentTarget.style.background = "rgba(15, 122, 95, 0.08)"}
-                        onMouseOut={(e) => e.currentTarget.style.background = "none"}
-                      >
-                        <RefreshCw size={16} className={isSyncingEmails ? "animate-spin" : ""} />
-                      </button>
                     </div>
                     <span className="inbox-count">{inboxThreads.length}</span>
                   </div>
@@ -2227,11 +2328,19 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                         </article>
                         <article className="summary-card">
                           <span>Price drops vs last</span>
-                          <strong>{selectedInboxThread.items.filter((item) => item.price_per_unit < (selectedInboxThread.items.reduce((total, row) => total + row.price_per_unit, 0) / selectedInboxThread.items.length)).length}</strong>
+                          <strong>{(() => {
+                            const priced = selectedInboxThread.items.filter((row) => row.price_per_unit != null);
+                            if (!priced.length) return 0;
+                            const avg = priced.reduce((total, row) => total + Number(row.price_per_unit), 0) / priced.length;
+                            return priced.filter((item) => Number(item.price_per_unit) < avg).length;
+                          })()}</strong>
                         </article>
                         <article className="summary-card">
                           <span>Best deals found</span>
-                          <strong>{selectedInboxThread.items.filter((item) => item.price_per_unit <= Math.min(...selectedInboxThread.items.map((row) => row.price_per_unit)) * 1.05).length}</strong>
+                          <strong>{(() => {
+                            const bestPrice = Math.min(...selectedInboxThread.items.map((row) => safePrice(row.price_per_unit, row.currency)));
+                            return Number.isFinite(bestPrice) ? selectedInboxThread.items.filter((item) => safePrice(item.price_per_unit, item.currency) <= bestPrice * 1.05).length : 0;
+                          })()}</strong>
                         </article>
                       </div>
 
@@ -2260,16 +2369,16 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                                 </tr>
                               ) : (
                                 selectedInboxThread.items.slice(0, 4).map((item, index) => {
-                                  const bestPrice = Math.min(...selectedInboxThread.items.map((row) => row.price_per_unit));
+                                  const bestPrice = Math.min(...selectedInboxThread.items.map((row) => safePrice(row.price_per_unit, row.currency)));
                                   return (
                                     <tr key={`${item.supplier_name}-${item.ingredient_name}-${index}`}>
-                                      <td>{item.ingredient_name}</td>
-                                      <td>{formatMoney(item.price_per_unit, item.currency)}/{item.unit}</td>
-                                      <td>{item.available_qty.toLocaleString()} {item.unit}</td>
-                                      <td>{item.lead_time_days != null ? `${item.lead_time_days} days` : "-"}</td>
-                                      <td>{item.moq != null ? `${formatQuantity(Number(item.moq))} ${item.unit}` : "-"}</td>
+                                      <td>{displayItemName(item)}</td>
+                                      <td>{displayPrice(item)}</td>
+                                      <td>{displayQuantity(item)}</td>
+                                      <td>{displayLeadTime(item)}</td>
+                                      <td>{displayMoq(item)}</td>
                                       <td>{formatDDMMYY(selectedInboxThread.received_at)}</td>
-                                      <td>{item.price_per_unit === bestPrice ? "Best price" : "-"}</td>
+                                      <td>{safePrice(item.price_per_unit, item.currency) === bestPrice ? "Best price" : "-"}</td>
                                     </tr>
                                   );
                                 })
@@ -2376,20 +2485,20 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                             <td colSpan={7}>No catalogue items match this filter.</td>
                           </tr>
                         ) : selectedCatalogItems.map((item, index) => {
-                          const bestPrice = Math.min(...selectedCatalog.items.map((row) => row.price_per_unit));
-                          const minQty = Math.min(...selectedCatalog.items.map((row) => row.available_qty));
-                          const status = item.price_per_unit <= bestPrice * 1.08
+                          const bestPrice = Math.min(...selectedCatalog.items.map((row) => safePrice(row.price_per_unit, row.currency)));
+                          const minQty = Math.min(...selectedCatalog.items.map((row) => safeQty(row.available_qty)));
+                          const status = safePrice(item.price_per_unit, item.currency) <= bestPrice * 1.08
                             ? "Best price"
-                            : item.available_qty <= minQty * 1.35
+                            : safeQty(item.available_qty) <= minQty * 1.35
                               ? "Low stock"
                               : "Good";
                           return (
                             <tr key={`${item.supplier_name}-${item.ingredient_name}-${index}`}>
-                              <td>{item.ingredient_name}</td>
-                              <td>{formatMoney(item.price_per_unit, item.currency)}/{item.unit}</td>
-                              <td>{formatQuantity(item.available_qty)} {item.unit}</td>
-                              <td>{item.lead_time_days != null ? `${item.lead_time_days} days` : "-"}</td>
-                              <td>{item.moq != null ? `${formatQuantity(Number(item.moq))} ${item.unit}` : "-"}</td>
+                              <td>{displayItemName(item)}</td>
+                              <td>{displayPrice(item)}</td>
+                              <td>{displayQuantity(item)}</td>
+                              <td>{displayLeadTime(item)}</td>
+                              <td>{displayMoq(item)}</td>
                               <td>{formatDDMMYY(item.received_at)}</td>
                               <td><span className={`catalog-status ${status === "Low stock" ? "warning" : status === "Best price" ? "best" : ""}`}>{status}</span></td>
                             </tr>
@@ -2451,12 +2560,12 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                         </div>
                       )}
                     </div>
-                    {compareData.rows.length > 0 && <small>{compareData.rows[0]?.pack_size || `${compareData.rows[0]?.unit ?? "unit"} based`} - Min qty {formatQuantity(Math.min(...compareData.rows.map((row) => row.available_qty)))}</small>}
+                    {compareData.rows.length > 0 && <small>{compareData.rows[0]?.pack_size || `${compareData.rows[0]?.unit ?? "unit"} based`} - Min qty {formatQuantity(Math.min(...compareData.rows.map((row) => safeQty(row.available_qty))))}</small>}
                   </div>
                   <label className="compare-sort">
                     <span>Sort by</span>
                     <select value={compareSort} onChange={(event) => setCompareSort(event.target.value as CompareSort)}>
-                      <option value="best-value">Best value score</option>
+                      <option value="best-value">Best value</option>
                       <option value="highest-qty">Highest qty</option>
                       <option value="lowest-price">Lowest price</option>
                     </select>
@@ -2466,88 +2575,52 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
 
               {compareData.rows.length > 0 && (
                 <p className="compare-note">
-                  Showing {compareData.rows.length} suppliers who carry this ingredient - Top 3 shown as cards - AI score = price + quantity
+                  Showing latest offers from {compareData.rows.length} supplier{compareData.rows.length === 1 ? "" : "s"} for {displayText(compareData.ingredientLabel)}.
                 </p>
               )}
 
               {supplierLoading ? (
-                <div className="compare-empty">Loading mock comparison data...</div>
+                <div className="compare-empty">Loading supplier comparison data...</div>
               ) : supplierError ? (
                 <div className="compare-empty">{supplierError}</div>
               ) : !selectedCompareIngredient.trim() ? (
                 <div className="compare-empty">Select an ingredient from suggestions to compare suppliers.</div>
               ) : compareData.rows.length === 0 ? (
-                <div className="compare-empty">No mock suppliers found for this ingredient.</div>
+                <div className="compare-empty">No suppliers found for this ingredient.</div>
               ) : (
                 <>
                   <div className="compare-card-grid">
                     {compareData.topRows.map((row, index) => (
-                      <article className={`compare-card ${index === 0 ? "recommended" : ""}`} key={`${row.supplier_name}-${row.ingredient_name}`}>
-                        {index === 0 && <div className="recommended-ribbon">AI recommended</div>}
+                      <article className="compare-card" key={`${row.supplier_name}-${row.ingredient_name}`}>
                         <div className="compare-supplier-head">
                           <div className="supplier-badge">{supplierInitials(row.supplier_name)}</div>
                           <div>
                             <h3>{row.supplier_name}</h3>
-                            <p style={{ margin: 0 }}>{row.email_domain}</p>
-                            {row.certifications && (
-                              <div style={{ display: "flex", gap: "4px", flexWrap: "wrap", marginTop: "4px" }}>
-                                {row.certifications.split(",").map((cert) => {
-                                  const trimmed = cert.trim();
-                                  return (
-                                    <span
-                                      key={trimmed}
-                                      style={{
-                                        display: "inline-flex",
-                                        alignItems: "center",
-                                        background: "rgba(15, 122, 95, 0.06)",
-                                        color: "var(--accent)",
-                                        fontSize: "10px",
-                                        fontWeight: 600,
-                                        padding: "1px 5px",
-                                        borderRadius: "3px",
-                                        border: "1px solid rgba(15, 122, 95, 0.12)",
-                                      }}
-                                    >
-                                      {trimmed}
-                                    </span>
-                                  );
-                                })}
-                              </div>
-                            )}
+                            <p style={{ margin: 0 }}>{displayItemName(row)} · {row.email_domain}</p>
                           </div>
                         </div>
 
                         <div className="compare-stat-grid">
                           <div>
-                            <strong>{formatMoney(row.price_per_unit, row.currency)}</strong>
-                            <span>Per {row.unit}</span>
+                            <strong>{displayPrice(row)}</strong>
+                            <span>Price/unit</span>
                           </div>
                           <div>
-                            <strong>{formatQuantity(row.available_qty)}</strong>
-                            <span>Units avail.</span>
+                            <strong>{displayQuantity(row)}</strong>
+                            <span>Qty available</span>
                           </div>
                           <div>
-                            <strong>{row.lead_time_days ? `${row.lead_time_days} days` : "-"}</strong>
+                            <strong>{displayLeadTime(row)}</strong>
                             <span>Lead time</span>
                           </div>
-                        </div>
-
-                        <div className="score-bars">
-                          {[
-                            ["Price", row.priceScore],
-                            ["Qty", row.qtyScore],
-                            ["Overall", row.overallScore],
-                          ].map(([label, value]) => (
-                            <div className="score-row" key={label}>
-                              <span>{label}</span>
-                              <div className="score-track" aria-hidden="true">
-                                <svg viewBox="0 0 100 5" preserveAspectRatio="none" role="presentation" focusable="false">
-                                  <rect x="0" y="0" width={Math.max(0, Math.min(100, Number(value)))} height="5" rx="2.5" />
-                                </svg>
-                              </div>
-                              <strong>{value}</strong>
-                            </div>
-                          ))}
+                          <div>
+                            <strong>{displayMoq(row)}</strong>
+                            <span>MOQ</span>
+                          </div>
+                          <div>
+                            <strong>{formatDDMMYY(row.received_at)}</strong>
+                            <span>Updated</span>
+                          </div>
                         </div>
 
                         <button className="view-catalog-button" type="button" onClick={() => {
@@ -2560,7 +2633,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                   </div>
 
                   <section className="compare-table-panel">
-                    <h2>Other {compareData.otherRows.length} suppliers for {compareData.ingredientLabel}</h2>
+                    <h2>Supplier comparison for {displayText(compareData.ingredientLabel)}</h2>
                     <div className="table-wrap">
                       <table>
                         <thead>
@@ -2572,25 +2645,23 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                             <th>Lead Time</th>
                             <th>MOQ</th>
                             <th>Date</th>
-                            <th>Score</th>
                             <th>Certifications</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {compareData.otherRows.length === 0 ? (
+                          {compareData.rows.length === 0 ? (
                             <tr>
-                              <td colSpan={9}>Only top suppliers found for this ingredient.</td>
+                              <td colSpan={8}>Only top suppliers found for this ingredient.</td>
                             </tr>
-                          ) : compareData.otherRows.map((row, index) => (
+                          ) : compareData.rows.map((row, index) => (
                             <tr key={`${row.supplier_name}-${row.ingredient_name}-table`}>
-                              <td>{index + 4}</td>
+                              <td>{index + 1}</td>
                               <td>{row.supplier_name}</td>
-                              <td>{formatMoney(row.price_per_unit, row.currency)}/{row.unit}</td>
-                              <td>{formatQuantity(row.available_qty)} {row.unit}</td>
-                              <td>{row.lead_time_days != null ? `${row.lead_time_days} days` : "-"}</td>
-                              <td>{row.moq != null ? `${formatQuantity(Number(row.moq))} ${row.unit}` : "-"}</td>
+                              <td>{displayPrice(row)}</td>
+                              <td>{displayQuantity(row)}</td>
+                              <td>{displayLeadTime(row)}</td>
+                              <td>{displayMoq(row)}</td>
                               <td>{formatDDMMYY(row.received_at)}</td>
-                              <td>{row.overallScore}</td>
                               <td>
                                 {row.certifications ? (
                                   <div style={{ display: "flex", gap: "4px", flexWrap: "wrap", justifyContent: "center" }}>
@@ -2674,12 +2745,12 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                       ) : (
                         assistantRows.map((row, index) => (
                           <tr key={index}>
-                            <td>{String(row.supplier_name ?? "-")}</td>
-                            <td>{String(row.normalized_name ?? row.ingredient_name ?? "-")}</td>
-                            <td>{typeof row.price_per_unit === "number" ? `${formatMoney(Number(row.price_per_unit), String(row.currency ?? "INR"))}/${String(row.unit ?? "unit")}` : "-"}</td>
-                            <td>{row.available_qty != null ? `${formatQuantity(Number(row.available_qty))} ${String(row.unit ?? "")}` : "-"}</td>
-                            <td>{row.lead_time_days != null ? `${row.lead_time_days} days` : "-"}</td>
-                            <td>{row.moq != null ? `${formatQuantity(Number(row.moq))} ${String(row.unit ?? "")}` : "-"}</td>
+                            <td>{displayText(row.supplier_name)}</td>
+                            <td>{displayItemName(row)}</td>
+                            <td>{displayPrice(row as SupplierItem)}</td>
+                            <td>{displayQuantity(row as SupplierItem)}</td>
+                            <td>{!isMissingDisplayValue(row.lead_time_text) ? String(row.lead_time_text) : (row.lead_time_days != null ? `${row.lead_time_days} days` : "-")}</td>
+                            <td>{!isMissingDisplayValue(row.moq_display) ? String(row.moq_display) : (row.moq != null ? `${formatQuantity(Number(row.moq))} ${String(row.unit ?? "")}` : "-")}</td>
                             <td>{formatDDMMYY(row.received_at as string)}</td>
                             <td>
                               {row.certifications ? (

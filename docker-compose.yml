@@ -1,24 +1,41 @@
 services:
-  redis:
-    image: redis:7-alpine
+  valkey:
+    image: valkey/valkey:8-alpine
+    command: ["valkey-server", "--requirepass", "${VALKEY_PASSWORD:-medicore-local-valkey-password}", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD:-medicore-local-valkey-password}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
   api:
     build:
       context: .
       dockerfile: backend/Dockerfile
     env_file: .env
+    environment:
+      VALKEY_URL: ${VALKEY_URL:-redis://:${VALKEY_PASSWORD:-medicore-local-valkey-password}@valkey:6379/0}
     ports:
       - "8000:8000"
     depends_on:
-      - redis
+      valkey:
+        condition: service_healthy
 
   worker:
     build:
       context: .
       dockerfile: backend/Dockerfile
     env_file: .env
+    environment:
+      VALKEY_URL: ${VALKEY_URL:-redis://:${VALKEY_PASSWORD:-medicore-local-valkey-password}@valkey:6379/0}
     command: ["uv", "run", "celery", "-A", "backend.app.tasks", "worker", "--loglevel=info"]
     depends_on:
-      - redis
+      valkey:
+        condition: service_healthy
+
+volumes:
+  valkey_data:

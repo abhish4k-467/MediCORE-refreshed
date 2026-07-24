@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, exists, func, nullslast, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from uuid import UUID
@@ -9,8 +9,17 @@ from backend.app.db import get_db
 from backend.app.models import CatalogEmail, CatalogItem, Supplier
 from backend.app.seed_mock_catalogs import build_catalogs
 from backend.app.auth import get_current_user
+from backend.app.schemas import clean_optional_text
 
 router = APIRouter()
+
+
+def nullable_float(value):
+    return float(value) if value is not None else None
+
+
+def display_value(raw_payload: dict | None, key: str):
+    return clean_optional_text((raw_payload or {}).get(key))
 
 
 def mock_catalog_emails(limit: int) -> list[dict]:
@@ -41,17 +50,23 @@ def mock_catalog_items(q: str | None, limit: int) -> list[dict]:
             "supplier_name": supplier_names.get(item.supplier_id, "Mock supplier"),
             "ingredient_name": item.ingredient_name,
             "normalized_name": item.normalized_name,
-            "price_per_unit": float(item.price_per_unit),
+            "price_per_unit": nullable_float(item.price_per_unit),
             "currency": item.currency,
-            "available_qty": float(item.available_qty),
+            "available_qty": nullable_float(item.available_qty),
             "unit": item.unit,
             "valid_until": item.valid_until,
             "lead_time_days": getattr(item, "lead_time_days", None) if getattr(item, "lead_time_days", None) is not None else (item.raw_payload or {}).get("lead_time_days"),
+            "lead_time_text": display_value(item.raw_payload, "lead_time_text"),
             "moq": getattr(item, "moq", None) if getattr(item, "moq", None) is not None else (item.raw_payload or {}).get("moq"),
-            "pack_size": (item.raw_payload or {}).get("pack_size"),
+            "pack_size": display_value(item.raw_payload, "pack_size"),
+            "price_display": display_value(item.raw_payload, "price_display"),
+            "quantity_display": display_value(item.raw_payload, "quantity_display"),
+            "moq_display": display_value(item.raw_payload, "moq_display"),
+            "source_document": display_value(item.raw_payload, "source_document"),
+            "is_updated": bool((item.raw_payload or {}).get("is_updated")),
             "received_at": email_received_dates.get(item.catalog_email_id) if getattr(item, "catalog_email_id", None) else None,
         }
-        for item in sorted(filtered_items, key=lambda row: row.price_per_unit)[:limit]
+        for item in sorted(filtered_items, key=lambda row: row.price_per_unit if row.price_per_unit is not None else float("inf"))[:limit]
     ]
 
 
@@ -97,35 +112,47 @@ def list_catalog_emails(
 def list_catalog_items(
     db: Session = Depends(get_db),
     q: str | None = None,
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(500, ge=1, le=5000),
     latest_only: bool = Query(True),
     current_user: dict = Depends(get_current_user)
 ) -> list[dict]:
     settings = get_settings()
     user_uuid = UUID(current_user["tenant_id"])
     stmt = (
-        select(CatalogItem, Supplier.name, CatalogEmail.received_at)
+        select(CatalogItem, Supplier.name, CatalogEmail.received_at, None)
         .join(Supplier, Supplier.id == CatalogItem.supplier_id)
         .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
     )
     if latest_only:
         latest_items = (
             select(
-                CatalogItem.supplier_id.label("supplier_id"),
-                CatalogItem.normalized_name.label("normalized_name"),
-                func.max(CatalogEmail.received_at).label("latest_received_at"),
+                CatalogItem.id.label("item_id"),
+                func.row_number().over(
+                    partition_by=(CatalogItem.supplier_id, CatalogItem.normalized_name),
+                    order_by=(
+                        CatalogEmail.received_at.desc(),
+                        CatalogItem.raw_payload["is_updated"].as_boolean().desc().nullslast(),
+                        CatalogItem.id.desc(),
+                    ),
+                ).label("row_number"),
+                func.count(CatalogItem.id).over(
+                    partition_by=(CatalogItem.supplier_id, CatalogItem.normalized_name),
+                ).label("history_count"),
             )
             .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
             .where(CatalogItem.tenant_id == user_uuid)
-            .group_by(CatalogItem.supplier_id, CatalogItem.normalized_name)
             .subquery()
+        )
+        stmt = (
+            select(CatalogItem, Supplier.name, CatalogEmail.received_at, latest_items.c.history_count)
+            .join(Supplier, Supplier.id == CatalogItem.supplier_id)
+            .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
         )
         stmt = stmt.join(
             latest_items,
             and_(
-                latest_items.c.supplier_id == CatalogItem.supplier_id,
-                latest_items.c.normalized_name == CatalogItem.normalized_name,
-                latest_items.c.latest_received_at == CatalogEmail.received_at,
+                latest_items.c.item_id == CatalogItem.id,
+                latest_items.c.row_number == 1,
             ),
         )
     stmt = stmt.where(CatalogItem.tenant_id == user_uuid)
@@ -134,7 +161,7 @@ def list_catalog_items(
         stmt = stmt.where(or_(source.is_(None), source != "mock_extracted_catalogue"))
     if q:
         stmt = stmt.where(CatalogItem.normalized_name.ilike(f"%{q}%"))
-    stmt = stmt.order_by(CatalogItem.price_per_unit.asc()).limit(limit)
+    stmt = stmt.order_by(nullslast(CatalogItem.price_per_unit.asc())).limit(limit)
     try:
         return [
             {
@@ -143,17 +170,23 @@ def list_catalog_items(
                 "supplier_name": supplier_name,
                 "ingredient_name": item.ingredient_name,
                 "normalized_name": item.normalized_name,
-                "price_per_unit": float(item.price_per_unit),
+                "price_per_unit": nullable_float(item.price_per_unit),
                 "currency": item.currency,
-                "available_qty": float(item.available_qty),
+                "available_qty": nullable_float(item.available_qty),
                 "unit": item.unit,
                 "valid_until": item.valid_until,
                 "lead_time_days": getattr(item, "lead_time_days", None) if getattr(item, "lead_time_days", None) is not None else (item.raw_payload or {}).get("lead_time_days"),
+                "lead_time_text": display_value(item.raw_payload, "lead_time_text"),
                 "moq": getattr(item, "moq", None) if getattr(item, "moq", None) is not None else (item.raw_payload or {}).get("moq"),
-                "pack_size": (item.raw_payload or {}).get("pack_size"),
+                "pack_size": display_value(item.raw_payload, "pack_size"),
+                "price_display": display_value(item.raw_payload, "price_display"),
+                "quantity_display": display_value(item.raw_payload, "quantity_display"),
+                "moq_display": display_value(item.raw_payload, "moq_display"),
+                "source_document": display_value(item.raw_payload, "source_document"),
+                "is_updated": bool((item.raw_payload or {}).get("is_updated")) or bool(history_count and history_count > 1),
                 "received_at": received_at,
             }
-            for item, supplier_name, received_at in db.execute(stmt)
+            for item, supplier_name, received_at, history_count in db.execute(stmt)
         ]
     except SQLAlchemyError:
         if not settings.mock_data_enabled:
@@ -177,17 +210,34 @@ def delete_catalog_email(
             detail="Catalog email not found or access denied."
         )
     try:
-        # Delete catalog items first to satisfy foreign key constraint
-        db.query(CatalogItem).filter(CatalogItem.catalog_email_id == email_id).delete(synchronize_session=False)
-        # Delete the email record itself
-        db.delete(email_record)
+        email_items = db.query(CatalogItem).filter(CatalogItem.catalog_email_id == email_id).all()
+        for item in email_items:
+            history_count = (
+                db.query(CatalogItem.id)
+                .filter(
+                    CatalogItem.tenant_id == user_uuid,
+                    CatalogItem.supplier_id == item.supplier_id,
+                    CatalogItem.normalized_name == item.normalized_name,
+                )
+                .count()
+            )
+            if bool((item.raw_payload or {}).get("is_updated")) or history_count > 1:
+                db.query(CatalogItem).filter(
+                    CatalogItem.tenant_id == user_uuid,
+                    CatalogItem.supplier_id == item.supplier_id,
+                    CatalogItem.normalized_name == item.normalized_name,
+                ).delete(synchronize_session=False)
+            else:
+                db.delete(item)
+        # Keep a tombstone so future inbox syncs do not re-import a user-deleted email.
+        email_record.processing_status = "deleted"
         db.commit()
     except Exception as e:
         db.rollback()
         from fastapi import HTTPException
         raise HTTPException(
             status_code=500,
-            detail=f"An error occurred while deleting the email record: {str(e)}"
+            detail="An error occurred while deleting the email record."
         )
 
 

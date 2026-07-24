@@ -1,12 +1,12 @@
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from uuid import UUID
 
 from backend.app.config import get_settings
 from backend.app.db import get_db
-from backend.app.models import CatalogEmail, Supplier
+from backend.app.models import CatalogEmail, CatalogItem, Supplier
 from backend.app.seed_mock_catalogs import build_catalogs
 from backend.app.auth import get_current_user
 
@@ -38,7 +38,11 @@ def list_suppliers(
         stmt = (
             select(Supplier)
             .join(CatalogEmail, CatalogEmail.supplier_id == Supplier.id)
-            .where(Supplier.tenant_id == user_uuid)
+            .where(
+                Supplier.tenant_id == user_uuid,
+                CatalogEmail.processing_status == "completed",
+                exists().where(CatalogItem.catalog_email_id == CatalogEmail.id),
+            )
             .distinct()
         )
         if not settings.mock_data_enabled:

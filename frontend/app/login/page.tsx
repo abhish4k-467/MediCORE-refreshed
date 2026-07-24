@@ -32,23 +32,8 @@ export default function LoginPage() {
         return;
       }
 
-      const role = data.user?.user_metadata?.role;
-      
-      if (loginRole === "admin" && role !== "admin" && role !== "superadmin") {
-        await supabase.auth.signOut();
-        setError("This account is not configured as an administrator.");
-        setLoading(false);
-        return;
-      }
-      
-      if (loginRole === "employee" && role === "admin") {
-        await supabase.auth.signOut();
-        setError("This account is configured as an administrator. Please select Admin Login.");
-        setLoading(false);
-        return;
-      }
-
       // Verify database status of profile (active/disabled/deleted)
+      let role = "employee";
       try {
         const isLocal = window.location.hostname === "localhost" ||
           window.location.hostname === "127.0.0.1" ||
@@ -73,6 +58,21 @@ export default function LoginPage() {
           return;
         } else {
           const profileData = await res.json();
+          role = profileData.role || "employee";
+          if (loginRole === "admin" && role !== "admin" && role !== "superadmin") {
+            await supabase.auth.signOut();
+            setError("This account is not configured as an administrator.");
+            setLoading(false);
+            return;
+          }
+
+          if (loginRole === "employee" && (role === "admin" || role === "superadmin")) {
+            await supabase.auth.signOut();
+            setError("This account is configured as an administrator. Please select Admin Login.");
+            setLoading(false);
+            return;
+          }
+
           if (profileData.status === "Pending Approval") {
             await supabase.auth.signOut();
             setError("Your workspace registration is pending approval by the MediCORE Superadmin. You will be granted access once approved.");
@@ -88,6 +88,10 @@ export default function LoginPage() {
         }
       } catch (err) {
         console.error("Failed to verify user profile during login:", err);
+        await supabase.auth.signOut();
+        setError("You are not authorised to use MediCORE");
+        setLoading(false);
+        return;
       }
 
       if (role === "superadmin") {

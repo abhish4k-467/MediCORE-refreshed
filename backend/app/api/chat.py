@@ -38,9 +38,9 @@ async def chat_socket(websocket: WebSocket, db: Session = Depends(get_db)) -> No
                     tenant_id = profile.tenant_id
                 else:
                     tenant_id = user_uuid
-        except Exception as e:
+        except Exception:
             logger.exception("WebSocket authentication failed with exception")
-            await websocket.send_json({"type": "error", "message": f"Authentication failed. Connection closed. Details: {str(e)}"})
+            await websocket.send_json({"type": "error", "message": "Authentication failed. Connection closed."})
             await websocket.close()
             return
     else:
@@ -56,7 +56,7 @@ async def chat_socket(websocket: WebSocket, db: Session = Depends(get_db)) -> No
         return
 
     settings = get_settings()
-    cache = Redis.from_url(settings.redis_url, decode_responses=True)
+    cache = Redis.from_url(settings.queue_url, decode_responses=True)
     engine = NaturalLanguageQueryEngine(db=db, cache=cache)
 
     try:
@@ -65,15 +65,12 @@ async def chat_socket(websocket: WebSocket, db: Session = Depends(get_db)) -> No
             try:
                 result = engine.answer(message, tenant_id=tenant_id, user_id=user_id)
                 await websocket.send_json({"type": "answer", "answer": result.answer, "rows": result.rows})
-            except Exception as exc:
+            except Exception:
+                logger.exception("Chat query failed")
                 await websocket.send_json(
                     {
                         "type": "error",
-                        "message": (
-                            "MediCORE could not complete that query. "
-                            "Check the backend terminal for the full error. "
-                            f"Short error: {exc}"
-                        ),
+                        "message": "MediCORE could not complete that query.",
                     }
                 )
     except WebSocketDisconnect:
