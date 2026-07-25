@@ -11,7 +11,7 @@ settings = get_settings()
 
 allowed_origins = {
     settings.frontend_origin,
-    "https://medi-core-silk.vercel.app",
+    "https://medi-core2.vercel.app",
 }
 allow_origin_regex = None
 
