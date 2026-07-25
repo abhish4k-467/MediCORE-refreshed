@@ -27,6 +27,8 @@ dependencies = [
     "openpyxl",
     "xlrd",
     "mammoth",
+    "pydantic[email]",
+    "email-validator>=2.2.0",
 ]
 
 [project.optional-dependencies]

@@ -15,9 +15,11 @@ redis>=5.0.8
 sentence-transformers>=3.1.0
 sqlalchemy>=2.0.35
 supabase>=2.8.0
-uvicorn[standard]>=0.30.6
-psycopg2>=2.9.12
+uvicorn[standard]==0.30.6
+python-pptx>=1.0.2
 pandas
 openpyxl
 xlrd
 mammoth
+pydantic[email]
+email-validator>=2.2.0
