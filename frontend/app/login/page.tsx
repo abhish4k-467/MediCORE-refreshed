@@ -33,12 +33,19 @@ export default function LoginPage() {
         return;
       }
 
+      const accessToken = data.session?.access_token;
+      if (!accessToken) {
+        setError("Login succeeded, but no Supabase session token was returned.");
+        setLoading(false);
+        return;
+      }
+
       // Verify database status of profile (active/disabled/deleted)
       let role = "employee";
       try {
         const res = await fetch(`${getApiBaseUrl()}/api/profile`, {
           headers: {
-            Authorization: `Bearer ${data.session?.access_token}`
+            Authorization: `Bearer ${accessToken}`
           }
         });
         if (!res.ok) {
