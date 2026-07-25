@@ -1,12 +1,12 @@
 "use client";
 
-import { useState, useEffect, FormEvent } from "react";
+import { useState, useEffect, FormEvent, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { supabase } from "@/lib/supabase";
 import { Sparkles, ArrowRight, ShieldCheck, Mail, Lock, User, Briefcase, Loader2, Info, Eye, EyeOff } from "lucide-react";
 
-export default function RegisterStep1Page() {
+function RegisterStep1Content() {
   const router = useRouter();
   const searchParams = useSearchParams();
 
@@ -843,5 +843,17 @@ export default function RegisterStep1Page() {
         }
       `}</style>
     </main>
+  );
+}
+
+export default function RegisterStep1Page() {
+  return (
+    <Suspense fallback={
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', background: 'radial-gradient(circle at 10% 20%, rgba(244, 247, 245, 1) 0%, rgba(220, 228, 223, 0.4) 90%)', color: '#66736d', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif' }}>
+        Loading...
+      </div>
+    }>
+      <RegisterStep1Content />
+    </Suspense>
   );
 }
