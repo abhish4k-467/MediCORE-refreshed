@@ -4,6 +4,7 @@ import { useEffect, useState, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Loader2, AlertTriangle, ShieldCheck, Lock, Eye, EyeOff, CheckCircle } from "lucide-react";
 import Loader from "@/components/Loader";
+import { getApiBaseUrl } from "@/lib/api";
 
 function ResetPasswordContent() {
   const router = useRouter();
@@ -28,7 +29,7 @@ function ResetPasswordContent() {
       return;
     }
 
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+    const apiUrl = getApiBaseUrl();
 
     // Call backend endpoint to verify reset token
     fetch(`${apiUrl}/api/admin/reset-password/verify?token=${token}`)
@@ -65,7 +66,7 @@ function ResetPasswordContent() {
     }
 
     setSubmitting(true);
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+    const apiUrl = getApiBaseUrl();
 
     try {
       const response = await fetch(`${apiUrl}/api/admin/reset-password/complete`, {

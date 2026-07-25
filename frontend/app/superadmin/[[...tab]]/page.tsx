@@ -3,6 +3,7 @@
 import React, { useEffect, useState, use } from "react";
 import { useRouter } from "next/navigation";
 import Loader from "@/components/Loader";
+import { getApiBaseUrl } from "@/lib/api";
 import {
   LayoutDashboard,
   Users,
@@ -113,16 +114,7 @@ export default function SuperadminWorkspacePage({ params }: { params: Promise<{ 
 
   const getQueueStatus = () => telemetry?.valkey_status || telemetry?.redis_status || "Offline";
 
-  const getApiUrl = () => {
-    const isLocal = window.location.hostname === "localhost" ||
-      window.location.hostname === "127.0.0.1" ||
-      window.location.hostname === "0.0.0.0" ||
-      window.location.hostname.startsWith("192.168.") ||
-      window.location.hostname.startsWith("10.") ||
-      window.location.hostname.startsWith("172.");
-    const targetHost = window.location.hostname === "localhost" ? "127.0.0.1" : window.location.hostname;
-    return isLocal ? `${window.location.protocol}//${targetHost}:8000` : "https://backend-production-b29e.up.railway.app";
-  };
+  const getApiUrl = getApiBaseUrl;
 
   const verifySuperadminProfile = async (accessToken: string) => {
     const response = await fetch(`${getApiUrl()}/api/profile`, {

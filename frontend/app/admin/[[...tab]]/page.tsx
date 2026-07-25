@@ -3,6 +3,7 @@
 import React, { useEffect, useState, use } from "react";
 import { useRouter } from "next/navigation";
 import Loader from "@/components/Loader";
+import { getApiBaseUrl } from "@/lib/api";
 import { 
   Users, 
   MailOpen, 
@@ -146,24 +147,7 @@ export default function AdminWorkspacePage({ params }: { params: Promise<{ tab?:
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
 
-  function getApiUrl() {
-    if (process.env.NEXT_PUBLIC_API_URL) {
-      return process.env.NEXT_PUBLIC_API_URL;
-    }
-    if (typeof window === "undefined") {
-      return "http://localhost:8000";
-    }
-    const hn = window.location.hostname;
-    const isLocal = hn === "localhost" ||
-      hn === "127.0.0.1" ||
-      hn === "0.0.0.0" ||
-      hn.startsWith("192.168.") ||
-      hn.startsWith("10.") ||
-      hn.startsWith("172.") ||
-      hn.endsWith(".local");
-    const targetHost = hn === "localhost" ? "127.0.0.1" : hn;
-    return isLocal ? `${window.location.protocol}//${targetHost}:8000` : "https://backend-production-b29e.up.railway.app";
-  }
+  const getApiUrl = getApiBaseUrl;
 
   // --- 1. Dashboard State & Fetching ---
   const [dashboardStats, setDashboardStats] = useState<DashboardStats | null>(null);

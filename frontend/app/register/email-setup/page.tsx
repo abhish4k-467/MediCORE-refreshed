@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
+import { getApiBaseUrl } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 import {
   Sparkles,
@@ -79,22 +80,7 @@ export default function EmailSetupPage() {
     };
   }, [router]);
 
-  const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || (() => {
-    if (typeof window === "undefined") {
-      return "https://backend-production-b29e.up.railway.app";
-    }
-    const hn = window.location.hostname;
-    const isLocal = hn === "localhost" || 
-                    hn === "127.0.0.1" || 
-                    hn === "0.0.0.0" ||
-                    hn.startsWith("192.168.") || 
-                    hn.startsWith("10.") || 
-                    hn.startsWith("172.") ||
-                    hn.endsWith(".local");
-    return isLocal 
-      ? `http://${hn}:8000` 
-      : "https://backend-production-b29e.up.railway.app";
-  })();
+  const apiBaseUrl = getApiBaseUrl();
 
   async function handleTestConnection() {
     if (!emailAddress || !appPassword) {

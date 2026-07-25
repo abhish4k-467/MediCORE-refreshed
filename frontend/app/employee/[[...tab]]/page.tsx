@@ -1,6 +1,7 @@
 "use client";
 
 import Loader from "@/components/Loader";
+import { getApiBaseUrl, getChatWsUrl } from "@/lib/api";
 import {
   BarChart3,
   Bell,
@@ -638,59 +639,12 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
 
   const [syncingAccountsState, setSyncingAccountsState] = useState<Record<string, boolean>>({});
   const socketRef = useRef<WebSocket | null>(null);
-  const productionApiBaseUrl = "https://backend-production-b29e.up.railway.app";
-  const productionWsUrl = "wss://backend-production-b29e.up.railway.app/ws/chat";
-
   const apiBaseUrl = useMemo(() => {
-    if (process.env.NEXT_PUBLIC_API_URL) {
-      return process.env.NEXT_PUBLIC_API_URL;
-    }
-
-    if (typeof window === "undefined") {
-      return productionApiBaseUrl;
-    }
-
-    const hn = window.location.hostname;
-    const isLocal = hn === "localhost" ||
-      hn === "127.0.0.1" ||
-      hn === "0.0.0.0" ||
-      hn.startsWith("192.168.") ||
-      hn.startsWith("10.") ||
-      hn.startsWith("172.") ||
-      hn.endsWith(".local");
-
-    if (isLocal) {
-      const targetHost = hn === "localhost" ? "127.0.0.1" : hn;
-      return `${window.location.protocol}//${targetHost}:8000`;
-    }
-
-    return productionApiBaseUrl;
+    return getApiBaseUrl();
   }, []);
+
   const wsUrl = useMemo(() => {
-    if (process.env.NEXT_PUBLIC_WS_URL) {
-      return process.env.NEXT_PUBLIC_WS_URL;
-    }
-
-    if (typeof window === "undefined") {
-      return productionWsUrl;
-    }
-
-    const hn = window.location.hostname;
-    const isLocal = hn === "localhost" ||
-      hn === "127.0.0.1" ||
-      hn === "0.0.0.0" ||
-      hn.startsWith("192.168.") ||
-      hn.startsWith("10.") ||
-      hn.startsWith("172.") ||
-      hn.endsWith(".local");
-
-    if (isLocal) {
-      const targetHost = hn === "localhost" ? "127.0.0.1" : hn;
-      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      return `${protocol}://${targetHost}:8000/ws/chat`;
-    }
-
-    return productionWsUrl;
+    return getChatWsUrl();
   }, []);
   const showAssistantPanel = activeTab === "assistant";
 

@@ -3,6 +3,7 @@
 import { useState, useEffect, FormEvent, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
+import { getApiBaseUrl } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 import { Sparkles, ArrowRight, ShieldCheck, Mail, Lock, User, Briefcase, Loader2, Info, Eye, EyeOff } from "lucide-react";
 
@@ -44,22 +45,7 @@ function RegisterStep1Content() {
     setLoading(true);
 
     try {
-      const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || (() => {
-        if (typeof window === "undefined") {
-          return "https://backend-production-b29e.up.railway.app";
-        }
-        const hn = window.location.hostname;
-        const isLocal = hn === "localhost" ||
-          hn === "127.0.0.1" ||
-          hn === "0.0.0.0" ||
-          hn.startsWith("192.168.") ||
-          hn.startsWith("10.") ||
-          hn.startsWith("172.") ||
-          hn.endsWith(".local");
-        return isLocal
-          ? `http://${hn}:8000`
-          : "https://backend-production-b29e.up.railway.app";
-      })();
+      const apiBaseUrl = getApiBaseUrl();
 
       if (isEmployee) {
         // Complete activation using backend API to auto-confirm email and bypass Supabase signUp email trigger

@@ -3,6 +3,7 @@
 import { useState, FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { getApiBaseUrl } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 import { Sparkles, ArrowRight, ShieldCheck, Mail, Lock, Loader2, Eye, EyeOff } from "lucide-react";
 
@@ -35,18 +36,7 @@ export default function LoginPage() {
       // Verify database status of profile (active/disabled/deleted)
       let role = "employee";
       try {
-        const isLocal = window.location.hostname === "localhost" ||
-          window.location.hostname === "127.0.0.1" ||
-          window.location.hostname === "0.0.0.0" ||
-          window.location.hostname.startsWith("192.168.") ||
-          window.location.hostname.startsWith("10.") ||
-          window.location.hostname.startsWith("172.") ||
-          window.location.hostname.endsWith(".local");
-
-        const targetHost = window.location.hostname === "localhost" ? "127.0.0.1" : window.location.hostname;
-        const apiBaseUrl = isLocal ? `${window.location.protocol}//${targetHost}:8000` : "https://backend-production-b29e.up.railway.app";
-
-        const res = await fetch(`${apiBaseUrl}/api/profile`, {
+        const res = await fetch(`${getApiBaseUrl()}/api/profile`, {
           headers: {
             Authorization: `Bearer ${data.session?.access_token}`
           }

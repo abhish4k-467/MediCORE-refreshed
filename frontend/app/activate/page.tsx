@@ -4,6 +4,7 @@ import { useEffect, useState, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { AlertTriangle, ShieldCheck } from "lucide-react";
 import Loader from "@/components/Loader";
+import { getApiBaseUrl } from "@/lib/api";
 
 function ActivateContent() {
   const router = useRouter();
@@ -20,7 +21,7 @@ function ActivateContent() {
       return;
     }
     
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+    const apiUrl = getApiBaseUrl();
     
     // Call backend endpoint to verify activation token
     fetch(`${apiUrl}/api/admin/activate/verify?token=${token}`)
