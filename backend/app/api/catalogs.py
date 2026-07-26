@@ -6,7 +6,7 @@ from uuid import UUID
 
 from backend.app.config import get_settings
 from backend.app.db import get_db
-from backend.app.models import CatalogEmail, CatalogItem, Supplier
+from backend.app.models import CatalogEmail, CatalogItem, EmailAccount, EmailSyncSetting, Supplier
 from backend.app.seed_mock_catalogs import build_catalogs
 from backend.app.auth import get_current_user
 from backend.app.schemas import clean_optional_text
@@ -192,6 +192,77 @@ def list_catalog_items(
         if not settings.mock_data_enabled:
             raise
         return mock_catalog_items(q, limit)
+
+
+@router.get("/sync-diagnostics")
+def sync_diagnostics(
+    db: Session = Depends(get_db),
+    limit: int = Query(25, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    import json
+
+    tenant_uuid = UUID(current_user["tenant_id"])
+    user_uuid = UUID(current_user["id"])
+
+    accounts = db.query(EmailAccount).filter(EmailAccount.user_id == user_uuid).all()
+    sync_setting = db.query(EmailSyncSetting).filter(EmailSyncSetting.user_id == user_uuid).first()
+    pending_approvals: list[dict] = []
+    if sync_setting:
+        try:
+            parsed = json.loads(sync_setting.pending_approvals or "[]")
+            pending_approvals = [item for item in parsed if isinstance(item, dict)]
+        except Exception:
+            pending_approvals = []
+
+    email_rows = (
+        db.query(
+            CatalogEmail,
+            Supplier.name.label("supplier_name"),
+            func.count(CatalogItem.id).label("item_count"),
+        )
+        .join(Supplier, Supplier.id == CatalogEmail.supplier_id)
+        .outerjoin(CatalogItem, CatalogItem.catalog_email_id == CatalogEmail.id)
+        .filter(CatalogEmail.tenant_id == tenant_uuid)
+        .group_by(CatalogEmail.id, Supplier.name)
+        .order_by(CatalogEmail.received_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return {
+        "tenant_id": str(tenant_uuid),
+        "accounts": [
+            {
+                "id": str(account.id),
+                "email_address": account.email_address,
+                "sync_status": account.sync_status,
+                "sync_error_msg": account.sync_error_msg,
+                "last_synced_at": account.last_synced_at.isoformat() if account.last_synced_at else None,
+            }
+            for account in accounts
+        ],
+        "sync_settings": {
+            "ingestion_approach": sync_setting.ingestion_approach if sync_setting else None,
+            "trusted_suppliers": sync_setting.trusted_suppliers if sync_setting else None,
+            "keyword_filters": sync_setting.keyword_filters if sync_setting else None,
+            "pending_approval_count": len([item for item in pending_approvals if not item.get("ignored")]),
+            "pending_approvals": pending_approvals[:limit],
+        },
+        "recent_emails": [
+            {
+                "id": str(email.id),
+                "raw_email_id": email.raw_email_id,
+                "supplier_name": supplier_name,
+                "subject": email.subject,
+                "received_at": email.received_at.isoformat() if email.received_at else None,
+                "processing_status": email.processing_status,
+                "item_count": int(item_count or 0),
+                "visible_in_catalog": email.processing_status == "completed" and int(item_count or 0) > 0,
+            }
+            for email, supplier_name, item_count in email_rows
+        ],
+    }
 
 
 @router.delete("/emails/{email_id}", status_code=204)
