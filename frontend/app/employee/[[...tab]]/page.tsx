@@ -463,12 +463,15 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   async function handleSyncRealtimeEmails() {
     setIsSyncingEmails(true);
     setSyncSuccess(false);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 10000);
     try {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) return;
       
-      const response = await fetch(`${apiBaseUrl}/api/ingestion/poll-now-sync-user?mode=inline`, {
+      const response = await fetch(`${apiBaseUrl}/api/ingestion/poll-now-sync-user`, {
         method: "POST",
+        signal: controller.signal,
         headers: {
           Authorization: `Bearer ${session.access_token}`,
         },
@@ -489,7 +492,6 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         } else {
           setSyncNotice(processed > 0 ? `Processed ${processed} catalogue item${processed === 1 ? "" : "s"}.` : "No new supplier catalogue emails found.");
         }
-        await refreshWorkspaceData();
         setTimeout(() => {
           setSyncSuccess(false);
         }, 2000);
@@ -500,8 +502,11 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       }
     } catch (err) {
       console.error(err);
-      setSyncNotice("Email sync failed. Check connected inbox settings and try again.");
+      setSyncNotice(err instanceof DOMException && err.name === "AbortError"
+        ? "Email sync request timed out. Check worker status and try again."
+        : "Email sync failed. Check connected inbox settings and try again.");
     } finally {
+      window.clearTimeout(timeout);
       setIsSyncingEmails(false);
     }
   }
