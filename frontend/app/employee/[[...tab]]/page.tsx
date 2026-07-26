@@ -482,8 +482,12 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         const processed = Number(result?.processed || 0);
         const pending = Number(result?.pending_approvals || 0);
         const queuedAccounts = Number(result?.queued_accounts || 0);
+        const candidates = Number(result?.candidate_messages || 0);
+        const newCandidates = Number(result?.new_candidate_messages || 0);
         if (result?.status === "queued") {
-          setSyncNotice(queuedAccounts > 0 ? `Email sync started for ${queuedAccounts} account${queuedAccounts === 1 ? "" : "s"}. New catalogue rows will appear shortly.` : "No connected email accounts found.");
+          setSyncNotice(queuedAccounts > 0
+            ? `Found ${newCandidates} new of ${candidates} candidate email${candidates === 1 ? "" : "s"}; queued ${queuedAccounts} inbox sync${queuedAccounts === 1 ? "" : "s"}.`
+            : "No connected email accounts found.");
           window.setTimeout(() => {
             refreshWorkspaceData().catch((err) => console.error("Delayed workspace refresh failed", err));
           }, 2500);

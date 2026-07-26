@@ -1,3 +1,5 @@
+from typing import Any
+
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -57,7 +59,7 @@ def poll_now_sync(
 def poll_now_sync_user(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
-) -> dict[str, int | str]:
+) -> dict[str, Any]:
     from uuid import UUID
     import json
     from backend.app.models import EmailAccount, EmailSyncSetting
@@ -65,8 +67,12 @@ def poll_now_sync_user(
     accounts = db.query(EmailAccount).filter(EmailAccount.user_id == user_uuid).all()
 
     queued_accounts = 0
+    task_ids: list[str] = []
+    previews = []
+    preview_service = EmailIngestionService(db)
     for account in accounts:
-        queue_email_account_sync(account.id)
+        previews.append(preview_service.preview_account_sync(account.id))
+        task_ids.append(queue_email_account_sync(account.id))
         account.sync_status = "pending"
         queued_accounts += 1
     db.commit()
@@ -83,7 +89,16 @@ def poll_now_sync_user(
         except Exception:
             pending_count = 0
 
-    return {"status": "queued", "queued_accounts": queued_accounts, "processed": 0, "pending_approvals": pending_count}
+    return {
+        "status": "queued",
+        "queued_accounts": queued_accounts,
+        "task_ids": task_ids,
+        "processed": 0,
+        "pending_approvals": pending_count,
+        "candidate_messages": sum(int(item.get("candidate_count") or 0) for item in previews),
+        "new_candidate_messages": sum(int(item.get("new_candidate_count") or 0) for item in previews),
+        "previews": previews,
+    }
 
 
 @router.post("/poll-now-sync-with-credentials")

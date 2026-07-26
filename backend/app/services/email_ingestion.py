@@ -1217,6 +1217,99 @@ class EmailIngestionService:
             created_at = created_at.replace(tzinfo=UTC)
         return ("SINCE", created_at.strftime("%d-%b-%Y"))
 
+    def preview_account_sync(self, account_id: UUID) -> dict:
+        from backend.app.auth import decrypt_password
+        from backend.app.models import CatalogEmail, EmailAccount, EmailSyncSetting
+
+        account = self.db.query(EmailAccount).filter(EmailAccount.id == account_id).first()
+        if not account:
+            return {"account_id": str(account_id), "error": "Email account not found."}
+
+        try:
+            password = decrypt_password(account.encrypted_password)
+        except Exception as e:
+            return {
+                "account_id": str(account.id),
+                "email_address": account.email_address,
+                "error": f"Failed to decrypt app password: {str(e)}",
+            }
+
+        sync_setting = self.db.query(EmailSyncSetting).filter(EmailSyncSetting.user_id == account.user_id).first()
+        approach = sync_setting.ingestion_approach if sync_setting else "approach_1"
+        mailbox = "INBOX"
+
+        try:
+            if account.imap_port == 993:
+                client = imaplib.IMAP4_SSL(account.imap_host, account.imap_port, timeout=8)
+            else:
+                client = imaplib.IMAP4(account.imap_host, account.imap_port, timeout=8)
+
+            with client:
+                client.login(account.email_address, password)
+
+                if approach == "approach_1":
+                    matched_mailbox = None
+                    try:
+                        status, mailboxes = client.list()
+                        if status == "OK":
+                            for mb in mailboxes:
+                                mb_str = mb.decode("utf-8", errors="ignore")
+                                match = re.search(r'"([^"]+)"\s*$', mb_str)
+                                mb_name = match.group(1) if match else mb_str.split()[-1]
+                                mb_name_lower = mb_name.strip().lower()
+                                if (
+                                    mb_name_lower in ("supplier", "suppliers")
+                                    or mb_name_lower.endswith("/supplier")
+                                    or mb_name_lower.endswith("/suppliers")
+                                ):
+                                    matched_mailbox = mb_name.strip()
+                                    break
+                    except Exception:
+                        matched_mailbox = None
+                    mailbox = matched_mailbox or "suppliers"
+
+                status, _ = client.select(mailbox)
+                if status != "OK":
+                    return {
+                        "account_id": str(account.id),
+                        "email_address": account.email_address,
+                        "approach": approach,
+                        "mailbox": mailbox,
+                        "error": f"Mailbox '{mailbox}' could not be selected.",
+                    }
+
+                search_args = self._imap_search_args_for_approach(approach, account)
+                _, message_ids = client.uid("search", None, *search_args)
+                ids = [msg_id.decode() for msg_id in (message_ids[0].split() if message_ids and message_ids[0] else [])]
+
+            account_prefix = f"{account.id}:"
+            logged_rows = self.db.query(CatalogEmail.raw_email_id).filter(
+                CatalogEmail.raw_email_id.like(f"{account_prefix}%")
+            ).all()
+            logged_raw_ids = {row[0] for row in logged_rows}
+            candidate_raw_ids = [f"{account.id}:{mailbox}:{msg_id}" for msg_id in ids]
+            new_candidate_count = len([raw_id for raw_id in candidate_raw_ids if raw_id not in logged_raw_ids])
+
+            return {
+                "account_id": str(account.id),
+                "email_address": account.email_address,
+                "approach": approach,
+                "mailbox": mailbox,
+                "search": " ".join(search_args),
+                "candidate_count": len(ids),
+                "already_logged_count": len(candidate_raw_ids) - new_candidate_count,
+                "new_candidate_count": new_candidate_count,
+            }
+        except Exception as e:
+            logger.exception("Failed IMAP sync preview for account %s", account.email_address)
+            return {
+                "account_id": str(account.id),
+                "email_address": account.email_address,
+                "approach": approach,
+                "mailbox": mailbox,
+                "error": str(e),
+            }
+
     def poll_account_inbox(self, account_id: UUID, force_retry_failed: bool = False) -> int:
         from backend.app.models import EmailAccount, EmailFilter
         from backend.app.auth import decrypt_password
