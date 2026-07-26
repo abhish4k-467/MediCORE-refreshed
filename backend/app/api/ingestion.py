@@ -56,13 +56,41 @@ def poll_now_sync(
 @router.post("/poll-now-sync-user")
 def poll_now_sync_user(
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    mode: str = Query("queue", pattern="^(queue|inline)$"),
 ) -> dict[str, int | str]:
     from uuid import UUID
     import json
     from backend.app.models import EmailAccount, EmailSyncSetting
     user_uuid = UUID(current_user["id"])
     accounts = db.query(EmailAccount).filter(EmailAccount.user_id == user_uuid).all()
+
+    if mode == "inline":
+        service = EmailIngestionService(db)
+        processed = 0
+        checked_accounts = 0
+        for account in accounts:
+            checked_accounts += 1
+            processed += service.poll_account_inbox(account.id)
+
+        sync_setting = db.query(EmailSyncSetting).filter(EmailSyncSetting.user_id == user_uuid).first()
+        pending_count = 0
+        if sync_setting:
+            try:
+                pending_items = json.loads(sync_setting.pending_approvals or "[]")
+                pending_count = len([
+                    item for item in pending_items
+                    if isinstance(item, dict) and not item.get("ignored")
+                ])
+            except Exception:
+                pending_count = 0
+
+        return {
+            "status": "completed",
+            "checked_accounts": checked_accounts,
+            "processed": processed,
+            "pending_approvals": pending_count,
+        }
 
     queued_accounts = 0
     for account in accounts:

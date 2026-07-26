@@ -467,7 +467,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) return;
       
-      const response = await fetch(`${apiBaseUrl}/api/ingestion/poll-now-sync-user`, {
+      const response = await fetch(`${apiBaseUrl}/api/ingestion/poll-now-sync-user?mode=inline`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${session.access_token}`,
@@ -489,6 +489,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         } else {
           setSyncNotice(processed > 0 ? `Processed ${processed} catalogue item${processed === 1 ? "" : "s"}.` : "No new supplier catalogue emails found.");
         }
+        await refreshWorkspaceData();
         setTimeout(() => {
           setSyncSuccess(false);
         }, 2000);

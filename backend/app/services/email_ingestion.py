@@ -1278,6 +1278,7 @@ class EmailIngestionService:
                 pending_email_ids: set[str] = set()
                 ignored_email_ids: set[str] = set()
                 ignored_email_fingerprints: set[str] = set()
+                ignored_email_keys: set[str] = set()
                 if sync_setting:
                     try:
                         import json
@@ -1297,10 +1298,22 @@ class EmailIngestionService:
                             for item in approval_items
                             if isinstance(item, dict) and item.get("fingerprint") and item.get("ignored")
                         }
+                        ignored_email_keys = {
+                            "|".join(
+                                [
+                                    str(item.get("sender") or "").strip().lower(),
+                                    str(item.get("subject") or "").strip().lower(),
+                                    str(item.get("date") or "").strip(),
+                                ]
+                            )
+                            for item in approval_items
+                            if isinstance(item, dict) and item.get("ignored")
+                        }
                     except Exception:
                         pending_email_ids = set()
                         ignored_email_ids = set()
                         ignored_email_fingerprints = set()
+                        ignored_email_keys = set()
 
                 mailbox = "INBOX"
                 if approach == "approach_1":
@@ -1506,7 +1519,18 @@ class EmailIngestionService:
                         if approach == "approach_2" and sync_setting:
                             domain = get_supplier_domain(sender)
                             trusted_list = self._csv_terms(sync_setting.trusted_suppliers)
-                            if raw_id_str in ignored_email_ids or email_fingerprint in ignored_email_fingerprints:
+                            email_approval_key = "|".join(
+                                [
+                                    sender.strip().lower(),
+                                    subject.strip().lower(),
+                                    email_date.isoformat(),
+                                ]
+                            )
+                            if (
+                                raw_id_str in ignored_email_ids
+                                or email_fingerprint in ignored_email_fingerprints
+                                or email_approval_key in ignored_email_keys
+                            ):
                                 logger.info("Skipping email id=%s because user denied processing previously", raw_id_str)
                                 self._create_skipped_email_record(raw_id_str, sender, display_name, subject, "ignored: denied by user", active_tenant_id, email_date)
                                 self._mark_seen(client, msg_id)
