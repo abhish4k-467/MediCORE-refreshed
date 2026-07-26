@@ -1,4 +1,7 @@
 import logging
+
+logging.basicConfig(level=logging.INFO)
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -39,8 +42,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure logging for capturing errors in production logs
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 @app.exception_handler(Exception)

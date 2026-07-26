@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import logging
+from urllib.parse import urlparse
 from uuid import UUID
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -16,6 +17,10 @@ from backend.app.models import Profile
 settings = get_settings()
 security = HTTPBearer()
 logger = logging.getLogger(__name__)
+
+
+def supabase_url_summary() -> str:
+    return urlparse(str(settings.supabase_url).strip()).netloc or "<invalid-supabase-url>"
 
 def get_fernet() -> Fernet:
     """Derive a 32-byte base64 key securely from SUPABASE_SERVICE_ROLE_KEY."""
@@ -43,6 +48,17 @@ def get_current_user(
     supabase: Client = get_supabase()
     try:
         response = supabase.auth.get_user(token)
+    except Exception:
+        logger.exception(
+            "Supabase token verification request failed against host %s",
+            supabase_url_summary(),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Supabase authentication service could not be reached.",
+        )
+
+    try:
         if not response or not response.user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
