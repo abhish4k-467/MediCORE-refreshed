@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+import logging
 import urllib.parse
 
 from sqlalchemy import URL, create_engine
@@ -10,6 +11,7 @@ from backend.app.config import get_settings
 
 settings = get_settings()
 DEFAULT_DATABASE_URL = "postgresql+psycopg://postgres:postgres@localhost:5432/postgres"
+logger = logging.getLogger(__name__)
 
 
 def repair_database_url(url: str) -> str:
@@ -81,9 +83,19 @@ def build_database_url() -> URL | str:
     return repair_database_url(raw_url)
 
 
+def database_url_summary() -> str:
+    url = build_database_url()
+    if isinstance(url, URL):
+        return f"{url.host}:{url.port or 'default'}/{url.database}"
+
+    parsed = urllib.parse.urlparse(str(url))
+    return f"{parsed.hostname}:{parsed.port or 'default'}{parsed.path or ''}"
+
+
 
 def create_app_engine():
     try:
+        logger.info("Using database host: %s", database_url_summary())
         return create_engine(build_database_url(), pool_pre_ping=True, connect_args={"sslmode": "require"})
     except Exception:
         if settings.environment == "production":

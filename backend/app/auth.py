@@ -7,6 +7,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import Client
 from cryptography.fernet import Fernet
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 
 from backend.app.config import get_settings
 from backend.app.db import get_supabase, get_db
@@ -50,7 +51,14 @@ def get_current_user(
         
         # Load user profile for custom role, status and tenant_id
         user_uuid = UUID(response.user.id)
-        profile = db.query(Profile).filter(Profile.id == user_uuid).first()
+        try:
+            profile = db.query(Profile).filter(Profile.id == user_uuid).first()
+        except SQLAlchemyError:
+            logger.exception("Database profile lookup failed for authenticated user %s", user_uuid)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Database connection failed while loading user profile.",
+            )
         
         custom_role = "employee"
         tenant_id = response.user.id
@@ -63,7 +71,14 @@ def get_current_user(
             
             # Check the associated admin's status
             if custom_role == "employee" and profile.tenant_id:
-                admin_profile = db.query(Profile).filter(Profile.id == profile.tenant_id).first()
+                try:
+                    admin_profile = db.query(Profile).filter(Profile.id == profile.tenant_id).first()
+                except SQLAlchemyError:
+                    logger.exception("Database admin profile lookup failed for tenant %s", profile.tenant_id)
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Database connection failed while loading tenant profile.",
+                    )
                 if admin_profile and admin_profile.status == "Disabled":
                     status_str = "Disabled"
         else:
