@@ -1,3 +1,4 @@
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -11,6 +12,7 @@ from backend.app.auth import get_current_admin, get_current_user
 from backend.app.api.email_accounts import queue_email_account_sync
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class ImapCredentials(BaseModel):
@@ -66,17 +68,33 @@ def poll_now_sync_user(
     user_uuid = UUID(current_user["id"])
     accounts = db.query(EmailAccount).filter(EmailAccount.user_id == user_uuid).all()
 
-    queued_accounts = 0
     task_ids: list[str] = []
     previews = []
     preview_service = EmailIngestionService(db)
     for account in accounts:
         previews.append(preview_service.preview_account_sync(account.id))
-        task_ids.append(queue_email_account_sync(account.id))
         account.sync_status = "pending"
-        queued_accounts += 1
+        account.sync_error_msg = None
+
+    # Commit before dispatching. A fast worker may finish immediately and write
+    # "ok"; committing "pending" after dispatch would overwrite that result.
     db.commit()
 
+    queue_errors: list[dict[str, str]] = []
+    for account in accounts:
+        try:
+            task_ids.append(queue_email_account_sync(account.id))
+        except Exception:
+            logger.exception("Failed to queue email sync for account_id=%s", account.id)
+            account.sync_status = "error"
+            account.sync_error_msg = "Could not queue email sync. Check the Celery worker and Redis connection."
+            db.commit()
+            queue_errors.append({
+                "account_id": str(account.id),
+                "message": account.sync_error_msg,
+            })
+
+    queued_accounts = len(task_ids)
     sync_setting = db.query(EmailSyncSetting).filter(EmailSyncSetting.user_id == user_uuid).first()
     pending_count = 0
     if sync_setting:
@@ -90,8 +108,10 @@ def poll_now_sync_user(
             pending_count = 0
 
     return {
-        "status": "queued",
+        "status": "queued" if queued_accounts else ("error" if accounts else "no_accounts"),
         "queued_accounts": queued_accounts,
+        "failed_accounts": len(queue_errors),
+        "queue_errors": queue_errors,
         "task_ids": task_ids,
         "processed": 0,
         "pending_approvals": pending_count,

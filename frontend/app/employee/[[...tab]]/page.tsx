@@ -482,15 +482,18 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         const processed = Number(result?.processed || 0);
         const pending = Number(result?.pending_approvals || 0);
         const queuedAccounts = Number(result?.queued_accounts || 0);
+        const failedAccounts = Number(result?.failed_accounts || 0);
         const candidates = Number(result?.candidate_messages || 0);
         const newCandidates = Number(result?.new_candidate_messages || 0);
         if (result?.status === "queued") {
           setSyncNotice(queuedAccounts > 0
-            ? `Found ${newCandidates} new of ${candidates} candidate email${candidates === 1 ? "" : "s"}; queued ${queuedAccounts} inbox sync${queuedAccounts === 1 ? "" : "s"}.`
+            ? `Found ${newCandidates} new of ${candidates} candidate email${candidates === 1 ? "" : "s"}; queued ${queuedAccounts} inbox sync${queuedAccounts === 1 ? "" : "s"}${failedAccounts ? ` (${failedAccounts} failed to queue)` : ""}.`
             : "No connected email accounts found.");
           window.setTimeout(() => {
             refreshWorkspaceData().catch((err) => console.error("Delayed workspace refresh failed", err));
           }, 2500);
+        } else if (result?.status === "error") {
+          setSyncNotice(result?.queue_errors?.[0]?.message || "Could not queue email sync. Check the Celery worker and Redis connection.");
         } else if (pending > 0) {
           setSyncNotice(`${pending} new supplier approval${pending === 1 ? "" : "s"} waiting. Approve trusted suppliers in Email Settings.`);
         } else {
