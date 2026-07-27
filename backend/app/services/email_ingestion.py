@@ -78,16 +78,7 @@ IRRELEVANT_MAIL_TERMS = (
 def get_supplier_domain(sender: str) -> str:
     if "@" not in sender:
         return sender.lower()
-    local_part, domain = sender.split("@", 1)
-    domain = domain.lower()
-    generic_domains = {
-        "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com",
-        "mail.com", "protonmail.com", "proton.me", "icloud.com", "zoho.com",
-        "gmx.com", "yandex.com", "live.com"
-    }
-    if domain in generic_domains:
-        return sender.lower()
-    return domain
+    return sender.strip().lower()
 
 
 def _nullable_float(value: Any) -> float | None:
@@ -616,7 +607,7 @@ class EmailIngestionService:
         return any(variant in compact_line for variant in variants)
 
     def _has_required_grounded_values(self, item) -> bool:
-        if not (item.ingredient_name or "").strip():
+        if not clean_optional_text(getattr(item, "ingredient_name", None)):
             return False
         if item.price_per_unit is not None and float(item.price_per_unit) <= 0:
             return False
@@ -973,24 +964,7 @@ class EmailIngestionService:
                 self.db.add(supplier)
             return supplier
 
-        if cleaned_display_name:
-            supplier_name = cleaned_display_name
-        else:
-            # Check if domain is a generic domain
-            generic_domains = {
-                "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com",
-                "mail.com", "protonmail.com", "proton.me", "icloud.com", "zoho.com",
-                "gmx.com", "yandex.com", "live.com"
-            }
-            email_domain_part = sender.split("@")[1].lower() if "@" in sender else domain
-
-            if email_domain_part in generic_domains:
-                # Use the full email address, don't format the name from the email ID
-                supplier_name = sender
-            else:
-                # Custom domain: format the domain name prefix
-                domain_prefix = email_domain_part.split(".")[0]
-                supplier_name = domain_prefix.replace("-", " ").replace(".", " ").title()
+        supplier_name = cleaned_display_name or sender
 
         supplier = Supplier(
             id=uuid4(),

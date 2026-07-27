@@ -29,6 +29,7 @@ def mock_catalog_emails(limit: int) -> list[dict]:
         {
             "id": str(email.id),
             "supplier_name": supplier_names.get(email.supplier_id, "Mock supplier"),
+            "email_domain": "",
             "received_at": email.received_at,
             "subject": email.subject,
             "pdf_url": email.pdf_url,
@@ -48,6 +49,7 @@ def mock_catalog_items(q: str | None, limit: int) -> list[dict]:
             "id": str(item.id),
             "catalog_email_id": str(item.catalog_email_id) if getattr(item, "catalog_email_id", None) else None,
             "supplier_name": supplier_names.get(item.supplier_id, "Mock supplier"),
+            "email_domain": "",
             "ingredient_name": item.ingredient_name,
             "normalized_name": item.normalized_name,
             "specification": display_value(item.raw_payload, "specification"),
@@ -80,7 +82,7 @@ def list_catalog_emails(
     settings = get_settings()
     user_uuid = UUID(current_user["tenant_id"])
     stmt = (
-        select(CatalogEmail, Supplier.name)
+        select(CatalogEmail, Supplier.name, Supplier.email_domain)
         .join(Supplier, Supplier.id == CatalogEmail.supplier_id)
         .where(
             CatalogEmail.tenant_id == user_uuid,
@@ -96,12 +98,13 @@ def list_catalog_emails(
             {
                 "id": str(email.id),
                 "supplier_name": supplier_name,
+                "email_domain": email_domain,
                 "received_at": email.received_at,
                 "subject": email.subject,
                 "pdf_url": email.pdf_url,
                 "processing_status": email.processing_status,
             }
-            for email, supplier_name in db.execute(stmt)
+            for email, supplier_name, email_domain in db.execute(stmt)
         ]
     except SQLAlchemyError:
         if not settings.mock_data_enabled:
@@ -120,7 +123,7 @@ def list_catalog_items(
     settings = get_settings()
     user_uuid = UUID(current_user["tenant_id"])
     stmt = (
-        select(CatalogItem, Supplier.name, CatalogEmail.received_at, None)
+        select(CatalogItem, Supplier.name, Supplier.email_domain, CatalogEmail.received_at, None)
         .join(Supplier, Supplier.id == CatalogItem.supplier_id)
         .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
     )
@@ -159,7 +162,7 @@ def list_catalog_items(
             .subquery()
         )
         stmt = (
-            select(CatalogItem, Supplier.name, CatalogEmail.received_at, latest_items.c.history_count)
+            select(CatalogItem, Supplier.name, Supplier.email_domain, CatalogEmail.received_at, latest_items.c.history_count)
             .join(Supplier, Supplier.id == CatalogItem.supplier_id)
             .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
         )
@@ -182,13 +185,14 @@ def list_catalog_items(
                 CatalogItem.raw_payload["specification"].astext.ilike(f"%{q}%"),
             )
         )
-    stmt = stmt.order_by(nullslast(CatalogItem.price_per_unit.asc())).limit(limit)
+    stmt = stmt.order_by(CatalogItem.normalized_name.asc(), CatalogItem.ingredient_name.asc()).limit(limit)
     try:
         return [
             {
                 "id": str(item.id),
                 "catalog_email_id": str(item.catalog_email_id) if item.catalog_email_id else None,
                 "supplier_name": supplier_name,
+                "email_domain": email_domain,
                 "ingredient_name": item.ingredient_name,
                 "normalized_name": item.normalized_name,
                 "specification": display_value(item.raw_payload, "specification"),
@@ -208,7 +212,7 @@ def list_catalog_items(
                 "is_updated": bool((item.raw_payload or {}).get("is_updated")) or bool(history_count and history_count > 1),
                 "received_at": received_at,
             }
-            for item, supplier_name, received_at, history_count in db.execute(stmt)
+            for item, supplier_name, email_domain, received_at, history_count in db.execute(stmt)
         ]
     except SQLAlchemyError:
         if not settings.mock_data_enabled:

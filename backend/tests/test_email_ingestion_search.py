@@ -133,6 +133,28 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         self.assertEqual(rows[0].unit, "kg")
         self.assertEqual(rows[1].specification, "Berberine Extract 20:1")
 
+    def test_numbered_ocr_rows_keep_specification_and_quantity_aligned(self) -> None:
+        rows = parse_catalog_table_text(
+            "19 Ginger Powder Pb0.3-0.8 ppm 7,500KG\n"
+            "20 Ginger Extract Powder 1% HPLC 1,550KG\n"
+            "21 Ginger Extract Powder 5% HPLC 5,000KG\n"
+        )
+
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0].ingredient_name, "Ginger Powder")
+        self.assertEqual(rows[0].specification, "Pb0.3-0.8 ppm")
+        self.assertEqual(rows[0].available_qty, 7500.0)
+        self.assertIsNone(rows[0].price_per_unit)
+        self.assertEqual(rows[1].ingredient_name, "Ginger Extract Powder")
+        self.assertEqual(rows[1].specification, "1% HPLC")
+        self.assertEqual(rows[2].specification, "5% HPLC")
+
+    def test_supplier_identity_uses_full_sender_email(self) -> None:
+        from backend.app.services.email_ingestion import get_supplier_domain
+
+        self.assertEqual(get_supplier_domain("sales@alpha.com"), "sales@alpha.com")
+        self.assertEqual(get_supplier_domain("pricing@alpha.com"), "pricing@alpha.com")
+
     def test_display_payload_adds_unit_when_quantity_cell_is_numeric_only(self) -> None:
         service = object.__new__(EmailIngestionService)
         item = ExtractedCatalogItem(

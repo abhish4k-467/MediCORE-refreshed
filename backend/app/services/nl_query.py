@@ -50,6 +50,7 @@ class NaturalLanguageQueryEngine:
         self._log_query(question, tenant_id=tenant_id, user_id=user_id, operation_type=plan.operation)
         rows = self._execute_plan(plan, tenant_id=tenant_id)
         rows = self.ranker._dedupe_supplier_item_rows(rows, plan.normalized_name)
+        rows = self._sort_rows_for_question(question, rows)
         try:
             answer = self.llm.summarize_answer(question, rows)
         except Exception:
@@ -101,6 +102,33 @@ class NaturalLanguageQueryEngine:
         if plan.operation == "supplier_activity":
             return self.ranker.ranked_items(plan, tenant_id=tenant_id)
         return []
+
+    def _sort_rows_for_question(self, question: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        lowered = question.lower()
+
+        def missing_last(value: Any):
+            return (value is None, value)
+
+        if "sort" in lowered or "order" in lowered:
+            if "lead" in lowered:
+                return sorted(rows, key=lambda row: missing_last(row.get("lead_time_days") or row.get("lead_time_text")))
+            if "quantity" in lowered or "qty" in lowered or "stock" in lowered:
+                return sorted(rows, key=lambda row: missing_last(row.get("available_qty")))
+            if "moq" in lowered:
+                return sorted(rows, key=lambda row: missing_last(row.get("moq")))
+            if "date" in lowered or "latest" in lowered or "recent" in lowered:
+                return sorted(rows, key=lambda row: row.get("received_at") or "", reverse=True)
+            if "price" in lowered or "rate" in lowered or "cost" in lowered:
+                return sorted(rows, key=lambda row: missing_last(row.get("price_per_unit")))
+
+        return sorted(
+            rows,
+            key=lambda row: (
+                str(row.get("normalized_name") or row.get("ingredient_name") or "").lower(),
+                str(row.get("specification") or "").lower(),
+                str(row.get("supplier_name") or "").lower(),
+            ),
+        )
 
     def _looks_like_false_negative(self, answer: str) -> bool:
         lowered = (answer or "").lower()

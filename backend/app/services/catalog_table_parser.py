@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 
 from backend.app.schemas import ExtractedCatalogItem, clean_optional_text
 
-CATALOG_TABLE_PARSER_VERSION = "2026-07-22.vertical-catalog-v2"
+CATALOG_TABLE_PARSER_VERSION = "2026-07-27.specification-alignment-v1"
 
 MONTHS = {
     "jan": 1,
@@ -63,6 +63,10 @@ FOOTER_OR_HEADER_PATTERN = re.compile(
     r"product specification description|fob\s*\()",
     re.IGNORECASE,
 )
+NUMBERED_SPEC_QTY_PATTERN = re.compile(
+    r"^\s*\d{1,4}\s+(?P<body>.+?)\s+(?P<qty>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>kg|kgs|g|mg|ml|l|units?|packs?)\s*$",
+    re.IGNORECASE,
+)
 
 
 def parse_catalog_table_text(
@@ -84,6 +88,12 @@ def parse_catalog_table_text(
         if key not in seen:
             seen.add(key)
             items.append(table_item)
+
+    for numbered_item in _parse_numbered_spec_quantity_rows(text):
+        key = _item_key(numbered_item)
+        if key not in seen:
+            seen.add(key)
+            items.append(numbered_item)
 
     for line in _candidate_lines(text):
         cleaned = _clean_line(line)
@@ -182,6 +192,59 @@ def _parse_vertical_catalog_rows(
 
         index = max(cursor, index + 1)
     return rows
+
+
+def _parse_numbered_spec_quantity_rows(text: str) -> list[ExtractedCatalogItem]:
+    rows: list[ExtractedCatalogItem] = []
+    for line in (_clean_line(line) for line in text.splitlines()):
+        if not line:
+            continue
+        if "|" in line or "\t" in line:
+            continue
+        match = NUMBERED_SPEC_QTY_PATTERN.match(line)
+        if not match:
+            continue
+        product, specification = _split_product_specification(match.group("body"))
+        if not product:
+            continue
+        rows.append(
+            ExtractedCatalogItem(
+                ingredient_name=product,
+                normalized_name=_normalize_name(product),
+                specification=specification,
+                available_qty=_number(match.group("qty")),
+                unit=_normalize_unit(match.group("unit")),
+                notes=_notes(
+                    specification=specification.replace(";", ",") if specification else None,
+                    original_quantity=f"{match.group('qty')} {match.group('unit')}",
+                    source=line[:500].replace(";", ","),
+                ),
+            )
+        )
+    return rows
+
+
+def _split_product_specification(body: str) -> tuple[str, str | None]:
+    text = _clean_line(body)
+    if not text:
+        return "", None
+
+    # Specifications usually begin with assay/purity markers, percentages, metals, ratios, or ppm values.
+    marker = re.search(
+        r"(?=(?:Pb|Fe|Zn|Mg|Ca|Na|K|N)(?=\b|\d|[+-])|(?:Assay|Purity|Content)\b|\d+(?:\.\d+)?\s*%|\d+\s*:\s*\d+|[<>]=?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if marker and marker.start() > 0:
+        product = text[: marker.start()].strip(" -")
+        specification = text[marker.start() :].strip(" -")
+        if product and specification:
+            return product, specification
+
+    parts = text.split()
+    if len(parts) >= 2 and parts[0].lower() == parts[1].lower():
+        return parts[0], " ".join(parts[1:])
+    return text, None
 
 
 def extract_pack_size(line: str) -> str | None:

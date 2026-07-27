@@ -76,6 +76,7 @@ type SupplierApiRow = {
 type CatalogEmailRow = {
   id: string;
   supplier_name: string;
+  email_domain?: string | null;
   received_at: string;
   subject: string | null;
   pdf_url: string | null;
@@ -110,6 +111,10 @@ type InboxThread = {
   pdf_url?: string | null;
   subject?: string | null;
 };
+
+function supplierKey(name: string | null | undefined, email: string | null | undefined): string {
+  return `${String(name || "").trim().toLowerCase()}|${String(email || "").trim().toLowerCase()}`;
+}
 
 type AuthUser = {
   email: string;
@@ -667,7 +672,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const showAssistantPanel = activeTab === "assistant";
 
   const inboxThreads = useMemo<InboxThread[]>(() => {
-    const supplierMeta = new Map(supplierMetaRows.map((supplier) => [supplier.name, supplier]));
+    const supplierMeta = new Map(supplierMetaRows.map((supplier) => [supplierKey(supplier.name, supplier.email_domain), supplier]));
 
     // Group items by their catalog_email_id
     const itemsByEmail = new Map<string, SupplierTableRow[]>();
@@ -681,8 +686,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
 
     return catalogEmails.map((email) => {
       const items = itemsByEmail.get(email.id) ?? [];
-      const sortedItems = [...items].sort((left, right) => safePrice(left.price_per_unit, left.currency) - safePrice(right.price_per_unit, right.currency));
-      const meta = supplierMeta.get(email.supplier_name);
+      const sortedItems = [...items].sort((left, right) => displayItemName(left).localeCompare(displayItemName(right)));
+      const meta = supplierMeta.get(supplierKey(email.supplier_name, email.email_domain));
       const bestItem = sortedItems[0];
       const hasExtractedItems = sortedItems.length > 0;
 
@@ -772,25 +777,25 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         map.set(key, row);
       }
     }
-    return Array.from(map.values());
+    return Array.from(map.values()).sort((left, right) => displayItemName(left).localeCompare(displayItemName(right)));
   }, [messages, rows]);
 
   const latestSupplierRows = useMemo(() => {
     const map = new Map<string, SupplierTableRow>();
     for (const row of supplierRows) {
-      const key = `${row.supplier_name}-${row.normalized_name || row.ingredient_name}-${row.specification || ""}-${row.available_qty ?? ""}-${row.unit ?? ""}-${row.moq ?? ""}`;
+      const key = `${supplierKey(row.supplier_name, row.email_domain)}-${row.normalized_name || row.ingredient_name}-${row.specification || ""}-${row.available_qty ?? ""}-${row.unit ?? ""}-${row.moq ?? ""}`;
       const existing = map.get(key);
       if (!existing || new Date(row.received_at ?? 0).getTime() > new Date(existing.received_at ?? 0).getTime()) {
         map.set(key, row);
       }
     }
-    return Array.from(map.values());
+    return Array.from(map.values()).sort((left, right) => displayItemName(left).localeCompare(displayItemName(right)));
   }, [supplierRows]);
 
   const dashboardData = useMemo(() => {
     const suppliers = new Set([
-      ...supplierRows.map((row) => row.supplier_name),
-      ...catalogEmails.map((email) => email.supplier_name),
+      ...supplierRows.map((row) => supplierKey(row.supplier_name, row.email_domain)),
+      ...catalogEmails.map((email) => supplierKey(email.supplier_name, email.email_domain)),
     ]);
     const completedCatalogs = catalogEmails.filter((email) => email.processing_status === "completed").length;
 
@@ -833,29 +838,34 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const supplierDirectory = useMemo(() => {
     const supplierMap = new Map<string, SupplierTableRow[]>();
     const emailBySupplier = new Map<string, CatalogEmailRow[]>();
-    const supplierMeta = new Map(supplierMetaRows.map((supplier) => [supplier.name, supplier]));
+    const supplierMeta = new Map(supplierMetaRows.map((supplier) => [supplierKey(supplier.name, supplier.email_domain), supplier]));
 
     for (const row of supplierRows) {
-      const current = supplierMap.get(row.supplier_name) ?? [];
+      const key = supplierKey(row.supplier_name, row.email_domain);
+      const current = supplierMap.get(key) ?? [];
       current.push(row);
-      supplierMap.set(row.supplier_name, current);
+      supplierMap.set(key, current);
     }
 
     for (const email of catalogEmails) {
-      const current = emailBySupplier.get(email.supplier_name) ?? [];
+      const key = supplierKey(email.supplier_name, email.email_domain);
+      const current = emailBySupplier.get(key) ?? [];
       current.push(email);
-      emailBySupplier.set(email.supplier_name, current);
+      emailBySupplier.set(key, current);
     }
 
-    const supplierNames = new Set([...supplierMap.keys(), ...emailBySupplier.keys()]);
+    const supplierKeys = new Set([...supplierMap.keys(), ...emailBySupplier.keys()]);
     const search = supplierSearch.trim().toLowerCase();
-    const summaries = Array.from(supplierNames).map((supplierName) => {
-      const items = supplierMap.get(supplierName) ?? [];
+    const summaries = Array.from(supplierKeys).map((key) => {
+      const items = supplierMap.get(key) ?? [];
+      const emails = emailBySupplier.get(key) ?? [];
+      const supplierName = items[0]?.supplier_name ?? emails[0]?.supplier_name ?? "-";
+      const emailDomain = items[0]?.email_domain ?? emails[0]?.email_domain ?? "-";
       const sortedByPrice = [...items].sort((left, right) => safePrice(left.price_per_unit, left.currency) - safePrice(right.price_per_unit, right.currency));
-      const latestEmail = (emailBySupplier.get(supplierName) ?? []).slice().sort((left, right) => {
+      const latestEmail = emails.slice().sort((left, right) => {
         return new Date(right.received_at).getTime() - new Date(left.received_at).getTime();
       })[0];
-      const meta = supplierMeta.get(supplierName);
+      const meta = supplierMeta.get(key);
       
       const latestItems = latestEmail
         ? items.filter((item) => item.catalog_email_id === latestEmail.id)
@@ -864,8 +874,9 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       const totalQty = latestItems.reduce((total, item) => total + safeQty(item.available_qty), 0);
 
       return {
+        supplier_key: key,
         supplier_name: supplierName,
-        email_domain: items[0]?.email_domain ?? meta?.email_domain ?? "-",
+        email_domain: emailDomain ?? meta?.email_domain ?? "-",
         item_count: latestItems.length,
         best_item: sortedLatestByPrice[0],
         total_qty: totalQty,
@@ -895,12 +906,12 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
 
   const selectedCatalog = useMemo(() => {
     if (!supplierDirectory.length) return null;
-    return supplierDirectory.find((supplier) => supplier.supplier_name === selectedCatalogSupplier) ?? supplierDirectory[0];
+    return supplierDirectory.find((supplier) => supplier.supplier_key === selectedCatalogSupplier) ?? supplierDirectory[0];
   }, [selectedCatalogSupplier, supplierDirectory]);
 
   const supplierEmails = useMemo(() => {
     if (!selectedCatalogSupplier) return [];
-    return catalogEmails.filter((email) => email.supplier_name === selectedCatalogSupplier)
+    return catalogEmails.filter((email) => supplierKey(email.supplier_name, email.email_domain) === selectedCatalogSupplier)
       .sort((left, right) => new Date(right.received_at).getTime() - new Date(left.received_at).getTime());
   }, [catalogEmails, selectedCatalogSupplier]);
 
@@ -938,7 +949,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       if (catalogFilter === "best") return safePrice(item.price_per_unit, item.currency) <= bestPrice * 1.08;
       if (catalogFilter === "low-stock") return safeQty(item.available_qty) <= minQty * 1.35;
       return true;
-    });
+    }).sort((left, right) => displayItemName(left).localeCompare(displayItemName(right)));
   }, [catalogFilter, catalogSearch, selectedCatalog, selectedCatalogEmailId]);
 
   const emailItemsCount = useMemo(() => {
@@ -978,9 +989,10 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
 
     const bySupplier = new Map<string, SupplierTableRow>();
     for (const row of matchedRows) {
-      const current = bySupplier.get(`${row.supplier_name}-${row.specification || ""}-${row.available_qty ?? ""}-${row.unit ?? ""}-${row.moq ?? ""}`);
+      const identity = `${supplierKey(row.supplier_name, row.email_domain)}-${row.specification || ""}-${row.available_qty ?? ""}-${row.unit ?? ""}-${row.moq ?? ""}`;
+      const current = bySupplier.get(identity);
       if (!current || safePrice(row.price_per_unit, row.currency) < safePrice(current.price_per_unit, current.currency)) {
-        bySupplier.set(`${row.supplier_name}-${row.specification || ""}-${row.available_qty ?? ""}-${row.unit ?? ""}-${row.moq ?? ""}`, row);
+        bySupplier.set(identity, row);
       }
     }
 
@@ -1227,7 +1239,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         }
 
         const suppliers: SupplierApiRow[] = suppliersRes.ok ? await suppliersRes.json() : [];
-        const items: Array<SupplierItem & { supplier_name: string }> = itemsRes.ok ? await itemsRes.json() : [];
+        const items: Array<SupplierItem & { supplier_name: string; email_domain?: string | null }> = itemsRes.ok ? await itemsRes.json() : [];
         const emails: CatalogEmailRow[] = await emailsRes.json();
 
         const supplierMeta = new Map(
@@ -1238,7 +1250,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
           const meta = supplierMeta.get(item.supplier_name);
           return {
             ...item,
-            email_domain: meta?.email_domain ?? "-",
+            email_domain: item.email_domain ?? meta?.email_domain ?? "-",
             certifications: meta?.certifications ?? null,
           };
         });
@@ -2373,7 +2385,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                       <div className="inbox-actions">
                         <button type="button" onClick={() => setActiveTab("compare")}>Compare suppliers</button>
                         <button type="button" onClick={() => {
-                          setSelectedCatalogSupplier(selectedInboxThread.supplier_name);
+                          setSelectedCatalogSupplier(supplierKey(selectedInboxThread.supplier_name, selectedInboxThread.email_domain));
                           setSelectedCatalogEmailId(selectedInboxThread.id);
                           setActiveTab("catalogs");
                         }}>View full catalogue</button>
@@ -2609,7 +2621,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                         </div>
 
                         <button className="view-catalog-button" type="button" onClick={() => {
-                          setSelectedCatalogSupplier(row.supplier_name);
+                          setSelectedCatalogSupplier(supplierKey(row.supplier_name, row.email_domain));
                           setSelectedCatalogEmailId(row.catalog_email_id ?? null);
                           setActiveTab("catalogs");
                         }}>View catalogue</button>
@@ -3888,7 +3900,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                         </td>
                         <td>
                           <button className="table-action-button" type="button" onClick={() => {
-                            setSelectedCatalogSupplier(supplier.supplier_name);
+                            setSelectedCatalogSupplier(supplier.supplier_key);
                             setSelectedCatalogEmailId(supplier.latest_email_id);
                             setActiveTab("catalogs");
                           }}>View catalogue</button>

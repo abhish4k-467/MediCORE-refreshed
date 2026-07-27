@@ -62,7 +62,7 @@ class SupplierRanker:
                     latest_items.c.row_number == 1,
                 ),
             )
-            .order_by(nullslast(CatalogItem.price_per_unit.asc()))
+            .order_by(CatalogItem.normalized_name.asc(), CatalogItem.ingredient_name.asc(), nullslast(CatalogItem.price_per_unit.asc()))
             .limit(plan.limit)
         )
         if not settings.mock_data_enabled:
@@ -75,14 +75,18 @@ class SupplierRanker:
         if tenant_id:
             stmt = stmt.where(CatalogItem.tenant_id == (UUID(str(tenant_id)) if isinstance(tenant_id, str) else tenant_id))
         if plan.normalized_name:
-            search_term = plan.normalized_name.lower()
-            stmt = stmt.where(
-                or_(
-                    CatalogItem.normalized_name.ilike(f"%{search_term}%"),
-                    CatalogItem.ingredient_name.ilike(f"%{search_term}%"),
-                    CatalogItem.raw_payload["specification"].astext.ilike(f"%{search_term}%"),
+            search_tokens = [
+                token for token in self._canonical_item_key(plan.normalized_name).split()
+                if len(token) >= 3 and token not in {"price", "qty", "item", "supplier"}
+            ]
+            for token in search_tokens or [plan.normalized_name.lower()]:
+                stmt = stmt.where(
+                    or_(
+                        CatalogItem.normalized_name.ilike(f"%{token}%"),
+                        CatalogItem.ingredient_name.ilike(f"%{token}%"),
+                        CatalogItem.raw_payload["specification"].astext.ilike(f"%{token}%"),
+                    )
                 )
-            )
         if plan.min_quantity:
             stmt = stmt.where(CatalogItem.available_qty >= plan.min_quantity)
         if plan.unit:

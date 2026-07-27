@@ -10,11 +10,12 @@ from PIL import Image, ImageFilter, ImageOps
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_COLUMNS = ("date", "customer", "product", "quantity", "price", "lead_time")
+DEFAULT_COLUMNS = ("date", "customer", "product", "specification", "quantity", "price", "lead_time")
 HEADER_ALIASES = {
     "date": ("date",),
     "customer": ("customer", "buyer", "client"),
     "product": ("product", "item", "ingredient", "chemical", "material", "medicine", "api", "name"),
+    "specification": ("specification", "spec", "description", "assay", "purity", "grade", "content"),
     "quantity": ("quantity", "qty", "stock", "available"),
     "price": ("price", "rate", "quote", "cost"),
     "lead_time": ("lead", "delivery", "dispatch"),
@@ -191,7 +192,7 @@ def ocr_table_cells(image: Image.Image, horizontal: list[int], vertical: list[in
             if column_name in {"date", "customer"}:
                 continue
             cell = crop_cell(image, vertical[column_index], top, vertical[column_index + 1], bottom)
-            psm = 6 if column_name in {"product", "price"} else 7
+            psm = 6 if column_name in {"product", "specification", "price"} else 7
             cell_text[column_name] = ocr_cell(cell, psm=psm)
         rows.append(
             {
@@ -204,12 +205,13 @@ def ocr_table_cells(image: Image.Image, horizontal: list[int], vertical: list[in
 
 
 def rows_to_catalog_table_text(rows: list[dict[str, Any]]) -> str:
-    lines = ["Product | Qty | Unit | Price | Currency | Lead | MOQ | Pack | Notes"]
+    lines = ["Product | Specification | Qty | Unit | Price | Currency | Lead | MOQ | Pack | Notes"]
     for row in rows:
         cells = row["cells"]
         product = cells.get("product", "")
         if not product:
             continue
+        specification = cells.get("specification", "")
         quantity_text = cells.get("quantity", "")
         price_text = cells.get("price", "")
         lead_text = cells.get("lead_time", "")
@@ -218,6 +220,8 @@ def rows_to_catalog_table_text(rows: list[dict[str, Any]]) -> str:
         notes = []
         if quantity_text:
             notes.append(f"original_quantity={quantity_text}")
+        if specification:
+            notes.append(f"specification={specification}")
         if price_text:
             notes.append(f"original_price={price_text}")
         if lead_text and re.search(r"\d", lead_text):
@@ -226,6 +230,7 @@ def rows_to_catalog_table_text(rows: list[dict[str, Any]]) -> str:
             " | ".join(
                 [
                     product,
+                    specification,
                     quantity,
                     quantity_unit,
                     price,
