@@ -23,7 +23,14 @@ class SupplierRanker:
             select(
                 CatalogItem.id.label("item_id"),
                 func.row_number().over(
-                    partition_by=(CatalogItem.supplier_id, CatalogItem.normalized_name),
+                    partition_by=(
+                        CatalogItem.supplier_id,
+                        CatalogItem.normalized_name,
+                        CatalogItem.raw_payload["specification"].astext,
+                        CatalogItem.available_qty,
+                        CatalogItem.unit,
+                        CatalogItem.moq,
+                    ),
                     order_by=(
                         CatalogEmail.received_at.desc(),
                         CatalogItem.raw_payload["is_updated"].as_boolean().desc().nullslast(),
@@ -31,7 +38,14 @@ class SupplierRanker:
                     ),
                 ).label("row_number"),
                 func.count(CatalogItem.id).over(
-                    partition_by=(CatalogItem.supplier_id, CatalogItem.normalized_name),
+                    partition_by=(
+                        CatalogItem.supplier_id,
+                        CatalogItem.normalized_name,
+                        CatalogItem.raw_payload["specification"].astext,
+                        CatalogItem.available_qty,
+                        CatalogItem.unit,
+                        CatalogItem.moq,
+                    ),
                 ).label("history_count"),
             )
             .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
@@ -66,6 +80,7 @@ class SupplierRanker:
                 or_(
                     CatalogItem.normalized_name.ilike(f"%{search_term}%"),
                     CatalogItem.ingredient_name.ilike(f"%{search_term}%"),
+                    CatalogItem.raw_payload["specification"].astext.ilike(f"%{search_term}%"),
                 )
             )
         if plan.min_quantity:
@@ -86,6 +101,7 @@ class SupplierRanker:
                     "certifications": supplier.certifications,
                     "ingredient_name": item.ingredient_name,
                     "normalized_name": item.normalized_name,
+                    "specification": clean_optional_text(raw_payload.get("specification")),
                     "price_per_unit": price,
                     "currency": item.currency,
                     "available_qty": qty,
@@ -93,6 +109,7 @@ class SupplierRanker:
                     "price_display": clean_optional_text(raw_payload.get("price_display")),
                     "quantity_display": clean_optional_text(raw_payload.get("quantity_display")),
                     "lead_time_text": clean_optional_text(raw_payload.get("lead_time_text")),
+                    "moq": float(item.moq) if item.moq is not None else None,
                     "moq_display": clean_optional_text(raw_payload.get("moq_display")),
                     "is_updated": bool(raw_payload.get("is_updated")) or bool(history_count and history_count > 1),
                     "valid_until": item.valid_until.isoformat() if item.valid_until else None,
@@ -106,7 +123,7 @@ class SupplierRanker:
         grouped: dict[tuple[str, str], dict] = {}
         for row in rows:
             supplier_key = str(row.get("email_domain") or row.get("supplier_name") or "").strip().lower()
-            item_key = self._canonical_item_key(requested_item or row.get("normalized_name") or row.get("ingredient_name"))
+            item_key = self._catalog_line_key(row, requested_item)
             key = (
                 supplier_key,
                 item_key,
@@ -122,6 +139,17 @@ class SupplierRanker:
         text = re.sub(r"\(u\)", "", str(value or ""), flags=re.IGNORECASE)
         text = re.sub(r"[^a-z0-9]+", " ", text.lower())
         return " ".join(text.split())
+
+    def _catalog_line_key(self, row: dict, requested_item: str | None) -> str:
+        return "|".join(
+            [
+                self._canonical_item_key(requested_item or row.get("normalized_name") or row.get("ingredient_name")),
+                self._canonical_item_key(row.get("specification")),
+                str(row.get("available_qty") if row.get("available_qty") is not None else ""),
+                str(row.get("unit") or "").strip().lower(),
+                str(row.get("moq") if row.get("moq") is not None else ""),
+            ]
+        )
 
     def _row_is_newer(self, candidate: dict, current: dict) -> bool:
         if bool(candidate.get("is_updated")) != bool(current.get("is_updated")):

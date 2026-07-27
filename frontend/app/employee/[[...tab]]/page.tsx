@@ -47,6 +47,7 @@ type ChatMessage = {
 type SupplierItem = {
   ingredient_name: string;
   normalized_name: string;
+  specification?: string | null;
   price_per_unit: number | null;
   currency: string;
   available_qty: number | null;
@@ -291,6 +292,10 @@ function displayItemName(item: Pick<SupplierItem, "ingredient_name" | "normalize
   const rawName = (item as any).normalized_name ?? (item as any).ingredient_name;
   const name = displayText(rawName);
   return name !== "-" && (item as any).is_updated ? `${name} (U)` : name;
+}
+
+function displaySpecification(item: Pick<SupplierItem, "specification"> | Record<string, unknown>): string {
+  return displayText((item as any).specification);
 }
 
 function isNumericOnlyDisplay(value: unknown): boolean {
@@ -758,7 +763,9 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     for (const row of rows as Array<Record<string, unknown>>) {
       const rowName = String(row.normalized_name ?? row.ingredient_name ?? "").toLowerCase();
       const matchedToken = Array.from(queryTokens).find((token) => rowName.includes(token));
-      const itemKey = matchedToken || rowName.replace(/[^a-z0-9]+/g, " ").trim();
+      const specKey = String(row.specification ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      const qtyKey = `${String(row.available_qty ?? "")}-${String(row.unit ?? "")}-${String(row.moq ?? "")}`;
+      const itemKey = `${matchedToken || rowName.replace(/[^a-z0-9]+/g, " ").trim()}-${specKey}-${qtyKey}`;
       const key = `${String(row.email_domain ?? row.supplier_name ?? "").toLowerCase()}-${itemKey}`;
       const current = map.get(key);
       if (!current || shouldPreferAssistantRow(row, current)) {
@@ -771,7 +778,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const latestSupplierRows = useMemo(() => {
     const map = new Map<string, SupplierTableRow>();
     for (const row of supplierRows) {
-      const key = `${row.supplier_name}-${row.normalized_name || row.ingredient_name}`;
+      const key = `${row.supplier_name}-${row.normalized_name || row.ingredient_name}-${row.specification || ""}-${row.available_qty ?? ""}-${row.unit ?? ""}-${row.moq ?? ""}`;
       const existing = map.get(key);
       if (!existing || new Date(row.received_at ?? 0).getTime() > new Date(existing.received_at ?? 0).getTime()) {
         map.set(key, row);
@@ -789,7 +796,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
 
     const itemGroups = new Map<string, SupplierTableRow[]>();
     for (const row of latestSupplierRows) {
-      const key = row.normalized_name || row.ingredient_name;
+      const key = `${row.normalized_name || row.ingredient_name}-${row.specification || ""}`;
       const group = itemGroups.get(key) ?? [];
       group.push(row);
       itemGroups.set(key, group);
@@ -872,7 +879,11 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       return !search
         || supplier.supplier_name.toLowerCase().includes(search)
         || supplier.email_domain.toLowerCase().includes(search)
-        || supplier.items.some((item) => (item.normalized_name || "").toLowerCase().includes(search) || (item.ingredient_name || "").toLowerCase().includes(search));
+        || supplier.items.some((item) => (
+          (item.normalized_name || "").toLowerCase().includes(search)
+          || (item.ingredient_name || "").toLowerCase().includes(search)
+          || (item.specification || "").toLowerCase().includes(search)
+        ));
     });
 
     return summaries.sort((left, right) => {
@@ -921,7 +932,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     return filteredByEmail.filter((item) => {
       const matchesSearch = !search
         || (item.ingredient_name || "").toLowerCase().includes(search)
-        || (item.normalized_name || "").toLowerCase().includes(search);
+        || (item.normalized_name || "").toLowerCase().includes(search)
+        || (item.specification || "").toLowerCase().includes(search);
       if (!matchesSearch) return false;
       if (catalogFilter === "best") return safePrice(item.price_per_unit, item.currency) <= bestPrice * 1.08;
       if (catalogFilter === "low-stock") return safeQty(item.available_qty) <= minQty * 1.35;
@@ -960,14 +972,15 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     const matchedRows = latestSupplierRows.filter((row) => {
       const normalized = (row.normalized_name || "").toLowerCase();
       const ingredient = (row.ingredient_name || "").toLowerCase();
-      return !requested || normalized.includes(requested) || ingredient.includes(requested);
+      const specification = (row.specification || "").toLowerCase();
+      return !requested || normalized.includes(requested) || ingredient.includes(requested) || specification.includes(requested);
     });
 
     const bySupplier = new Map<string, SupplierTableRow>();
     for (const row of matchedRows) {
-      const current = bySupplier.get(row.supplier_name);
+      const current = bySupplier.get(`${row.supplier_name}-${row.specification || ""}-${row.available_qty ?? ""}-${row.unit ?? ""}-${row.moq ?? ""}`);
       if (!current || safePrice(row.price_per_unit, row.currency) < safePrice(current.price_per_unit, current.currency)) {
-        bySupplier.set(row.supplier_name, row);
+        bySupplier.set(`${row.supplier_name}-${row.specification || ""}-${row.available_qty ?? ""}-${row.unit ?? ""}-${row.moq ?? ""}`, row);
       }
     }
 
@@ -2321,6 +2334,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                             <thead>
                               <tr>
                                 <th>Ingredient</th>
+                                <th>Specification</th>
                                 <th>Price/Unit</th>
                                 <th>Qty Avail.</th>
                                 <th>Lead Time</th>
@@ -2332,14 +2346,15 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                             <tbody>
                               {selectedInboxThread.items.length === 0 ? (
                                 <tr>
-                                  <td colSpan={7}>No catalogue items were extracted for this supplier.</td>
+                                  <td colSpan={8}>No catalogue items were extracted for this supplier.</td>
                                 </tr>
                               ) : (
                                 selectedInboxThread.items.slice(0, 4).map((item, index) => {
                                   const bestPrice = Math.min(...selectedInboxThread.items.map((row) => safePrice(row.price_per_unit, row.currency)));
                                   return (
                                     <tr key={`${item.supplier_name}-${item.ingredient_name}-${index}`}>
-                                      <td>{displayItemName(item)}</td>
+                                      <td className="two-line-cell">{displayItemName(item)}</td>
+                                      <td className="two-line-cell specification-cell">{displaySpecification(item)}</td>
                                       <td>{displayPrice(item)}</td>
                                       <td>{displayQuantity(item)}</td>
                                       <td>{displayLeadTime(item)}</td>
@@ -2438,6 +2453,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                       <thead>
                         <tr>
                           <th>Ingredient</th>
+                          <th>Specification</th>
                           <th>Price/unit</th>
                           <th>Qty avail.</th>
                           <th>Lead Time</th>
@@ -2449,7 +2465,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                       <tbody>
                         {selectedCatalogItems.length === 0 ? (
                           <tr>
-                            <td colSpan={7}>No catalogue items match this filter.</td>
+                            <td colSpan={8}>No catalogue items match this filter.</td>
                           </tr>
                         ) : selectedCatalogItems.map((item, index) => {
                           const bestPrice = Math.min(...selectedCatalog.items.map((row) => safePrice(row.price_per_unit, row.currency)));
@@ -2461,7 +2477,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                               : "Good";
                           return (
                             <tr key={`${item.supplier_name}-${item.ingredient_name}-${index}`}>
-                              <td>{displayItemName(item)}</td>
+                              <td className="two-line-cell">{displayItemName(item)}</td>
+                              <td className="two-line-cell specification-cell">{displaySpecification(item)}</td>
                               <td>{displayPrice(item)}</td>
                               <td>{displayQuantity(item)}</td>
                               <td>{displayLeadTime(item)}</td>
@@ -2563,7 +2580,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                           <div className="supplier-badge">{supplierInitials(row.supplier_name)}</div>
                           <div>
                             <h3>{row.supplier_name}</h3>
-                            <p style={{ margin: 0 }}>{displayItemName(row)} · {row.email_domain}</p>
+                            <p style={{ margin: 0 }}>{displayItemName(row)} - {row.email_domain}</p>
+                            <p className="compare-spec-line">{displaySpecification(row)}</p>
                           </div>
                         </div>
 
@@ -2607,6 +2625,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                           <tr>
                             <th>#</th>
                             <th>Supplier</th>
+                            <th>Item</th>
+                            <th>Specification</th>
                             <th>Price/Unit</th>
                             <th>Available Qty</th>
                             <th>Lead Time</th>
@@ -2618,12 +2638,14 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                         <tbody>
                           {compareData.rows.length === 0 ? (
                             <tr>
-                              <td colSpan={8}>Only top suppliers found for this ingredient.</td>
+                              <td colSpan={10}>Only top suppliers found for this ingredient.</td>
                             </tr>
                           ) : compareData.rows.map((row, index) => (
                             <tr key={`${row.supplier_name}-${row.ingredient_name}-table`}>
                               <td>{index + 1}</td>
                               <td>{row.supplier_name}</td>
+                              <td className="two-line-cell">{displayItemName(row)}</td>
+                              <td className="two-line-cell specification-cell">{displaySpecification(row)}</td>
                               <td>{displayPrice(row)}</td>
                               <td>{displayQuantity(row)}</td>
                               <td>{displayLeadTime(row)}</td>
@@ -2696,6 +2718,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                       <tr>
                         <th>Supplier</th>
                         <th>Item</th>
+                        <th>Specification</th>
                         <th>Price/Unit</th>
                         <th>Qty</th>
                         <th>Lead Time</th>
@@ -2707,13 +2730,14 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                     <tbody>
                       {assistantRows.length === 0 ? (
                         <tr>
-                          <td colSpan={8}>Results appear after ProcuraAI returns supplier data.</td>
+                          <td colSpan={9}>Results appear after ProcuraAI returns supplier data.</td>
                         </tr>
                       ) : (
                         assistantRows.map((row, index) => (
                           <tr key={index}>
                             <td>{displayText(row.supplier_name)}</td>
-                            <td>{displayItemName(row)}</td>
+                            <td className="two-line-cell">{displayItemName(row)}</td>
+                            <td className="two-line-cell specification-cell">{displaySpecification(row)}</td>
                             <td>{displayPrice(row as SupplierItem)}</td>
                             <td>{displayQuantity(row as SupplierItem)}</td>
                             <td>{!isMissingDisplayValue(row.lead_time_text) ? String(row.lead_time_text) : (row.lead_time_days != null ? `${row.lead_time_days} days` : "-")}</td>

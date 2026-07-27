@@ -28,6 +28,7 @@ def normalize_item(item: ExtractedCatalogItem) -> ExtractedCatalogItem:
             "normalized_name": normalized_name,
             "unit": unit,
             "currency": (clean_optional_text(item.currency) or "INR").upper(),
+            "specification": clean_optional_text(item.specification),
             "lead_time_text": clean_optional_text(item.lead_time_text),
             "notes": clean_optional_text(item.notes),
         }

@@ -28,6 +28,7 @@ class ExtractedCatalogItem(BaseModel):
     unit: str | None = None
     valid_until: datetime | None = None
     supplier_sku: str | None = None
+    specification: str | None = None
     lead_time_days: int | None = None
     lead_time_text: str | None = None
     moq: float | None = None
@@ -75,7 +76,7 @@ class ExtractedCatalogItem(BaseModel):
             return None
         return v
 
-    @field_validator("unit", "supplier_sku", "lead_time_text", "notes", mode="before")
+    @field_validator("unit", "supplier_sku", "specification", "lead_time_text", "notes", mode="before")
     @classmethod
     def validate_optional_text(cls, v):
         return clean_optional_text(v)

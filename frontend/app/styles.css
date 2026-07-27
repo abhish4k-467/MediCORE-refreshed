@@ -676,6 +676,38 @@ td {
   white-space: nowrap;
 }
 
+.two-line-cell,
+.specification-cell {
+  max-width: 260px;
+  white-space: normal;
+  text-align: left;
+}
+
+.two-line-cell {
+  display: -webkit-box;
+  overflow: hidden;
+  line-height: 1.35;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.specification-cell {
+  max-width: 360px;
+  color: #315f54;
+}
+
+.compare-spec-line {
+  display: -webkit-box;
+  max-width: 320px;
+  margin: 3px 0 0;
+  overflow: hidden;
+  color: #5d877c;
+  font-size: 12px;
+  line-height: 1.35;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
 th:first-child,
 td:first-child {
   text-align: left;

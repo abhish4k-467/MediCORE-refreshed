@@ -523,7 +523,7 @@ class EmailIngestionService:
 
             item_text = (
                 f"{item.normalized_name} {item.ingredient_name} "
-                f"{item.available_qty} {item.unit} {item.price_per_unit} {item.currency}"
+                f"{self._item_specification(item)} {item.available_qty} {item.unit} {item.price_per_unit} {item.currency}"
             )
             raw_payload = self._compact_payload(item.model_dump(mode="json"))
             raw_payload["source"] = "email_extracted_catalogue"
@@ -636,7 +636,7 @@ class EmailIngestionService:
         tenant_id: Any,
     ) -> bool:
         normalized_name = item.normalized_name or item.ingredient_name.lower()
-        previous = (
+        previous_candidates = (
             self.db.query(CatalogItem)
             .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
             .filter(
@@ -646,7 +646,15 @@ class EmailIngestionService:
                 CatalogItem.catalog_email_id != catalog_email.id,
             )
             .order_by(CatalogEmail.received_at.desc())
-            .first()
+            .all()
+        )
+        previous = next(
+            (
+                candidate
+                for candidate in previous_candidates
+                if self._same_item_identity(candidate, item)
+            ),
+            None,
         )
         if previous is None:
             return True
@@ -655,11 +663,9 @@ class EmailIngestionService:
             [
                 _nullable_float(previous.price_per_unit) != _nullable_float(item.price_per_unit),
                 (previous.currency or "").upper() != (item.currency or "").upper(),
-                _nullable_float(previous.available_qty) != _nullable_float(item.available_qty),
-                (previous.unit or "").lower() != (item.unit or "").lower(),
                 (previous.lead_time_days or None) != (item.lead_time_days or None),
                 (previous.raw_payload or {}).get("lead_time_text") != (item.lead_time_text or None),
-                _nullable_float(previous.moq) != _nullable_float(item.moq),
+                self._item_specification(previous) != self._item_specification(item),
             ]
         )
 
@@ -671,7 +677,9 @@ class EmailIngestionService:
         tenant_id: Any,
     ) -> CatalogItem | None:
         normalized_name = item.normalized_name or item.ingredient_name.lower()
-        previous_items = (
+        previous_items = [
+            candidate
+            for candidate in (
             self.db.query(CatalogItem)
             .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
             .filter(
@@ -681,10 +689,33 @@ class EmailIngestionService:
                 CatalogItem.catalog_email_id != catalog_email.id,
             )
             .order_by(CatalogEmail.received_at.desc())
-            .limit(2)
             .all()
-        )
+            )
+            if self._same_item_identity(candidate, item)
+        ]
         return previous_items[0] if len(previous_items) == 1 else None
+
+    def _same_item_identity(self, existing: CatalogItem, item) -> bool:
+        return self._item_identity_key(existing) == self._item_identity_key(item)
+
+    def _item_identity_key(self, item) -> tuple:
+        normalized_name = getattr(item, "normalized_name", None) or getattr(item, "ingredient_name", "").lower()
+        return (
+            str(normalized_name or "").strip().lower(),
+            self._item_specification(item),
+            _nullable_float(getattr(item, "available_qty", None)),
+            str(getattr(item, "unit", None) or "").strip().lower(),
+            _nullable_float(getattr(item, "moq", None)),
+        )
+
+    def _item_specification(self, item) -> str:
+        raw_payload = getattr(item, "raw_payload", None) or {}
+        value = (
+            getattr(item, "specification", None)
+            or raw_payload.get("specification")
+            or self._notes_payload(getattr(item, "notes", None)).get("specification")
+        )
+        return (clean_optional_text(value) or "").strip().lower()
 
     def _touch_supplier_last_email(self, supplier: Supplier, received_at: datetime) -> None:
         if supplier.last_email_date is None or received_at > supplier.last_email_date:

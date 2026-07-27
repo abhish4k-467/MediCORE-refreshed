@@ -116,7 +116,22 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         self.assertEqual(rows[0].currency, "USD")
         self.assertEqual(rows[0].unit, "kg")
         self.assertIn("supplier_sku=JRG1287-A319", rows[0].notes or "")
+        self.assertEqual(rows[0].specification, "Assay: >=99.0%")
         self.assertIn("original_price=$30/kg", rows[0].notes or "")
+
+    def test_generic_table_extracts_specification_column_and_keeps_variants(self) -> None:
+        rows = parse_catalog_table_text(
+            "No | Product | Specification | Quantity\n"
+            "04 | Berberine | 97% Powder | 5,700KG\n"
+            "05 | Berberine | Berberine Extract 20:1 | 1,850KG\n"
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].ingredient_name, "Berberine")
+        self.assertEqual(rows[0].specification, "97% Powder")
+        self.assertEqual(rows[0].available_qty, 5700.0)
+        self.assertEqual(rows[0].unit, "kg")
+        self.assertEqual(rows[1].specification, "Berberine Extract 20:1")
 
     def test_display_payload_adds_unit_when_quantity_cell_is_numeric_only(self) -> None:
         service = object.__new__(EmailIngestionService)
@@ -225,17 +240,23 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
                     "supplier_name": "Prince Sikotra",
                     "email_domain": "prisik.da45@gmail.com",
                     "normalized_name": "biotin",
+                    "specification": "",
                     "price_display": "$5/kg",
-                    "quantity_display": None,
+                    "quantity_display": "125 kg",
+                    "available_qty": 125.0,
+                    "unit": "kg",
                     "received_at": "2026-07-22T10:00:00+00:00",
                     "is_updated": False,
                 },
                 {
                     "supplier_name": "Prince Sikotra",
                     "email_domain": "prisik.da45@gmail.com",
-                    "normalized_name": "biotin usp",
+                    "normalized_name": "biotin",
+                    "specification": "",
                     "price_display": "$31.00/kg",
                     "quantity_display": "125 kg",
+                    "available_qty": 125.0,
+                    "unit": "kg",
                     "received_at": "2026-07-22T10:00:00+00:00",
                     "is_updated": True,
                 },
@@ -246,6 +267,34 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["price_display"], "$31.00/kg")
         self.assertTrue(rows[0]["is_updated"])
+
+    def test_ranker_keeps_same_item_with_different_specification_as_distinct_rows(self) -> None:
+        ranker = object.__new__(SupplierRanker)
+        rows = ranker._dedupe_supplier_item_rows(
+            [
+                {
+                    "supplier_name": "Prince Sikotra",
+                    "email_domain": "prisik.da45@gmail.com",
+                    "normalized_name": "berberine",
+                    "specification": "97% Powder",
+                    "quantity_display": "5,700 kg",
+                    "available_qty": 5700.0,
+                    "unit": "kg",
+                },
+                {
+                    "supplier_name": "Prince Sikotra",
+                    "email_domain": "prisik.da45@gmail.com",
+                    "normalized_name": "berberine",
+                    "specification": "Berberine Extract 20:1",
+                    "quantity_display": "1,850 kg",
+                    "available_qty": 1850.0,
+                    "unit": "kg",
+                },
+            ],
+            "berberine",
+        )
+
+        self.assertEqual(len(rows), 2)
 
     def test_query_engine_dedupes_rows_after_execution_before_summary(self) -> None:
         engine = object.__new__(NaturalLanguageQueryEngine)
@@ -262,17 +311,23 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
                 "supplier_name": "Prince Sikotra",
                 "email_domain": "prisik.da45@gmail.com",
                 "normalized_name": "biotin",
+                "specification": "",
                 "price_display": "$5/kg",
-                "quantity_display": None,
+                "quantity_display": "125 kg",
+                "available_qty": 125.0,
+                "unit": "kg",
                 "received_at": "2026-07-22T10:00:00+00:00",
                 "is_updated": False,
             },
             {
                 "supplier_name": "Prince Sikotra",
                 "email_domain": "prisik.da45@gmail.com",
-                "normalized_name": "biotin usp",
+                "normalized_name": "biotin",
+                "specification": "",
                 "price_display": "$31.00/kg",
                 "quantity_display": "125 kg",
+                "available_qty": 125.0,
+                "unit": "kg",
                 "received_at": "2026-07-22T10:00:00+00:00",
                 "is_updated": True,
             },

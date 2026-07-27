@@ -50,6 +50,7 @@ def mock_catalog_items(q: str | None, limit: int) -> list[dict]:
             "supplier_name": supplier_names.get(item.supplier_id, "Mock supplier"),
             "ingredient_name": item.ingredient_name,
             "normalized_name": item.normalized_name,
+            "specification": display_value(item.raw_payload, "specification"),
             "price_per_unit": nullable_float(item.price_per_unit),
             "currency": item.currency,
             "available_qty": nullable_float(item.available_qty),
@@ -128,7 +129,14 @@ def list_catalog_items(
             select(
                 CatalogItem.id.label("item_id"),
                 func.row_number().over(
-                    partition_by=(CatalogItem.supplier_id, CatalogItem.normalized_name),
+                    partition_by=(
+                        CatalogItem.supplier_id,
+                        CatalogItem.normalized_name,
+                        CatalogItem.raw_payload["specification"].astext,
+                        CatalogItem.available_qty,
+                        CatalogItem.unit,
+                        CatalogItem.moq,
+                    ),
                     order_by=(
                         CatalogEmail.received_at.desc(),
                         CatalogItem.raw_payload["is_updated"].as_boolean().desc().nullslast(),
@@ -136,7 +144,14 @@ def list_catalog_items(
                     ),
                 ).label("row_number"),
                 func.count(CatalogItem.id).over(
-                    partition_by=(CatalogItem.supplier_id, CatalogItem.normalized_name),
+                    partition_by=(
+                        CatalogItem.supplier_id,
+                        CatalogItem.normalized_name,
+                        CatalogItem.raw_payload["specification"].astext,
+                        CatalogItem.available_qty,
+                        CatalogItem.unit,
+                        CatalogItem.moq,
+                    ),
                 ).label("history_count"),
             )
             .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
@@ -160,7 +175,13 @@ def list_catalog_items(
         source = CatalogItem.raw_payload["source"].astext
         stmt = stmt.where(or_(source.is_(None), source != "mock_extracted_catalogue"))
     if q:
-        stmt = stmt.where(CatalogItem.normalized_name.ilike(f"%{q}%"))
+        stmt = stmt.where(
+            or_(
+                CatalogItem.normalized_name.ilike(f"%{q}%"),
+                CatalogItem.ingredient_name.ilike(f"%{q}%"),
+                CatalogItem.raw_payload["specification"].astext.ilike(f"%{q}%"),
+            )
+        )
     stmt = stmt.order_by(nullslast(CatalogItem.price_per_unit.asc())).limit(limit)
     try:
         return [
@@ -170,6 +191,7 @@ def list_catalog_items(
                 "supplier_name": supplier_name,
                 "ingredient_name": item.ingredient_name,
                 "normalized_name": item.normalized_name,
+                "specification": display_value(item.raw_payload, "specification"),
                 "price_per_unit": nullable_float(item.price_per_unit),
                 "currency": item.currency,
                 "available_qty": nullable_float(item.available_qty),
@@ -283,21 +305,31 @@ def delete_catalog_email(
     try:
         email_items = db.query(CatalogItem).filter(CatalogItem.catalog_email_id == email_id).all()
         for item in email_items:
+            specification = (item.raw_payload or {}).get("specification")
+            specification_filter = (
+                CatalogItem.raw_payload["specification"].astext == str(specification)
+                if specification
+                else or_(
+                    CatalogItem.raw_payload["specification"].astext.is_(None),
+                    CatalogItem.raw_payload["specification"].astext == "",
+                )
+            )
+            identity_filters = (
+                CatalogItem.tenant_id == user_uuid,
+                CatalogItem.supplier_id == item.supplier_id,
+                CatalogItem.normalized_name == item.normalized_name,
+                specification_filter,
+                CatalogItem.available_qty == item.available_qty,
+                CatalogItem.unit == item.unit,
+                CatalogItem.moq == item.moq,
+            )
             history_count = (
                 db.query(CatalogItem.id)
-                .filter(
-                    CatalogItem.tenant_id == user_uuid,
-                    CatalogItem.supplier_id == item.supplier_id,
-                    CatalogItem.normalized_name == item.normalized_name,
-                )
+                .filter(*identity_filters)
                 .count()
             )
             if bool((item.raw_payload or {}).get("is_updated")) or history_count > 1:
-                db.query(CatalogItem).filter(
-                    CatalogItem.tenant_id == user_uuid,
-                    CatalogItem.supplier_id == item.supplier_id,
-                    CatalogItem.normalized_name == item.normalized_name,
-                ).delete(synchronize_session=False)
+                db.query(CatalogItem).filter(*identity_filters).delete(synchronize_session=False)
             else:
                 db.delete(item)
         # Keep a tombstone so future inbox syncs do not re-import a user-deleted email.

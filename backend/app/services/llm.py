@@ -185,6 +185,7 @@ class OpenRouterClient:
             for item in chunk_items:
                 key = (
                     (item.normalized_name or item.ingredient_name).strip().lower(),
+                    (item.specification or "").strip().lower(),
                     str(item.price_per_unit),
                     (item.currency or "").upper(),
                     str(item.available_qty) if item.available_qty is not None else None,
@@ -212,6 +213,8 @@ class OpenRouterClient:
             "Each catalog item in the array MUST contain the following fields:\n"
             "- ingredient_name: The raw name of the chemical, ingredient, or medicine (e.g., 'Citric Acid Anhydrous', 'Paracetamol API', 'Aspirin USP')\n"
             "- normalized_name: The lowercase, clean, canonical name of the ingredient, excluding grades, CAS, or pack sizes (e.g., 'citric acid', 'paracetamol', 'aspirin')\n"
+            "- specification: The exact product specification/description/grade/purity/assay/content from the row if present, otherwise null. "
+            "Examples: '97% Powder', 'Berberine Extract 20:1', 'Fe2+: 20.0%-23.7%, Nitrogen: 10.0%-12.0%'. Do not merge this into normalized_name.\n"
             "- price_per_unit: The numeric price from a price/rate column or phrase only. "
             "Never copy the quantity value into price_per_unit. Preserve the exact decimal value visible in the source; do not round. If a price range is given, use the visible lower bound and put the full original range in notes. "
             "If no real price/rate is visible for an item, use null instead of guessing; still extract the item if the product name is visible.\n"
@@ -323,6 +326,7 @@ class OpenRouterClient:
             {
                 "supplier": row.get("supplier_name"),
                 "item": self._display_item_name(row),
+                "specification": row.get("specification"),
                 "price": row.get("price_per_unit"),
                 "price_display": row.get("price_display"),
                 "currency": row.get("currency"),

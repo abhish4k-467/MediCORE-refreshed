@@ -171,6 +171,7 @@ def _parse_vertical_catalog_rows(
                 ExtractedCatalogItem(
                     ingredient_name=product_name,
                     normalized_name=_normalize_name(product_name),
+                    specification=" ".join(spec_parts).replace(";", ",") if spec_parts else None,
                     price_per_unit=price,
                     currency=currency,
                     available_qty=None,
@@ -300,7 +301,7 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
             continue
 
         possible_map = _header_map(parts)
-        if {"name", "price"}.issubset(possible_map) and ("qty" in possible_map or "unit" in possible_map):
+        if "name" in possible_map and any(key in possible_map for key in ("price", "qty", "specification")):
             header = parts
             header_map = possible_map
             continue
@@ -333,7 +334,10 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
         )
         moq = _number_from_text(_cell(parts, header_map.get("moq"))) if "moq" in header_map else None
         lead_time_days = _lead_time_days(_cell(parts, header_map.get("lead_time")))
+        specification = clean_optional_text(_cell(parts, header_map.get("specification")))
         notes_parts = []
+        if specification:
+            notes_parts.append(f"specification={specification.replace(';', ',')}")
         pack = clean_optional_text(_cell(parts, header_map.get("pack")))
         if pack:
             notes_parts.append(f"packaging={pack}")
@@ -351,6 +355,7 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
             ExtractedCatalogItem(
                 ingredient_name=name,
                 normalized_name=_normalize_name(name),
+                specification=specification,
                 price_per_unit=price,
                 currency=currency,
                 available_qty=qty,
@@ -381,6 +386,7 @@ def _header_map(parts: list[str]) -> dict[str, int]:
         "name": ("product", "item", "ingredient", "chemical", "material", "medicine", "api", "name"),
         "qty": ("qty", "quantity", "stock", "available", "availability"),
         "unit": ("unit", "uom"),
+        "specification": ("specification", "spec", "description", "assay", "purity", "grade", "content"),
         "price": ("price", "rate", "quote", "cost"),
         "currency": ("currency", "curr"),
         "moq": ("moq", "minimum order"),
@@ -528,9 +534,10 @@ def _candidate_lines(text: str) -> list[str]:
     return candidates
 
 
-def _item_key(item: ExtractedCatalogItem) -> tuple[str, float, float, str]:
+def _item_key(item: ExtractedCatalogItem) -> tuple[str, str, float, float, str]:
     return (
         item.normalized_name or item.ingredient_name.lower(),
+        (item.specification or "").strip().lower(),
         float(item.available_qty or 0),
         float(item.price_per_unit or 0),
         item.currency,

@@ -26,7 +26,7 @@ class NaturalLanguageQueryEngine:
         tenant_id: Any | None = None,
         user_id: Any | None = None,
     ) -> ChatResponse:
-        cache_key = f"chat:answer:v9:{tenant_id}:{question.strip().lower()}"
+        cache_key = f"chat:answer:v10:{tenant_id}:{question.strip().lower()}"
         cached = self._cache_get(cache_key)
         if cached:
             payload = json.loads(cached)
@@ -135,14 +135,18 @@ class NaturalLanguageQueryEngine:
         if not query_tokens:
             return None
 
-        query = self.db.query(CatalogItem.normalized_name, CatalogItem.ingredient_name).distinct()
+        query = self.db.query(
+            CatalogItem.normalized_name,
+            CatalogItem.ingredient_name,
+            CatalogItem.raw_payload["specification"].astext.label("specification"),
+        ).distinct()
         if tenant_id:
             query = query.filter(CatalogItem.tenant_id == (UUID(str(tenant_id)) if isinstance(tenant_id, str) else tenant_id))
 
         best_name: str | None = None
         best_score = 0
-        for normalized_name, ingredient_name in query.limit(500):
-            candidates = [normalized_name or "", ingredient_name or ""]
+        for normalized_name, ingredient_name, specification in query.limit(500):
+            candidates = [normalized_name or "", ingredient_name or "", specification or ""]
             for candidate in candidates:
                 candidate_lower = candidate.lower()
                 candidate_tokens = {
