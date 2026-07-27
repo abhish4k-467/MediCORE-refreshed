@@ -69,7 +69,7 @@ def preprocess_for_ocr(cell: Image.Image, scale: int = 4) -> Image.Image:
     return Image.fromarray(arr)
 
 
-def clean_text(text: str) -> str:
+def clean_text(text: str, preserve_symbols: bool = False) -> str:
     replacements = {
         "|": " ",
         "—": "-",
@@ -85,13 +85,25 @@ def clean_text(text: str) -> str:
         text = text.replace(old, new)
     text = text.replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
-    return text.strip(" -_.,")
+    return text.strip() if preserve_symbols else text.strip(" -_.,")
 
 
-def ocr_cell(cell: Image.Image, psm: int = 6) -> str:
+def ocr_cell(cell: Image.Image, psm: int = 6, preserve_symbols: bool = False) -> str:
     prepared = preprocess_for_ocr(cell)
-    raw = pytesseract.image_to_string(prepared, config=f"--oem 3 --psm {psm}")
-    return clean_text(raw)
+    config = f"--oem 3 --psm {psm} -c preserve_interword_spaces=1 -c user_defined_dpi=300"
+    raw = pytesseract.image_to_string(prepared, config=config)
+    return clean_text(raw, preserve_symbols=preserve_symbols)
+
+
+def richer_specification_text(primary: str, alternate: str) -> str:
+    def score(value: str) -> int:
+        return (
+            len(value)
+            + len(re.findall(r"[%:+<>=/().,-]", value)) * 4
+            + len(re.findall(r"\d", value)) * 2
+        )
+
+    return alternate if score(alternate) > score(primary) else primary
 
 
 def column_name_from_header(header: str, fallback: str) -> str:
@@ -193,7 +205,12 @@ def ocr_table_cells(image: Image.Image, horizontal: list[int], vertical: list[in
                 continue
             cell = crop_cell(image, vertical[column_index], top, vertical[column_index + 1], bottom)
             psm = 6 if column_name in {"product", "specification", "price"} else 7
-            cell_text[column_name] = ocr_cell(cell, psm=psm)
+            if column_name == "specification":
+                primary_text = ocr_cell(cell, psm=psm, preserve_symbols=True)
+                alternate_text = ocr_cell(cell, psm=7, preserve_symbols=True)
+                cell_text[column_name] = richer_specification_text(primary_text, alternate_text)
+            else:
+                cell_text[column_name] = ocr_cell(cell, psm=psm)
         rows.append(
             {
                 "row_number": row_index,

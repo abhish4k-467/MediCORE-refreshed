@@ -695,6 +695,10 @@ td {
   color: #315f54;
 }
 
+.specification-header {
+  text-align: left;
+}
+
 .compare-spec-line {
   display: -webkit-box;
   max-width: 320px;

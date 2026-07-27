@@ -2346,7 +2346,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                             <thead>
                               <tr>
                                 <th>Ingredient</th>
-                                <th>Specification</th>
+                                <th className="specification-header">Specification</th>
                                 <th>Price/Unit</th>
                                 <th>Qty Avail.</th>
                                 <th>Lead Time</th>
@@ -2465,7 +2465,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                       <thead>
                         <tr>
                           <th>Ingredient</th>
-                          <th>Specification</th>
+                          <th className="specification-header">Specification</th>
                           <th>Price/unit</th>
                           <th>Qty avail.</th>
                           <th>Lead Time</th>
@@ -2638,7 +2638,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                             <th>#</th>
                             <th>Supplier</th>
                             <th>Item</th>
-                            <th>Specification</th>
+                            <th className="specification-header">Specification</th>
                             <th>Price/Unit</th>
                             <th>Available Qty</th>
                             <th>Lead Time</th>
@@ -2730,7 +2730,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                       <tr>
                         <th>Supplier</th>
                         <th>Item</th>
-                        <th>Specification</th>
+                        <th className="specification-header">Specification</th>
                         <th>Price/Unit</th>
                         <th>Qty</th>
                         <th>Lead Time</th>
