@@ -149,6 +149,18 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         self.assertEqual(rows[1].specification, "1% HPLC")
         self.assertEqual(rows[2].specification, "5% HPLC")
 
+    def test_numbered_rows_keep_parenthetical_product_and_multiline_specification(self) -> None:
+        rows = parse_catalog_table_text(
+            "12 Bilberry Fruit Extract ( Europe ) Anthocyanins 36% HPLC Anthocyanidins 25%UV 300KG\n"
+            "13 Bilberry Fruit Extract ( Europe ) Anthocyanins 25% HPLC Anthocyanidins18%UV 500KG\n"
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].ingredient_name, "Bilberry Fruit Extract ( Europe )")
+        self.assertEqual(rows[0].specification, "Anthocyanins 36% HPLC Anthocyanidins 25%UV")
+        self.assertEqual(rows[0].available_qty, 300.0)
+        self.assertEqual(rows[1].specification, "Anthocyanins 25% HPLC Anthocyanidins18%UV")
+
     def test_supplier_identity_uses_full_sender_email(self) -> None:
         from backend.app.services.email_ingestion import get_supplier_domain
 

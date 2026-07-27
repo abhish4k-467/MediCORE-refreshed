@@ -1,5 +1,6 @@
 import email
 import email.utils
+from collections import defaultdict
 from email.header import decode_header
 from html.parser import HTMLParser
 import imaplib
@@ -24,7 +25,6 @@ from backend.app.services.catalog_table_parser import (
     extract_pack_size,
     parse_catalog_table_text,
 )
-from backend.app.services.embeddings import embed_catalog_item_text
 from backend.app.services.gmail_api import GmailApiClient
 from backend.app.services.llm import OpenRouterClient
 from backend.app.services.normalizer import normalize_item
@@ -418,29 +418,19 @@ class EmailIngestionService:
             logger.info("No text available for %s", source_name)
             return []
 
-        # If it is a conversational email body or unstructured text file, run LLM directly
-        if source_name.lower().endswith(".txt") or "email_body" in source_name.lower():
-            try:
-                extracted = [normalize_item(item) for item in self.llm.extract_catalog_items(text, reference_date=reference_date)]
-                logger.info("LLM extracted %s catalogue row(s) from conversational source %s", len(extracted), source_name)
-                return extracted
-            except Exception:
-                logger.exception("LLM extraction failed for %s", source_name)
-                return []
-
         parser_text = self._preferred_parser_text(text)
-
-        # Otherwise, try the OCR regex table parser first for structured catalogs
         parsed = [
             normalize_item(item)
             for item in parse_catalog_table_text(parser_text, reference_date=reference_date)
         ]
         parsed = self._dedupe_extracted_items(parsed)
-        logger.info("OCR table parser extracted %s catalogue row(s) from %s", len(parsed), source_name)
+        source_lower = source_name.lower()
+        conversational_source = source_lower.endswith(".txt") or "email_body" in source_lower
+        logger.info("Deterministic table parser extracted %s catalogue row(s) from %s", len(parsed), source_name)
 
-        if len(parsed) >= 20:
+        if len(parsed) >= (3 if conversational_source else 20):
             logger.info(
-                "Using %s deterministic parser row(s) for structured catalogue %s; skipping LLM fallback",
+                "Using %s deterministic parser row(s) for catalogue %s; skipping LLM fallback",
                 len(parsed),
                 source_name,
             )
@@ -471,6 +461,7 @@ class EmailIngestionService:
         for item in items:
             key = (
                 (item.normalized_name or item.ingredient_name).strip().lower(),
+                self._item_specification(item),
                 str(item.price_per_unit),
                 (item.currency or "").upper(),
                 str(item.available_qty) if item.available_qty is not None else None,
@@ -495,6 +486,7 @@ class EmailIngestionService:
     ) -> int:
         count = 0
         active_tenant_id = tenant_id or supplier.tenant_id
+        prepared_items = []
         for item in items:
             item = self._with_source_note(item, text)
             if not self._has_required_grounded_values(item):
@@ -503,8 +495,23 @@ class EmailIngestionService:
                     item.model_dump(mode="json"),
                 )
                 continue
+            prepared_items.append(item)
 
-            if not self._catalog_item_changed(catalog_email, supplier, item, active_tenant_id):
+        existing_by_identity = self._existing_supplier_items_by_identity(
+            catalog_email,
+            supplier,
+            prepared_items,
+            active_tenant_id,
+        )
+
+        for item in prepared_items:
+            existing_candidates = existing_by_identity.get(self._item_identity_key(item), [])
+            existing_item = existing_candidates[0] if len(existing_candidates) == 1 else None
+            has_changed = True
+            if existing_candidates:
+                has_changed = self._catalog_item_values_changed(existing_candidates[0], item)
+
+            if not has_changed:
                 logger.info(
                     "Skipping unchanged catalogue item supplier=%s item=%s",
                     supplier.email_domain,
@@ -512,10 +519,6 @@ class EmailIngestionService:
                 )
                 continue
 
-            item_text = (
-                f"{item.normalized_name} {item.ingredient_name} "
-                f"{self._item_specification(item)} {item.available_qty} {item.unit} {item.price_per_unit} {item.currency}"
-            )
             raw_payload = self._compact_payload(item.model_dump(mode="json"))
             raw_payload["source"] = "email_extracted_catalogue"
             if clean_optional_text(source_name):
@@ -525,7 +528,6 @@ class EmailIngestionService:
                 raw_payload["pack_size"] = pack_size
             raw_payload.update(self._compact_payload(self._notes_payload(item.notes)))
             raw_payload.update(self._compact_payload(self._exact_display_payload(item, text)))
-            existing_item = self._single_existing_supplier_item(catalog_email, supplier, item, active_tenant_id)
             if existing_item:
                 logger.info(
                     "Updating existing catalogue item supplier=%s item=%s from email id=%s",
@@ -544,7 +546,7 @@ class EmailIngestionService:
                 existing_item.valid_until = item.valid_until
                 existing_item.lead_time_days = item.lead_time_days
                 existing_item.moq = item.moq
-                existing_item.embedding = self._safe_embedding(item_text)
+                existing_item.embedding = None
                 existing_item.raw_payload = raw_payload
             else:
                 self.db.add(
@@ -562,7 +564,7 @@ class EmailIngestionService:
                         valid_until=item.valid_until,
                         lead_time_days=item.lead_time_days,
                         moq=item.moq,
-                        embedding=self._safe_embedding(item_text),
+                        embedding=None,
                         raw_payload=raw_payload,
                     )
                 )
@@ -618,6 +620,49 @@ class EmailIngestionService:
         notes = (item.notes or "").lower()
         grounded_markers = ("source=", "source:", "original_price=", "original_quantity=", "lead_time=")
         return any(marker in notes for marker in grounded_markers)
+
+    def _existing_supplier_items_by_identity(
+        self,
+        catalog_email: CatalogEmail,
+        supplier: Supplier,
+        items,
+        tenant_id: Any,
+    ) -> dict[tuple, list[CatalogItem]]:
+        normalized_names = {
+            (item.normalized_name or item.ingredient_name.lower()).strip().lower()
+            for item in items
+            if clean_optional_text(item.ingredient_name)
+        }
+        if not normalized_names:
+            return {}
+
+        previous_items = (
+            self.db.query(CatalogItem)
+            .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
+            .filter(
+                CatalogItem.tenant_id == tenant_id,
+                CatalogItem.supplier_id == supplier.id,
+                CatalogItem.normalized_name.in_(normalized_names),
+                CatalogItem.catalog_email_id != catalog_email.id,
+            )
+            .order_by(CatalogEmail.received_at.desc(), CatalogItem.id.desc())
+            .all()
+        )
+        grouped: dict[tuple, list[CatalogItem]] = defaultdict(list)
+        for previous in previous_items:
+            grouped[self._item_identity_key(previous)].append(previous)
+        return dict(grouped)
+
+    def _catalog_item_values_changed(self, previous: CatalogItem, item) -> bool:
+        return any(
+            [
+                _nullable_float(previous.price_per_unit) != _nullable_float(item.price_per_unit),
+                (previous.currency or "").upper() != (item.currency or "").upper(),
+                (previous.lead_time_days or None) != (item.lead_time_days or None),
+                (previous.raw_payload or {}).get("lead_time_text") != (item.lead_time_text or None),
+                self._item_specification(previous) != self._item_specification(item),
+            ]
+        )
 
     def _catalog_item_changed(
         self,
@@ -713,11 +758,8 @@ class EmailIngestionService:
             supplier.last_email_date = received_at
 
     def _safe_embedding(self, item_text: str) -> list[float] | None:
-        try:
-            return embed_catalog_item_text(item_text)
-        except Exception:
-            logger.exception("Embedding failed; storing catalogue item without vector")
-            return None
+        logger.debug("Skipping embedding generation during ingestion hot path")
+        return None
 
     def _pack_size_for_item(self, text: str, ingredient_name: str) -> str | None:
         ingredient = ingredient_name.lower()

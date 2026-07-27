@@ -238,6 +238,9 @@ def _split_product_specification(body: str) -> tuple[str, str | None]:
     if marker and marker.start() > 0:
         product = text[: marker.start()].strip(" -")
         specification = text[marker.start() :].strip(" -")
+        paren_split = _split_spec_after_trailing_parenthetical(product, specification)
+        if paren_split:
+            return paren_split
         if product and specification:
             return product, specification
 
@@ -245,6 +248,21 @@ def _split_product_specification(body: str) -> tuple[str, str | None]:
     if len(parts) >= 2 and parts[0].lower() == parts[1].lower():
         return parts[0], " ".join(parts[1:])
     return text, None
+
+
+def _split_spec_after_trailing_parenthetical(product: str, specification: str) -> tuple[str, str] | None:
+    if not specification or not re.match(r"^[<>]?\d", specification):
+        return None
+    close_index = product.rfind(")")
+    if close_index < 0 or close_index >= len(product) - 1:
+        return None
+    product_name = product[: close_index + 1].strip(" -")
+    spec_prefix = product[close_index + 1 :].strip(" -")
+    if not product_name or not spec_prefix:
+        return None
+    if not re.search(r"[A-Za-z]", spec_prefix):
+        return None
+    return product_name, f"{spec_prefix} {specification}".strip()
 
 
 def extract_pack_size(line: str) -> str | None:
