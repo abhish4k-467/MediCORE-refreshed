@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from backend.app.schemas import ExtractedCatalogItem
 from backend.app.services.catalog_table_parser import parse_catalog_table_text
+from backend.app.services.country_detection import detect_supplier_country
 from backend.app.services.email_ingestion import EmailIngestionService
 from backend.app.services.nl_query import NaturalLanguageQueryEngine
 from backend.app.services.ranking import SupplierRanker
@@ -401,6 +402,165 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         self.assertEqual(response.answer, "1 row(s)")
         self.assertEqual(len(response.rows), 1)
         self.assertEqual(response.rows[0]["price_display"], "$31.00/kg")
+
+    def test_query_engine_normalizes_sql_email_date_alias(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+        engine.db = SimpleNamespace()
+
+        rows = engine._normalize_sql_rows(
+            [
+                {
+                    "supplier_name": "Prince Sikotra",
+                    "ingredient_name": "Marigold Extract Lutein 10% Powder (HPLC)",
+                    "available_qty": 500,
+                    "unit": "kg",
+                    "email_date": datetime(2026, 7, 22, 10, 30, tzinfo=UTC),
+                }
+            ]
+        )
+
+        self.assertEqual(rows[0]["received_at"], "2026-07-22T10:30:00+00:00")
+        self.assertEqual(rows[0]["quantity_display"], "500.0 kg")
+
+    def test_query_engine_matches_misspelled_ingredient_before_querying(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+
+        matched = engine._best_ingredient_result_from_candidates(
+            "aswahgandha supplier name",
+            [
+                "5-Amino-1-methylquinolinium Chloride",
+                "Zinc Gluconate",
+                "Ashwagandha Extract 12:1",
+                "Organic Ashwagandha Powder",
+                "Magnesium Citrate",
+            ],
+        )
+
+        self.assertEqual(matched.search_phrase, "ashwagandha")
+        self.assertIn("Ashwagandha Extract 12:1", matched.matched_names)
+        self.assertIn("Organic Ashwagandha Powder", matched.matched_names)
+        self.assertNotIn("5-Amino-1-methylquinolinium Chloride", matched.matched_names)
+
+    def test_query_engine_matches_partial_ingredient_phrase(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+
+        matched = engine._best_ingredient_result_from_candidates(
+            "ginger price",
+            [
+                "Ginger Powder",
+                "Ginger Extract",
+                "Organic Ginger Root Powder",
+                "Magnesium Citrate",
+            ],
+        )
+
+        self.assertEqual(matched.search_phrase, "ginger")
+        self.assertEqual(
+            set(matched.matched_names),
+            {"Ginger Powder", "Ginger Extract", "Organic Ginger Root Powder"},
+        )
+
+    def test_query_engine_expands_common_ingredient_abbreviations(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+
+        matched = engine._best_ingredient_result_from_candidates(
+            "vit d3",
+            [
+                "Vitamin D3 Powder (Lichen)",
+                "Vitamin D3 100,000 IU/g",
+                "Vitamin B12",
+            ],
+        )
+
+        self.assertEqual(matched.search_phrase, "vitamin d3")
+        self.assertEqual(
+            set(matched.matched_names),
+            {"Vitamin D3 Powder (Lichen)", "Vitamin D3 100,000 IU/g"},
+        )
+
+    def test_query_engine_rejects_unrelated_weak_ingredient_match(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+
+        matched = engine._best_ingredient_result_from_candidates(
+            "give me supplier of ashwangandha",
+            [
+                "5-Amino-1-methylquinolinium Chloride",
+                "Zinc Gluconate",
+                "Magnesium Citrate",
+            ],
+        )
+
+        self.assertIsNone(matched.search_phrase)
+        self.assertEqual(matched.matched_names, [])
+
+    def test_supplier_country_detection_normalizes_usa_address(self) -> None:
+        country = detect_supplier_country(
+            "USA Warehouse & Office\n"
+            "Herbal Creations USA\n"
+            "Ontario, CA 91761\n"
+            "United States"
+        )
+
+        self.assertEqual(country, "United States")
+
+    def test_supplier_country_detection_handles_city_country_signature(self) -> None:
+        self.assertEqual(detect_supplier_country("Sales Team\nShanghai, China\nTel: 021-5555"), "China")
+        self.assertEqual(detect_supplier_country("Regards\nAhmedabad, Gujarat, India"), "India")
+
+    def test_supplier_country_detection_defaults_unknown_without_address(self) -> None:
+        self.assertEqual(detect_supplier_country("New catalogue attached. Best prices this month."), "Unknown")
+
+    def test_certificate_pdf_detection_uses_filename_and_text(self) -> None:
+        service = EmailIngestionService(db=SimpleNamespace())
+
+        self.assertTrue(service._is_certificate_pdf("Vitamin-D3-COA.pdf", ".pdf", "Certificate of Analysis"))
+        self.assertTrue(service._is_certificate_pdf("supplier-quality.pdf", ".pdf", "ISO 9001 Certificate"))
+        self.assertFalse(service._is_certificate_pdf("July catalogue.pdf", ".pdf", "price list inventory"))
+        self.assertFalse(service._is_certificate_pdf("COA.docx", ".docx", "Certificate of Analysis"))
+
+    def test_certificate_refs_are_deduped_and_keep_storage_path(self) -> None:
+        service = EmailIngestionService(db=SimpleNamespace())
+
+        refs = service._dedupe_certificate_refs(
+            [
+                {"name": "COA.pdf", "url": "https://storage/coa.pdf", "storage_path": "email/COA.pdf", "type": "COA"},
+                {"name": "COA copy.pdf", "url": "https://storage/coa.pdf", "storage_path": "email/COA.pdf", "type": "COA"},
+            ]
+        )
+
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["storage_path"], "email/COA.pdf")
+
+    def test_certificate_refs_merge_into_item_payload_without_binary(self) -> None:
+        service = EmailIngestionService(db=SimpleNamespace(add=lambda item: None))
+        item = SimpleNamespace(raw_payload={"source": "email_extracted_catalogue"})
+
+        service._merge_item_certificate_refs(
+            item,
+            [{"name": "COA.pdf", "url": "https://storage/coa.pdf", "storage_path": "email/COA.pdf", "type": "COA"}],
+        )
+
+        self.assertEqual(item.raw_payload["certificate_pdfs"][0]["url"], "https://storage/coa.pdf")
+        self.assertNotIn("payload", item.raw_payload["certificate_pdfs"][0])
+
+    def test_certificate_refs_attach_to_items_when_product_match_is_weak(self) -> None:
+        item = SimpleNamespace(
+            raw_payload={"source": "email_extracted_catalogue"},
+            ingredient_name="Ashwagandha Extract 5% Withanolides",
+        )
+        query = SimpleNamespace(
+            filter=lambda *args, **kwargs: SimpleNamespace(all=lambda: [item])
+        )
+        db = SimpleNamespace(query=lambda model: query, add=lambda item: None)
+        service = EmailIngestionService(db=db)
+
+        service._attach_certificate_refs(
+            SimpleNamespace(id="email-id", tenant_id="tenant-id"),
+            SimpleNamespace(id="supplier-id"),
+            [{"name": "Ashwagandha-Certi.pdf", "url": "https://storage/cert.pdf", "type": "Certificate"}],
+        )
+
+        self.assertEqual(item.raw_payload["certificate_pdfs"][0]["name"], "Ashwagandha-Certi.pdf")
 
 
 if __name__ == "__main__":

@@ -28,6 +28,21 @@ def display_value(raw_payload: dict | None, key: str):
     return clean_optional_text((raw_payload or {}).get(key))
 
 
+def certificate_pdfs(raw_payload: dict | None) -> list[dict]:
+    values = (raw_payload or {}).get("certificate_pdfs")
+    if not isinstance(values, list):
+        return []
+    return [
+        {
+            "name": clean_optional_text(row.get("name")) or "Certificate PDF",
+            "url": clean_optional_text(row.get("url")),
+            "type": clean_optional_text(row.get("type")) or "Certificate",
+        }
+        for row in values
+        if isinstance(row, dict) and clean_optional_text(row.get("url"))
+    ]
+
+
 def canonical_search_text(value: object) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).split())
 
@@ -92,6 +107,19 @@ def delete_storage_object(object_path: str | None) -> None:
         logger.warning("Failed to delete catalog attachment object %s", object_path, exc_info=True)
 
 
+def certificate_storage_paths(raw_payload: dict | None) -> list[str]:
+    values = (raw_payload or {}).get("certificate_pdfs")
+    if not isinstance(values, list):
+        return []
+    return [
+        path
+        for row in values
+        if isinstance(row, dict)
+        for path in [clean_optional_text(row.get("storage_path"))]
+        if path
+    ]
+
+
 def mock_catalog_emails(limit: int) -> list[dict]:
     suppliers, emails, _ = build_catalogs()
     supplier_names = {supplier.id: supplier.name for supplier in suppliers}
@@ -135,6 +163,7 @@ def mock_catalog_items(q: str | None, limit: int) -> list[dict]:
             "quantity_display": display_value(item.raw_payload, "quantity_display"),
             "moq_display": display_value(item.raw_payload, "moq_display"),
             "source_document": display_value(item.raw_payload, "source_document"),
+            "certificate_pdfs": certificate_pdfs(item.raw_payload),
             "is_updated": bool((item.raw_payload or {}).get("is_updated")),
             "received_at": email_received_dates.get(item.catalog_email_id) if getattr(item, "catalog_email_id", None) else None,
         }
@@ -288,6 +317,7 @@ def list_catalog_items(
                 "quantity_display": display_value(item.raw_payload, "quantity_display"),
                 "moq_display": display_value(item.raw_payload, "moq_display"),
                 "source_document": display_value(item.raw_payload, "source_document"),
+                "certificate_pdfs": certificate_pdfs(item.raw_payload),
                 "is_updated": bool((item.raw_payload or {}).get("is_updated")) or bool(history_count and history_count > 1),
                 "received_at": received_at,
             }
@@ -396,6 +426,14 @@ def delete_catalog_email(
             detail="Catalog email not found or access denied."
         )
     object_path = _storage_object_path_from_public_url(email_record.pdf_url)
+    certificate_paths = [
+        path
+        for (raw_payload,) in db.query(CatalogItem.raw_payload).filter(
+            CatalogItem.catalog_email_id == email_id,
+            CatalogItem.tenant_id == user_uuid,
+        )
+        for path in certificate_storage_paths(raw_payload)
+    ]
     try:
         db.query(CatalogItem).filter(
             CatalogItem.catalog_email_id == email_id,
@@ -406,6 +444,8 @@ def delete_catalog_email(
         email_record.pdf_url = None
         db.commit()
         background_tasks.add_task(delete_storage_object, object_path)
+        for certificate_path in dict.fromkeys(certificate_paths):
+            background_tasks.add_task(delete_storage_object, certificate_path)
     except Exception as e:
         db.rollback()
         from fastapi import HTTPException

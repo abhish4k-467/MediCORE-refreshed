@@ -670,6 +670,7 @@ export default function AdminWorkspacePage({ params }: { params: Promise<{ tab?:
             <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left" }}>
               <thead>
                 <tr style={{ background: "#fafcfb", borderBottom: "1px solid #dce4df" }}>
+                  <th style={{ padding: "18px 24px", fontSize: "12px", fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.5px", width: "64px" }}>#</th>
                   <th style={{ padding: "18px 24px", fontSize: "12px", fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Employee Name</th>
                   <th style={{ padding: "18px 24px", fontSize: "12px", fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Connected Email</th>
                   <th style={{ padding: "18px 24px", fontSize: "12px", fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Status</th>
@@ -680,13 +681,14 @@ export default function AdminWorkspacePage({ params }: { params: Promise<{ tab?:
               <tbody>
                 {employees.length === 0 ? (
                   <tr>
-                    <td colSpan={5} style={{ padding: "40px", textAlign: "center", color: "var(--muted)", fontSize: "13px" }}>
+                    <td colSpan={6} style={{ padding: "40px", textAlign: "center", color: "var(--muted)", fontSize: "13px" }}>
                       No employees found. Invite your first employee by clicking "Add Employee".
                     </td>
                   </tr>
                 ) : (
-                  employees.map((emp) => (
+                  employees.map((emp, index) => (
                     <tr key={emp.id} style={{ borderBottom: "1px solid #f4f7f5", transition: "background 0.2s" }}>
+                      <td style={{ padding: "16px 24px", fontSize: "12.5px", color: "var(--muted)" }}>{index + 1}</td>
                       <td style={{ padding: "16px 24px" }}>
                         <div style={{ fontWeight: 400, color: "var(--ink)", fontSize: "13px" }}>{emp.name}</div>
                       </td>

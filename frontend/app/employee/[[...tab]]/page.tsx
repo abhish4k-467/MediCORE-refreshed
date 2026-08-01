@@ -44,6 +44,12 @@ type ChatMessage = {
   text: string;
 };
 
+type CertificatePdf = {
+  name: string;
+  url: string;
+  type?: string | null;
+};
+
 type SupplierItem = {
   ingredient_name: string;
   specification?: string | null;
@@ -60,6 +66,7 @@ type SupplierItem = {
   quantity_display?: string | null;
   moq_display?: string | null;
   source_document?: string | null;
+  certificate_pdfs?: CertificatePdf[];
   catalog_email_id?: string | null;
   received_at?: string | null;
   is_updated?: boolean;
@@ -68,6 +75,7 @@ type SupplierItem = {
 type SupplierApiRow = {
   name: string;
   email_domain: string;
+  country?: string | null;
   last_email_date: string | null;
   certifications: string | null;
 };
@@ -85,6 +93,7 @@ type CatalogEmailRow = {
 type SupplierTableRow = SupplierItem & {
   supplier_name: string;
   email_domain: string;
+  country?: string | null;
   certifications?: string | null;
 };
 
@@ -340,6 +349,28 @@ function matchesSearch(row: Pick<SupplierItem, "ingredient_name" | "specificatio
   return searchRelevance(row, query) > 0;
 }
 
+function compareSearchMatches(row: Pick<SupplierItem, "ingredient_name" | "specification"> | string, query: string): boolean {
+  const tokens = searchTokens(query);
+  if (tokens.length === 0) return false;
+  const name = typeof row === "string" ? canonicalSearchText(row) : canonicalSearchText(row.ingredient_name);
+  const spec = typeof row === "string" ? "" : canonicalSearchText(row.specification);
+  const haystack = `${name} ${spec}`.trim();
+  const alphaTokens = tokens.filter((token) => /[a-z]/.test(token));
+  const requiredTokens = alphaTokens.length ? alphaTokens : tokens;
+  return requiredTokens.every((token) => haystack.split(" ").some((part) => part === token || part.includes(token)));
+}
+
+function compareSearchRelevance(row: Pick<SupplierItem, "ingredient_name" | "specification"> | string, query: string): number {
+  if (!compareSearchMatches(row, query)) return 0;
+  const base = searchRelevance(row, query);
+  const tokens = searchTokens(query);
+  const name = typeof row === "string" ? canonicalSearchText(row) : canonicalSearchText(row.ingredient_name);
+  const spec = typeof row === "string" ? "" : canonicalSearchText(row.specification);
+  const haystack = `${name} ${spec}`.trim();
+  const numericMatches = tokens.filter((token) => /^\d+$/.test(token) && haystack.includes(token)).length;
+  return base + numericMatches * 250;
+}
+
 function displaySpecification(item: Pick<SupplierItem, "specification"> | Record<string, unknown>): string {
   return displayText((item as any).specification);
 }
@@ -383,6 +414,34 @@ function displayLeadTime(item: Pick<SupplierItem, "lead_time_text" | "lead_time_
 
 function displayMoq(item: Pick<SupplierItem, "moq_display" | "moq" | "unit">): string {
   return !isMissingDisplayValue(item.moq_display) ? String(item.moq_display) : (item.moq != null ? `${formatQuantity(Number(item.moq))} ${item.unit || ""}`.trim() : "-");
+}
+
+function certificatePdfs(row: Pick<SupplierItem, "certificate_pdfs"> | Record<string, unknown>): CertificatePdf[] {
+  const values = (row as { certificate_pdfs?: unknown }).certificate_pdfs;
+  if (!Array.isArray(values)) return [];
+  return values
+    .filter((item): item is CertificatePdf => Boolean(item && typeof item === "object" && typeof (item as CertificatePdf).url === "string" && (item as CertificatePdf).url))
+    .map((item) => ({
+      name: item.name || "Certificate PDF",
+      url: item.url,
+      type: item.type || "Certificate",
+    }));
+}
+
+function comparisonRowKey(row: Record<string, unknown>, index: number): string {
+  return [
+    row.id,
+    row.catalog_email_id,
+    row.email_domain,
+    row.supplier_name,
+    row.ingredient_name,
+    row.specification,
+    row.available_qty,
+    row.unit,
+    row.moq,
+    row.received_at,
+    index,
+  ].map((value) => String(value ?? "")).join("|");
 }
 
 function formatShortDate(value: string | null | undefined): string {
@@ -590,6 +649,11 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const [selectedCatalogEmailId, setSelectedCatalogEmailId] = useState<string | null>(null);
   const [supplierSearch, setSupplierSearch] = useState("");
   const [supplierSort, setSupplierSort] = useState<SupplierSort>("latest");
+  const [selectedSupplierCountries, setSelectedSupplierCountries] = useState<string[]>([]);
+  const [supplierCountryOpen, setSupplierCountryOpen] = useState(false);
+  const [certificateModalItems, setCertificateModalItems] = useState<CertificatePdf[] | null>(null);
+  const [expandedCompareRows, setExpandedCompareRows] = useState<Record<string, boolean>>({});
+  const [expandedAssistantRows, setExpandedAssistantRows] = useState<Record<string, boolean>>({});
   const [catalogSearch, setCatalogSearch] = useState("");
   const [catalogFilter, setCatalogFilter] = useState<"all" | "best" | "low-stock">("all");
   const [compareIngredient, setCompareIngredient] = useState("");
@@ -635,6 +699,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const [isTypingResponse, setIsTypingResponse] = useState(false);
   const streamIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const chatMessagesEndRef = useRef<HTMLDivElement | null>(null);
+  const supplierCountryFilterRef = useRef<HTMLDivElement | null>(null);
 
   // Initial load tracking ref
   const initialLoadRef = useRef(false);
@@ -909,11 +974,12 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       const emails = emailBySupplier.get(key) ?? [];
       const supplierName = items[0]?.supplier_name ?? emails[0]?.supplier_name ?? "-";
       const emailDomain = items[0]?.email_domain ?? emails[0]?.email_domain ?? "-";
+      const meta = supplierMeta.get(key);
+      const country = meta?.country || items[0]?.country || "Unknown";
       const sortedByPrice = [...items].sort((left, right) => safePrice(left.price_per_unit, left.currency) - safePrice(right.price_per_unit, right.currency));
       const latestEmail = emails.slice().sort((left, right) => {
         return new Date(right.received_at).getTime() - new Date(left.received_at).getTime();
       })[0];
-      const meta = supplierMeta.get(key);
       
       const latestItems = latestEmail
         ? items.filter((item) => item.catalog_email_id === latestEmail.id)
@@ -925,6 +991,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         supplier_key: key,
         supplier_name: supplierName,
         email_domain: emailDomain ?? meta?.email_domain ?? "-",
+        country,
         item_count: latestItems.length,
         best_item: sortedLatestByPrice[0],
         total_qty: totalQty,
@@ -935,10 +1002,12 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         certifications: meta?.certifications ?? null,
       };
     }).filter((supplier) => {
-      return !search
+      const countryMatches = selectedSupplierCountries.length === 0 || selectedSupplierCountries.includes(supplier.country || "Unknown");
+      const searchMatches = !search
         || canonicalSearchText(supplier.supplier_name).includes(canonicalSearchText(search))
         || canonicalSearchText(supplier.email_domain).includes(canonicalSearchText(search))
         || supplier.items.some((item) => matchesSearch(item, search));
+      return countryMatches && searchMatches;
     });
 
     return summaries.sort((left, right) => {
@@ -946,7 +1015,78 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       if (supplierSort === "items") return right.item_count - left.item_count;
       return new Date(right.last_catalog_at ?? 0).getTime() - new Date(left.last_catalog_at ?? 0).getTime();
     });
-  }, [catalogEmails, supplierMetaRows, supplierRows, supplierSearch, supplierSort]);
+  }, [catalogEmails, selectedSupplierCountries, supplierMetaRows, supplierRows, supplierSearch, supplierSort]);
+
+  const supplierCountryOptions = useMemo(() => {
+    const countries = supplierMetaRows
+      .map((supplier) => supplier.country || "Unknown")
+      .filter(Boolean);
+    return Array.from(new Set(countries)).sort((left, right) => {
+      if (left === "Unknown") return 1;
+      if (right === "Unknown") return -1;
+      return left.localeCompare(right);
+    });
+  }, [supplierMetaRows]);
+
+  const toggleSupplierCountry = (country: string) => {
+    setSelectedSupplierCountries((current) =>
+      current.includes(country)
+        ? current.filter((item) => item !== country)
+        : [...current, country]
+    );
+  };
+
+  const openCertificatePdfs = (row: Pick<SupplierItem, "certificate_pdfs"> | Record<string, unknown>) => {
+    const pdfs = certificatePdfs(row);
+    if (pdfs.length === 0) return;
+    if (pdfs.length === 1) {
+      window.open(pdfs[0].url, "_blank", "noopener,noreferrer");
+      return;
+    }
+    setCertificateModalItems(pdfs);
+  };
+
+  const renderCertificatesCell = (row: Pick<SupplierItem, "certificate_pdfs"> & { certifications?: string | null } | Record<string, unknown>) => {
+    const pdfs = certificatePdfs(row);
+    if (pdfs.length > 0) {
+      return (
+        <button className="certificate-view-button" type="button" onClick={() => openCertificatePdfs(row)}>
+          View
+        </button>
+      );
+    }
+    const rawCertifications = (row as { certifications?: unknown }).certifications;
+    const certifications = typeof rawCertifications === "string" ? rawCertifications : "";
+    if (!certifications.trim()) {
+      return <span style={{ color: "var(--muted)", fontSize: "11px" }}>-</span>;
+    }
+    return (
+      <div style={{ display: "flex", gap: "4px", flexWrap: "wrap", justifyContent: "center" }}>
+        {certifications.split(",").map((cert) => {
+          const trimmed = cert.trim();
+          if (!trimmed) return null;
+          return (
+            <span key={trimmed} className="certificate-text-badge">
+              {trimmed}
+            </span>
+          );
+        })}
+      </div>
+    );
+  };
+
+  useEffect(() => {
+    if (!supplierCountryOpen) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!supplierCountryFilterRef.current?.contains(event.target as Node)) {
+        setSupplierCountryOpen(false);
+      }
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [supplierCountryOpen]);
 
   const selectedCatalog = useMemo(() => {
     if (!supplierDirectory.length) return null;
@@ -1014,8 +1154,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const compareSuggestions = useMemo(() => {
     const requested = compareIngredient.trim();
     const ranked = availableIngredients
-      .filter((ingredient) => matchesSearch(ingredient, requested))
-      .sort((left, right) => searchRelevance(right, requested) - searchRelevance(left, requested));
+      .filter((ingredient) => compareSearchMatches(ingredient, requested))
+      .sort((left, right) => compareSearchRelevance(right, requested) - compareSearchRelevance(left, requested));
     return ranked.slice(0, 8);
   }, [availableIngredients, compareIngredient]);
 
@@ -1026,8 +1166,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     }
 
     const matchedRows = latestSupplierRows.filter((row) => {
-      return matchesSearch(row, requested);
-    }).sort((left, right) => searchRelevance(right, requested) - searchRelevance(left, requested));
+      return compareSearchMatches(row, requested);
+    }).sort((left, right) => compareSearchRelevance(right, requested) - compareSearchRelevance(left, requested));
 
     const bySupplier = new Map<string, SupplierTableRow>();
     for (const row of matchedRows) {
@@ -1071,7 +1211,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       rows: sorted,
       topRows: sorted.slice(0, 3),
       otherRows: sorted.slice(3),
-      ingredientLabel: sorted[0]?.ingredient_name || selectedCompareIngredient || "ingredient",
+      ingredientLabel: sorted[0]?.ingredient_name || requested || "ingredient",
     };
   }, [compareSort, selectedCompareIngredient, latestSupplierRows]);
 
@@ -1299,6 +1439,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
           return {
             ...item,
             email_domain: item.email_domain ?? meta?.email_domain ?? "-",
+            country: meta?.country ?? "Unknown",
             certifications: meta?.certifications ?? null,
           };
         });
@@ -2430,6 +2571,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                           <table>
                             <thead>
                               <tr>
+                                <th>#</th>
                                 <th>Ingredient</th>
                                 <th className="specification-header">Specification</th>
                                 <th>Price/Unit</th>
@@ -2443,13 +2585,14 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                             <tbody>
                               {selectedInboxThread.items.length === 0 ? (
                                 <tr>
-                                  <td colSpan={8}>No catalogue items were extracted for this supplier.</td>
+                                  <td colSpan={9}>No catalogue items were extracted for this supplier.</td>
                                 </tr>
                               ) : (
                                 selectedInboxThread.items.slice(0, 4).map((item, index) => {
                                   const bestPrice = Math.min(...selectedInboxThread.items.map((row) => safePrice(row.price_per_unit, row.currency)));
                                   return (
                                     <tr key={`${item.supplier_name}-${item.ingredient_name}-${index}`}>
+                                      <td>{index + 1}</td>
                                       <td className="two-line-cell">{displayItemName(item)}</td>
                                       <td className="two-line-cell specification-cell">{displaySpecification(item)}</td>
                                       <td>{displayPrice(item)}</td>
@@ -2549,6 +2692,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                     <table className="catalog-table">
                       <thead>
                         <tr>
+                          <th>#</th>
                           <th>Ingredient</th>
                           <th className="specification-header">Specification</th>
                           <th>Price/unit</th>
@@ -2556,13 +2700,14 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                           <th>Lead Time</th>
                           <th>MOQ</th>
                           <th>Date</th>
+                          <th>Certificates</th>
                           <th>Status</th>
                         </tr>
                       </thead>
                       <tbody>
                         {selectedCatalogItems.length === 0 ? (
                           <tr>
-                            <td colSpan={8}>No catalogue items match this filter.</td>
+                            <td colSpan={10}>No catalogue items match this filter.</td>
                           </tr>
                         ) : selectedCatalogItems.map((item, index) => {
                           const bestPrice = Math.min(...selectedCatalog.items.map((row) => safePrice(row.price_per_unit, row.currency)));
@@ -2574,6 +2719,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                               : "Good";
                           return (
                             <tr key={`${item.supplier_name}-${item.ingredient_name}-${index}`}>
+                              <td>{index + 1}</td>
                               <td className="two-line-cell">{displayItemName(item)}</td>
                               <td className="two-line-cell specification-cell">{displaySpecification(item)}</td>
                               <td>{displayPrice(item)}</td>
@@ -2581,6 +2727,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                               <td>{displayLeadTime(item)}</td>
                               <td>{displayMoq(item)}</td>
                               <td>{formatDDMMYY(item.received_at)}</td>
+                              <td>{renderCertificatesCell(item)}</td>
                               <td><span className={`catalog-status ${status === "Low stock" ? "warning" : status === "Best price" ? "best" : ""}`}>{status}</span></td>
                             </tr>
                           );
@@ -2630,6 +2777,16 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                           onBlur={() => globalThis.setTimeout(() => setCompareSearchFocused(false), 180)}
                           onChange={(event) => { setCompareIngredient(event.target.value); setSelectedCompareIngredient(""); }}
                           onFocus={() => setCompareSearchFocused(true)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              const query = compareIngredient.trim();
+                              if (query) {
+                                setSelectedCompareIngredient(query);
+                                setCompareSearchFocused(false);
+                              }
+                            }
+                          }}
                           placeholder="Search ingredient"
                         />
                       </label>
@@ -2641,7 +2798,6 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                         </div>
                       )}
                     </div>
-                    {compareData.rows.length > 0 && <small>{compareData.rows[0]?.pack_size || `${compareData.rows[0]?.unit ?? "unit"} based`} - Min qty {formatQuantity(Math.min(...compareData.rows.map((row) => safeQty(row.available_qty))))}</small>}
                   </div>
                   <label className="compare-sort">
                     <span>Sort by</span>
@@ -2654,74 +2810,21 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                 </div>
               </div>
 
-              {compareData.rows.length > 0 && (
-                <p className="compare-note">
-                  Showing latest offers from {compareData.rows.length} supplier{compareData.rows.length === 1 ? "" : "s"} for {displayText(compareData.ingredientLabel)}.
-                </p>
-              )}
-
               {supplierLoading ? (
                 <div className="compare-empty">Loading supplier comparison data...</div>
               ) : supplierError ? (
                 <div className="compare-empty">{supplierError}</div>
               ) : !selectedCompareIngredient.trim() ? (
-                <div className="compare-empty">Select an ingredient from suggestions to compare suppliers.</div>
+                <div className="compare-empty">Select an ingredient from suggestions or press Enter to compare.</div>
               ) : compareData.rows.length === 0 ? (
-                <div className="compare-empty">No suppliers found for this ingredient.</div>
+                <div className="compare-empty">No matching ingredients found.</div>
               ) : (
-                <>
-                  <div className="compare-card-grid">
-                    {compareData.topRows.map((row, index) => (
-                      <article className="compare-card" key={`${supplierKey(row.supplier_name, row.email_domain)}-${row.ingredient_name}`}>
-                        <div className="compare-supplier-head">
-                          <div className="supplier-badge">{supplierInitials(row.supplier_name)}</div>
-                          <div>
-                            <h3>{row.supplier_name}</h3>
-                            <p style={{ margin: 0 }}>{displayItemName(row)} - {row.email_domain}</p>
-                            <p className="compare-spec-line">{displaySpecification(row)}</p>
-                          </div>
-                        </div>
-
-                        <div className="compare-stat-grid">
-                          <div>
-                            <strong>{displayPrice(row)}</strong>
-                            <span>Price/unit</span>
-                          </div>
-                          <div>
-                            <strong>{displayQuantity(row)}</strong>
-                            <span>Qty available</span>
-                          </div>
-                          <div>
-                            <strong>{displayLeadTime(row)}</strong>
-                            <span>Lead time</span>
-                          </div>
-                          <div>
-                            <strong>{displayMoq(row)}</strong>
-                            <span>MOQ</span>
-                          </div>
-                          <div>
-                            <strong>{formatDDMMYY(row.received_at)}</strong>
-                            <span>Updated</span>
-                          </div>
-                        </div>
-
-                        <button className="view-catalog-button" type="button" onClick={() => {
-                          setSelectedCatalogSupplier(supplierKey(row.supplier_name, row.email_domain));
-                          setSelectedCatalogEmailId(row.catalog_email_id ?? null);
-                          setActiveTab("catalogs");
-                        }}>View catalogue</button>
-                      </article>
-                    ))}
-                  </div>
-
-                  <section className="compare-table-panel">
-                    <h2>Supplier comparison for {displayText(compareData.ingredientLabel)}</h2>
+                <section className="compare-table-panel">
                     <div className="table-wrap">
                       <table>
                         <thead>
                           <tr>
                             <th>#</th>
-                            <th>Supplier</th>
                             <th>Item</th>
                             <th className="specification-header">Specification</th>
                             <th>Price/Unit</th>
@@ -2735,55 +2838,43 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                         <tbody>
                           {compareData.rows.length === 0 ? (
                             <tr>
-                              <td colSpan={10}>Only top suppliers found for this ingredient.</td>
+                              <td colSpan={9}>Only top suppliers found for this ingredient.</td>
                             </tr>
-                          ) : compareData.rows.map((row, index) => (
-                            <tr key={`${supplierKey(row.supplier_name, row.email_domain)}-${row.ingredient_name}-table`}>
-                              <td>{index + 1}</td>
-                              <td>{row.supplier_name}</td>
-                              <td className="two-line-cell">{displayItemName(row)}</td>
-                              <td className="two-line-cell specification-cell">{displaySpecification(row)}</td>
-                              <td>{displayPrice(row)}</td>
-                              <td>{displayQuantity(row)}</td>
-                              <td>{displayLeadTime(row)}</td>
-                              <td>{displayMoq(row)}</td>
-                              <td>{formatDDMMYY(row.received_at)}</td>
-                              <td>
-                                {row.certifications ? (
-                                  <div style={{ display: "flex", gap: "4px", flexWrap: "wrap", justifyContent: "center" }}>
-                                    {row.certifications.split(",").map((cert) => {
-                                      const trimmed = cert.trim();
-                                      return (
-                                        <span
-                                          key={trimmed}
-                                          style={{
-                                            display: "inline-flex",
-                                            alignItems: "center",
-                                            background: "rgba(15, 122, 95, 0.06)",
-                                            color: "var(--accent)",
-                                            fontSize: "10.5px",
-                                            fontWeight: 600,
-                                            padding: "1px 6px",
-                                            borderRadius: "3px",
-                                            border: "1px solid rgba(15, 122, 95, 0.12)",
-                                          }}
-                                        >
-                                          {trimmed}
-                                        </span>
-                                      );
-                                    })}
-                                  </div>
-                                ) : (
-                                  <span style={{ color: "var(--muted)", fontSize: "11px" }}>-</span>
-                                )}
-                              </td>
-                            </tr>
-                          ))}
+                          ) : compareData.rows.map((row, index) => {
+                            const rowKey = comparisonRowKey(row as Record<string, unknown>, index);
+                            const expanded = Boolean(expandedCompareRows[rowKey]);
+                            return (
+                              <tr key={rowKey}>
+                                <td>{index + 1}</td>
+                                <td className="two-line-cell">
+                                  <button
+                                    className="expandable-item-button"
+                                    type="button"
+                                    onClick={() => setExpandedCompareRows((current) => ({ ...current, [rowKey]: !current[rowKey] }))}
+                                  >
+                                    <span>{displayItemName(row)}</span>
+                                  </button>
+                                  {expanded && (
+                                    <div className="expanded-supplier-inline">
+                                      <span><b>Supplier:</b> <strong>{row.supplier_name}</strong></span>
+                                      <span><b>Email:</b> <strong>{row.email_domain || "-"}</strong></span>
+                                    </div>
+                                  )}
+                                </td>
+                                <td className="two-line-cell specification-cell">{displaySpecification(row)}</td>
+                                <td>{displayPrice(row)}</td>
+                                <td>{displayQuantity(row)}</td>
+                                <td>{displayLeadTime(row)}</td>
+                                <td>{displayMoq(row)}</td>
+                                <td>{formatDDMMYY(row.received_at)}</td>
+                                <td>{renderCertificatesCell(row)}</td>
+                              </tr>
+                            );
+                          })}
                         </tbody>
                       </table>
                     </div>
-                  </section>
-                </>
+                </section>
               )}
             </section>
           )}
@@ -2813,7 +2904,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                   <table>
                     <thead>
                       <tr>
-                        <th>Supplier</th>
+                        <th>#</th>
                         <th>Item</th>
                         <th className="specification-header">Specification</th>
                         <th>Price/Unit</th>
@@ -2830,47 +2921,37 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                           <td colSpan={9}>Results appear after ProcuraAI returns supplier data.</td>
                         </tr>
                       ) : (
-                        assistantRows.map((row, index) => (
-                          <tr key={index}>
-                            <td>{displayText(row.supplier_name)}</td>
-                            <td className="two-line-cell">{displayItemName(row)}</td>
-                            <td className="two-line-cell specification-cell">{displaySpecification(row)}</td>
-                            <td>{displayPrice(row as SupplierItem)}</td>
-                            <td>{displayQuantity(row as SupplierItem)}</td>
-                            <td>{!isMissingDisplayValue(row.lead_time_text) ? String(row.lead_time_text) : (row.lead_time_days != null ? `${row.lead_time_days} days` : "-")}</td>
-                            <td>{!isMissingDisplayValue(row.moq_display) ? String(row.moq_display) : (row.moq != null ? `${formatQuantity(Number(row.moq))} ${String(row.unit ?? "")}` : "-")}</td>
-                            <td>{formatDDMMYY(row.received_at as string)}</td>
-                            <td>
-                              {row.certifications ? (
-                                <div style={{ display: "flex", gap: "4px", flexWrap: "wrap", justifyContent: "center" }}>
-                                  {String(row.certifications).split(",").map((cert) => {
-                                    const trimmed = cert.trim();
-                                    return (
-                                      <span
-                                        key={trimmed}
-                                        style={{
-                                          display: "inline-flex",
-                                          alignItems: "center",
-                                          background: "rgba(15, 122, 95, 0.06)",
-                                          color: "var(--accent)",
-                                          fontSize: "10.5px",
-                                          fontWeight: 600,
-                                          padding: "1px 6px",
-                                          borderRadius: "3px",
-                                          border: "1px solid rgba(15, 122, 95, 0.12)",
-                                        }}
-                                      >
-                                        {trimmed}
-                                      </span>
-                                    );
-                                  })}
-                                </div>
-                              ) : (
-                                <span style={{ color: "var(--muted)", fontSize: "11px" }}>-</span>
-                              )}
-                            </td>
-                          </tr>
-                        ))
+                        assistantRows.map((row, index) => {
+                          const rowKey = comparisonRowKey(row, index);
+                          const expanded = Boolean(expandedAssistantRows[rowKey]);
+                          return (
+                            <tr key={rowKey}>
+                              <td>{index + 1}</td>
+                              <td className="two-line-cell">
+                                <button
+                                  className="expandable-item-button"
+                                  type="button"
+                                  onClick={() => setExpandedAssistantRows((current) => ({ ...current, [rowKey]: !current[rowKey] }))}
+                                >
+                                  <span>{displayItemName(row)}</span>
+                                </button>
+                                {expanded && (
+                                  <div className="expanded-supplier-inline">
+                                    <span><b>Supplier:</b> <strong>{displayText(row.supplier_name)}</strong></span>
+                                    <span><b>Email:</b> <strong>{displayText(row.email_domain)}</strong></span>
+                                  </div>
+                                )}
+                              </td>
+                              <td className="two-line-cell specification-cell">{displaySpecification(row)}</td>
+                              <td>{displayPrice(row as SupplierItem)}</td>
+                              <td>{displayQuantity(row as SupplierItem)}</td>
+                              <td>{!isMissingDisplayValue(row.lead_time_text) ? String(row.lead_time_text) : (row.lead_time_days != null ? `${row.lead_time_days} days` : "-")}</td>
+                              <td>{!isMissingDisplayValue(row.moq_display) ? String(row.moq_display) : (row.moq != null ? `${formatQuantity(Number(row.moq))} ${String(row.unit ?? "")}` : "-")}</td>
+                              <td>{formatDDMMYY(row.received_at as string)}</td>
+                              <td>{renderCertificatesCell(row)}</td>
+                            </tr>
+                          );
+                        })
                       )}
                     </tbody>
                   </table>
@@ -3908,6 +3989,38 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                     <Search size={16} />
                     <input value={supplierSearch} onChange={(event) => setSupplierSearch(event.target.value)} placeholder="Search suppliers or ingredients..." />
                   </label>
+                  <div className="supplier-country-control" ref={supplierCountryFilterRef}>
+                    <span>Country</span>
+                    <details className="supplier-country-filter" open={supplierCountryOpen}>
+                      <summary onClick={(event) => {
+                        event.preventDefault();
+                        setSupplierCountryOpen((open) => !open);
+                      }}>
+                        <strong>{selectedSupplierCountries.length ? `${selectedSupplierCountries.length} selected` : "All"}</strong>
+                        <ChevronDown size={14} />
+                      </summary>
+                      <div className="supplier-country-menu">
+                        {supplierCountryOptions.length === 0 ? (
+                          <span className="supplier-country-empty">No countries</span>
+                        ) : supplierCountryOptions.map((country) => (
+                          <label key={country} className="supplier-country-option">
+                            <input
+                              type="checkbox"
+                              checked={selectedSupplierCountries.includes(country)}
+                              onChange={() => toggleSupplierCountry(country)}
+                            />
+                            <span>{country}</span>
+                            {selectedSupplierCountries.includes(country) && <Check size={14} />}
+                          </label>
+                        ))}
+                        {selectedSupplierCountries.length > 0 && (
+                          <button type="button" onClick={() => setSelectedSupplierCountries([])}>
+                            Clear
+                          </button>
+                        )}
+                      </div>
+                    </details>
+                  </div>
                   <label className="supplier-sort">
                     <span>Sort by</span>
                     <select value={supplierSort} onChange={(event) => setSupplierSort(event.target.value as SupplierSort)}>
@@ -3923,6 +4036,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                 <table className="supplier-directory-table">
                   <thead>
                     <tr>
+                      <th>#</th>
                       <th>Supplier</th>
                       <th>Email</th>
                       <th>Items</th>
@@ -3934,13 +4048,14 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                   </thead>
                   <tbody>
                     {supplierLoading ? (
-                      <tr><td colSpan={7}>Loading supplier data...</td></tr>
+                      <tr><td colSpan={8}>Loading supplier data...</td></tr>
                     ) : supplierError ? (
-                      <tr><td colSpan={7}>{supplierError}</td></tr>
+                      <tr><td colSpan={8}>{supplierError}</td></tr>
                     ) : supplierDirectory.length === 0 ? (
-                      <tr><td colSpan={7}>No suppliers match your search.</td></tr>
-                    ) : supplierDirectory.map((supplier) => (
+                      <tr><td colSpan={8}>No suppliers match your search.</td></tr>
+                    ) : supplierDirectory.map((supplier, index) => (
                       <tr key={supplier.supplier_key}>
+                        <td>{index + 1}</td>
                         <td>
                           <div className="supplier-name-cell">
                             <span className="supplier-mini-badge">{supplierInitials(supplier.supplier_name)}</span>
@@ -3999,6 +4114,35 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
           )}
         </section>
       </main>
+
+      {certificateModalItems && (
+        <div className="certificate-modal-backdrop" role="presentation" onMouseDown={() => setCertificateModalItems(null)}>
+          <section className="certificate-modal" role="dialog" aria-modal="true" aria-label="Certificate PDFs" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="certificate-modal-head">
+              <h2>Certificates</h2>
+              <button type="button" onClick={() => setCertificateModalItems(null)} aria-label="Close certificates">
+                <X size={16} />
+              </button>
+            </div>
+            <div className="certificate-modal-list">
+              {certificateModalItems.map((pdf) => (
+                <button
+                  key={`${pdf.url}-${pdf.name}`}
+                  type="button"
+                  onClick={() => {
+                    window.open(pdf.url, "_blank", "noopener,noreferrer");
+                    setCertificateModalItems(null);
+                  }}
+                >
+                  <FileText size={16} />
+                  <span>{pdf.name}</span>
+                  <small>{pdf.type || "Certificate"}</small>
+                </button>
+              ))}
+            </div>
+          </section>
+        </div>
+      )}
 
       {/* Chat Panel */}
       {showAssistantPanel && (

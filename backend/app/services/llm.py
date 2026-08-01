@@ -308,10 +308,11 @@ class OpenRouterClient:
             "CRITICAL SQL GENERATION RULES:\n"
             "1. ONLY generate a read-only SELECT query (or WITH ... SELECT). Never generate INSERT, UPDATE, DELETE, DROP, ALTER, or TRUNCATE statements.\n"
             "2. Return ONLY the raw SQL code in plain text. Do not wrap in markdown markdown fences (```sql), do not include comments or explanations.\n"
-            "3. Select meaningful columns including supplier name (suppliers.name AS supplier_name), ingredient_name, price_per_unit, currency, available_qty, unit, moq, and lead_time_days.\n"
+            "3. Select meaningful columns including catalog_items.id AS id, suppliers.name AS supplier_name, suppliers.email_domain AS email_domain, ingredient_name, price_per_unit, currency, available_qty, unit, moq, lead_time_days, and catalog_emails.received_at AS received_at.\n"
             "4. Use case-insensitive partial matching on catalog_items.ingredient_name. For multi-word ingredient searches, split meaningful words and match each with ILIKE wildcards where practical; do not require exact names.\n"
             "5. Rank closer ingredient_name matches first, then apply appropriate ORDER BY clauses (e.g. ORDER BY price_per_unit ASC NULLS LAST for best price/cheapest deal requests).\n"
-            "6. Always limit results to at most 50 rows (LIMIT 50)."
+            "6. When returning catalog items, always join catalog_emails on catalog_items.catalog_email_id = catalog_emails.id so received_at is the email received date for that item.\n"
+            "7. Always limit results to at most 50 rows (LIMIT 50)."
         )
         content = self._chat(
             [

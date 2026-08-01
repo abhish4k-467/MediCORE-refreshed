@@ -6,6 +6,7 @@ create table if not exists suppliers (
     tenant_id uuid not null,
     name text not null,
     email_domain text not null,
+    country text not null default 'Unknown',
     last_email_date timestamptz,
     certifications text,
     created_at timestamptz not null default now(),

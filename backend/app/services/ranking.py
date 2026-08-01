@@ -15,7 +15,12 @@ class SupplierRanker:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def ranked_items(self, plan: QueryPlan, tenant_id: Any | None = None) -> list[dict]:
+    def ranked_items(
+        self,
+        plan: QueryPlan,
+        tenant_id: Any | None = None,
+        matched_ingredient_names: list[str] | None = None,
+    ) -> list[dict]:
         from uuid import UUID
         from backend.app.models import CatalogEmail
         from backend.app.config import get_settings
@@ -54,6 +59,7 @@ class SupplierRanker:
             .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
             .subquery()
         )
+        result_limit = 50 if matched_ingredient_names else plan.limit
         stmt: Select = (
             select(CatalogItem, Supplier, CatalogEmail.received_at, latest_items.c.history_count)
             .join(Supplier, Supplier.id == CatalogItem.supplier_id)
@@ -66,7 +72,7 @@ class SupplierRanker:
                 ),
             )
             .order_by(CatalogItem.ingredient_name.asc(), nullslast(CatalogItem.price_per_unit.asc()))
-            .limit(plan.limit)
+            .limit(result_limit)
         )
         if not settings.mock_data_enabled:
             stmt = stmt.where(
@@ -77,15 +83,16 @@ class SupplierRanker:
             )
         if tenant_id:
             stmt = stmt.where(CatalogItem.tenant_id == (UUID(str(tenant_id)) if isinstance(tenant_id, str) else tenant_id))
-        if plan.ingredient_name:
+        if matched_ingredient_names:
+            stmt = stmt.where(CatalogItem.ingredient_name.in_(matched_ingredient_names))
+        elif plan.ingredient_name:
             search_tokens = self._search_tokens(plan.ingredient_name)
-            if search_tokens:
+            fuzzy_terms = self._fuzzy_catalog_terms(plan.ingredient_name, tenant_id=tenant_id)
+            search_terms = list(dict.fromkeys([*search_tokens, *fuzzy_terms]))
+            if search_terms:
                 token_clauses = [
-                    or_(
-                        CatalogItem.ingredient_name.ilike(f"%{token}%"),
-                        CatalogItem.raw_payload["specification"].astext.ilike(f"%{token}%"),
-                    )
-                    for token in search_tokens
+                    CatalogItem.ingredient_name.ilike(f"%{token}%")
+                    for token in search_terms
                 ]
                 stmt = stmt.where(or_(*token_clauses))
                 exact_phrase = f"%{plan.ingredient_name.strip()}%"
@@ -95,12 +102,7 @@ class SupplierRanker:
                     nullslast(CatalogItem.price_per_unit.asc()),
                 )
             else:
-                stmt = stmt.where(
-                    or_(
-                        CatalogItem.ingredient_name.ilike(f"%{plan.ingredient_name.lower()}%"),
-                        CatalogItem.raw_payload["specification"].astext.ilike(f"%{plan.ingredient_name.lower()}%"),
-                    )
-                )
+                stmt = stmt.where(CatalogItem.ingredient_name.ilike(f"%{plan.ingredient_name.lower()}%"))
         if plan.min_quantity:
             stmt = stmt.where(CatalogItem.available_qty >= plan.min_quantity)
         if plan.unit:
@@ -128,6 +130,7 @@ class SupplierRanker:
                     "lead_time_text": clean_optional_text(raw_payload.get("lead_time_text")),
                     "moq": float(item.moq) if item.moq is not None else None,
                     "moq_display": clean_optional_text(raw_payload.get("moq_display")),
+                    "certificate_pdfs": self._certificate_pdfs(raw_payload),
                     "is_updated": bool(raw_payload.get("is_updated")) or bool(history_count and history_count > 1),
                     "valid_until": item.valid_until.isoformat() if item.valid_until else None,
                     "received_at": received_at.isoformat() if received_at else None,
@@ -136,6 +139,20 @@ class SupplierRanker:
             )
         rows = self._rank_rows_by_relevance(rows, plan.ingredient_name)
         return self._dedupe_supplier_item_rows(rows, plan.ingredient_name)
+
+    def _certificate_pdfs(self, raw_payload: dict | None) -> list[dict]:
+        values = (raw_payload or {}).get("certificate_pdfs")
+        if not isinstance(values, list):
+            return []
+        return [
+            {
+                "name": clean_optional_text(row.get("name")) or "Certificate PDF",
+                "url": clean_optional_text(row.get("url")),
+                "type": clean_optional_text(row.get("type")) or "Certificate",
+            }
+            for row in values
+            if isinstance(row, dict) and clean_optional_text(row.get("url"))
+        ]
 
     def _dedupe_supplier_item_rows(self, rows: list[dict], requested_item: str | None = None) -> list[dict]:
         grouped: dict[tuple[str, str], dict] = {}
@@ -162,6 +179,37 @@ class SupplierRanker:
             for token in self._canonical_item_key(value).split()
             if len(token) >= 2 and token not in {"price", "qty", "item", "supplier", "find", "show", "best", "for", "the", "and"}
         ]
+
+    def _fuzzy_catalog_terms(self, value: Any, tenant_id: Any | None = None) -> list[str]:
+        tokens = [token for token in self._search_tokens(value) if len(token) >= 5]
+        if not tokens:
+            return []
+
+        stmt = select(CatalogItem.ingredient_name).distinct().limit(1000)
+        if tenant_id:
+            from uuid import UUID
+            stmt = stmt.where(CatalogItem.tenant_id == (UUID(str(tenant_id)) if isinstance(tenant_id, str) else tenant_id))
+
+        best_terms: list[str] = []
+        try:
+            names = [name for (name,) in self.db.execute(stmt) if name]
+        except Exception:
+            return []
+
+        for token in tokens:
+            best_token = ""
+            best_score = 0.0
+            for name in names:
+                for candidate in self._canonical_item_key(name).split():
+                    if len(candidate) < 5:
+                        continue
+                    score = SequenceMatcher(None, token, candidate).ratio()
+                    if score > best_score:
+                        best_score = score
+                        best_token = candidate
+            if best_score >= 0.78 and best_token:
+                best_terms.append(best_token)
+        return best_terms
 
     def _row_relevance_score(self, row: dict, query: str | None) -> float:
         if not query:

@@ -578,6 +578,7 @@ export default function SuperadminWorkspacePage({ params }: { params: Promise<{ 
               <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left", fontSize: "13.5px" }}>
                 <thead>
                   <tr style={{ background: "#fafcfb", borderBottom: "1px solid #dce4df" }}>
+                    <th style={{ padding: "16px 24px", color: "#092f28", fontWeight: 600, width: "64px" }}>#</th>
                     <th style={{ padding: "16px 24px", color: "#092f28", fontWeight: 600 }}>Organisation</th>
                     <th style={{ padding: "16px 24px", color: "#092f28", fontWeight: 600 }}>Admin Owner</th>
                     <th style={{ padding: "16px 24px", color: "#092f28", fontWeight: 600 }}>Email Address</th>
@@ -586,8 +587,9 @@ export default function SuperadminWorkspacePage({ params }: { params: Promise<{ 
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredApprovals.map((req) => (
+                  {filteredApprovals.map((req, index) => (
                     <tr key={req.id} style={{ borderBottom: "1px solid #dce4df" }}>
+                      <td style={{ padding: "16px 24px", color: "var(--muted)" }}>{index + 1}</td>
                       <td style={{ padding: "16px 24px", fontWeight: 600, color: "var(--ink)" }}>{req.organisation}</td>
                       <td style={{ padding: "16px 24px", color: "var(--ink)" }}>{req.name}</td>
                       <td style={{ padding: "16px 24px", color: "var(--muted)" }}>{req.email}</td>
@@ -688,6 +690,7 @@ export default function SuperadminWorkspacePage({ params }: { params: Promise<{ 
               <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left", fontSize: "13.5px" }}>
                 <thead>
                   <tr style={{ background: "#fafcfb", borderBottom: "1px solid #dce4df" }}>
+                    <th style={{ padding: "16px 24px", color: "#092f28", fontWeight: 600, width: "64px" }}>#</th>
                     <th style={{ padding: "16px 24px", color: "#092f28", fontWeight: 600 }}>Organisation</th>
                     <th style={{ padding: "16px 24px", color: "#092f28", fontWeight: 600 }}>Owner Name</th>
                     <th style={{ padding: "16px 24px", color: "#092f28", fontWeight: 600 }}>Email Address</th>
@@ -698,8 +701,9 @@ export default function SuperadminWorkspacePage({ params }: { params: Promise<{ 
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredWorkspaces.map((ws) => (
+                  {filteredWorkspaces.map((ws, index) => (
                     <tr key={ws.id} style={{ borderBottom: "1px solid #dce4df" }}>
+                      <td style={{ padding: "16px 24px", color: "var(--muted)" }}>{index + 1}</td>
                       <td style={{ padding: "16px 24px", fontWeight: 600, color: "var(--ink)" }}>{ws.organisation}</td>
                       <td style={{ padding: "16px 24px", color: "var(--ink)" }}>{ws.owner_name}</td>
                       <td style={{ padding: "16px 24px", color: "var(--muted)" }}>{ws.owner_email}</td>

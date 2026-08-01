@@ -20,6 +20,7 @@ def mock_suppliers() -> list[dict]:
             "id": str(row.id),
             "name": row.name,
             "email_domain": row.email_domain,
+            "country": row.country or "Unknown",
             "last_email_date": row.last_email_date,
             "certifications": row.certifications,
         }
@@ -54,6 +55,7 @@ def list_suppliers(
                 "id": str(row.id),
                 "name": row.name,
                 "email_domain": row.email_domain,
+                "country": row.country or "Unknown",
                 "last_email_date": row.last_email_date,
                 "certifications": row.certifications,
             }

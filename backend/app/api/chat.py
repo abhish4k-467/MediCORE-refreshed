@@ -1,5 +1,6 @@
 import logging
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
 from redis import Redis
 from sqlalchemy.orm import Session
 
@@ -64,9 +65,9 @@ async def chat_socket(websocket: WebSocket, db: Session = Depends(get_db)) -> No
             message = await websocket.receive_text()
             try:
                 result = engine.answer(message, tenant_id=tenant_id, user_id=user_id)
-                await websocket.send_json({"type": "answer", "answer": result.answer, "rows": result.rows})
-            except Exception:
-                logger.exception("Chat query failed")
+                await websocket.send_json(jsonable_encoder({"type": "answer", "answer": result.answer, "rows": result.rows}))
+            except Exception as exc:
+                logger.exception("Chat query failed for tenant_id=%s user_id=%s message=%r: %s", tenant_id, user_id, message[:500], exc)
                 await websocket.send_json(
                     {
                         "type": "error",

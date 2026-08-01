@@ -29,6 +29,7 @@ from backend.app.services.catalog_table_parser import (
     extract_pack_size,
     parse_catalog_table_text,
 )
+from backend.app.services.country_detection import UNKNOWN_COUNTRY, detect_supplier_country
 from backend.app.services.gmail_api import GmailApiClient
 from backend.app.services.llm import OpenRouterClient
 from backend.app.services.normalizer import normalize_item
@@ -59,6 +60,27 @@ SUPPLIER_INTENT_TERMS = (
     "excipient",
     "raw material",
     "bulk",
+)
+
+CERTIFICATE_PDF_TERMS = (
+    "certificate",
+    "certificate of analysis",
+    "coa",
+    "c of a",
+    "analysis certificate",
+    "gmp",
+    "cgmp",
+    "fda",
+    "iso",
+    "halal",
+    "kosher",
+    "organic certificate",
+    "organic",
+    "lab report",
+    "laboratory report",
+    "test report",
+    "quality report",
+    "msds",
 )
 
 IRRELEVANT_MAIL_TERMS = (
@@ -257,9 +279,12 @@ class EmailIngestionService:
         subject = message.get("Subject")
         email_date = self._message_received_at(message)
 
+        country_contexts: list[str] = []
         if parse_targets is None:
             attachments = self._collect_attachments(message)
             body_text = self._get_email_body_text(message)
+            if body_text:
+                country_contexts.append(body_text)
             parse_targets = []
             for att in attachments:
                 parse_targets.append({
@@ -310,6 +335,7 @@ class EmailIngestionService:
         self.db.flush()
 
         uploaded_object_paths: list[str] = []
+        certificate_refs: list[dict[str, str]] = []
         processing_errors: list[str] = []
         for target in parse_targets:
             target_name = str(target["name"]).replace("\\", "/").split("/")[-1].strip()
@@ -329,12 +355,34 @@ class EmailIngestionService:
                     file_path = Path(tmp_dir) / target_name
                     file_path.write_bytes(payload)
                     uploaded_url, object_path = self._upload_file(file_path, raw_email_id, mime_type)
+
+                    try:
+                        text = self._extract_text_from_file(file_path, ext)
+                    except Exception as text_exc:
+                        text = ""
+                        logger.warning("Failed extracting text from %s: %s", target_name, text_exc, exc_info=True)
+                        if not self._is_certificate_pdf(target_name, ext, ""):
+                            raise
+                    logger.info("Extracted %s characters of text from %s", len(text), target_name)
+                    if text:
+                        country_contexts.append(text)
+                    if self._is_certificate_pdf(target_name, ext, text):
+                        certificate_refs.append(
+                            {
+                                "name": target_name,
+                                "url": uploaded_url,
+                                "storage_path": object_path,
+                                "type": self._certificate_type(target_name, text),
+                                "match_text": text[:10000],
+                            }
+                        )
+                        logger.info("Stored certificate PDF %s for email id=%s", target_name, raw_email_id)
+                        continue
+
                     uploaded_object_paths.append(object_path)
                     if not catalog_email.pdf_url:
                         catalog_email.pdf_url = uploaded_url
 
-                    text = self._extract_text_from_file(file_path, ext)
-                    logger.info("Extracted %s characters of text from %s", len(text), target_name)
                     extracted = self._extract_items_from_text(
                         text,
                         target_name,
@@ -351,6 +399,10 @@ class EmailIngestionService:
                 except Exception as exc:
                     logger.exception("Failed processing target %s for email id=%s", target_name, raw_email_id)
                     processing_errors.append(f"{target_name}: {exc}")
+        self._update_supplier_country(supplier, *country_contexts)
+        if certificate_refs:
+            self.db.flush()
+            self._attach_certificate_refs(catalog_email, supplier, certificate_refs)
         if count > 0:
             catalog_email.processing_status = "completed"
             self._touch_supplier_last_email(supplier, catalog_email.received_at)
@@ -796,6 +848,140 @@ class EmailIngestionService:
         if supplier.last_email_date is None or received_at > supplier.last_email_date:
             supplier.last_email_date = received_at
 
+    def _update_supplier_country(self, supplier: Supplier, *texts: str | None) -> None:
+        detected_country = detect_supplier_country(*texts)
+        current_country = clean_optional_text(getattr(supplier, "country", None)) or UNKNOWN_COUNTRY
+        if current_country == UNKNOWN_COUNTRY or detected_country != UNKNOWN_COUNTRY:
+            supplier.country = detected_country if detected_country != UNKNOWN_COUNTRY else current_country
+        if not clean_optional_text(getattr(supplier, "country", None)):
+            supplier.country = UNKNOWN_COUNTRY
+
+    def _is_certificate_pdf(self, filename: str, ext: str, text: str | None = None) -> bool:
+        if ext.lower() != ".pdf":
+            return False
+        haystack = f"{filename}\n{text or ''}".lower()
+        if not any(term in haystack for term in CERTIFICATE_PDF_TERMS):
+            return False
+        catalogue_terms = ("catalog", "catalogue", "price list", "inventory list", "stock list", "quotation")
+        filename_lower = filename.lower()
+        return not any(term in filename_lower for term in catalogue_terms)
+
+    def _certificate_type(self, filename: str, text: str | None = None) -> str:
+        haystack = f"{filename}\n{text or ''}".lower()
+        if "certificate of analysis" in haystack or re.search(r"\bcoa\b", haystack):
+            return "COA"
+        if "halal" in haystack:
+            return "Halal"
+        if "kosher" in haystack:
+            return "Kosher"
+        if "organic" in haystack:
+            return "Organic"
+        if "fda" in haystack:
+            return "FDA"
+        if "gmp" in haystack or "cgmp" in haystack:
+            return "GMP"
+        if "iso" in haystack:
+            return "ISO"
+        if "lab report" in haystack or "laboratory report" in haystack or "test report" in haystack:
+            return "Lab Report"
+        return "Certificate"
+
+    def _attach_certificate_refs(
+        self,
+        catalog_email: CatalogEmail,
+        supplier: Supplier,
+        certificate_refs: list[dict[str, str]],
+    ) -> None:
+        unique_refs = self._dedupe_certificate_refs(certificate_refs)
+        if not unique_refs:
+            return
+
+        items = (
+            self.db.query(CatalogItem)
+            .filter(
+                CatalogItem.catalog_email_id == catalog_email.id,
+                CatalogItem.supplier_id == supplier.id,
+                CatalogItem.tenant_id == catalog_email.tenant_id,
+            )
+            .all()
+        )
+        if not items:
+            return
+
+        matched_any = False
+        for item in items:
+            matches = [ref for ref in unique_refs if self._certificate_matches_item(ref, item)]
+            if matches:
+                matched_any = True
+                self._merge_item_certificate_refs(item, matches)
+
+        if matched_any:
+            return
+
+        # If a certificate was attached to the same supplier email but we cannot map
+        # it confidently to one product name, keep it visible on the catalogue rows.
+        # This avoids losing valid certificate PDFs because suppliers use short file
+        # names or certificate text that does not exactly match catalogue item names.
+        if unique_refs:
+            for item in items:
+                self._merge_item_certificate_refs(item, unique_refs)
+
+    def _certificate_matches_item(self, certificate_ref: dict[str, str], item: CatalogItem) -> bool:
+        cert_text = self._canonical_match_text(
+            f"{certificate_ref.get('name', '')} {certificate_ref.get('type', '')} {certificate_ref.get('match_text', '')}"
+        )
+        item_text = self._canonical_match_text(item.ingredient_name)
+        item_tokens = [
+            token
+            for token in item_text.split()
+            if len(token) >= 3 and token not in {"extract", "powder", "liquid", "grade", "hplc", "oil"}
+        ]
+        if not item_tokens:
+            return False
+        matched = sum(1 for token in item_tokens if token in cert_text)
+        return matched >= min(2, len(item_tokens))
+
+    def _merge_item_certificate_refs(self, item: CatalogItem, refs: list[dict[str, str]]) -> None:
+        raw_payload = dict(item.raw_payload or {})
+        existing = raw_payload.get("certificate_pdfs")
+        if not isinstance(existing, list):
+            existing = []
+
+        merged = self._dedupe_certificate_refs(
+            [
+                *(ref for ref in existing if isinstance(ref, dict)),
+                *refs,
+            ]
+        )
+        raw_payload["certificate_pdfs"] = merged
+        item.raw_payload = raw_payload
+        self.db.add(item)
+
+    def _dedupe_certificate_refs(self, refs: list[dict[str, str]]) -> list[dict[str, str]]:
+        deduped: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for ref in refs:
+            url = clean_optional_text(ref.get("url"))
+            name = clean_optional_text(ref.get("name")) or "Certificate PDF"
+            if not url:
+                continue
+            key = clean_optional_text(ref.get("storage_path")) or url
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(
+                {
+                    "name": name,
+                    "url": url,
+                    "type": clean_optional_text(ref.get("type")) or "Certificate",
+                    **({"storage_path": ref["storage_path"]} if clean_optional_text(ref.get("storage_path")) else {}),
+                }
+            )
+        return deduped
+
+    def _canonical_match_text(self, value: str | None) -> str:
+        return " ".join(re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).split())
+
     def _pack_size_for_item(self, text: str, ingredient_name: str) -> str | None:
         ingredient = ingredient_name.lower()
         for line in text.splitlines():
@@ -1045,6 +1231,9 @@ class EmailIngestionService:
         cleaned_display_name = display_name.strip() if display_name else None
 
         if supplier:
+            if not clean_optional_text(getattr(supplier, "country", None)):
+                supplier.country = UNKNOWN_COUNTRY
+                self.db.add(supplier)
             if cleaned_display_name and supplier.name != cleaned_display_name:
                 supplier.name = cleaned_display_name
                 self.db.add(supplier)
@@ -1057,6 +1246,7 @@ class EmailIngestionService:
             tenant_id=tenant_id or uuid4(),
             name=supplier_name,
             email_domain=domain,
+            country=UNKNOWN_COUNTRY,
         )
         self.db.add(supplier)
         self.db.flush()
