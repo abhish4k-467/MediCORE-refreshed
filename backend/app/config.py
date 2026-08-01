@@ -37,7 +37,6 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_site_url: str = ""
     openrouter_app_name: str = "MediCORE"
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
 
     email_mode: str = "imap"
     imap_host: str = "imap.gmail.com"

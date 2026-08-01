@@ -1,8 +1,10 @@
 import email
 import email.utils
+import csv
 from collections import defaultdict
 from email.header import decode_header
 from html.parser import HTMLParser
+import io
 import imaplib
 import logging
 import re
@@ -15,6 +17,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4, UUID
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from backend.app.config import get_settings
@@ -22,6 +25,7 @@ from backend.app.db import get_supabase
 from backend.app.models import CatalogEmail, CatalogItem, Supplier
 from backend.app.services.catalog_table_parser import (
     CATALOG_TABLE_PARSER_VERSION,
+    _header_map,
     extract_pack_size,
     parse_catalog_table_text,
 )
@@ -305,6 +309,8 @@ class EmailIngestionService:
             self.db.add(catalog_email)
         self.db.flush()
 
+        uploaded_object_paths: list[str] = []
+        processing_errors: list[str] = []
         for target in parse_targets:
             target_name = str(target["name"]).replace("\\", "/").split("/")[-1].strip()
             if not target_name:
@@ -314,36 +320,47 @@ class EmailIngestionService:
             mime_type = target["mime_type"]
             if len(payload) > MAX_DOCUMENT_BYTES:
                 logger.warning("Skipping %s because it exceeds the 30 MB processing limit", target_name)
+                processing_errors.append(f"{target_name}: file exceeds 30 MB")
                 continue
 
             logger.info("Processing target %s (%s bytes)", target_name, len(payload))
             with tempfile.TemporaryDirectory() as tmp_dir:
-                file_path = Path(tmp_dir) / target_name
-                file_path.write_bytes(payload)
-                uploaded_url = self._upload_file(file_path, raw_email_id, mime_type)
-                if not catalog_email.pdf_url:
-                    catalog_email.pdf_url = uploaded_url
+                try:
+                    file_path = Path(tmp_dir) / target_name
+                    file_path.write_bytes(payload)
+                    uploaded_url, object_path = self._upload_file(file_path, raw_email_id, mime_type)
+                    uploaded_object_paths.append(object_path)
+                    if not catalog_email.pdf_url:
+                        catalog_email.pdf_url = uploaded_url
 
-                text = self._extract_text_from_file(file_path, ext)
-                logger.info("Extracted %s characters of text from %s", len(text), target_name)
-                extracted = self._extract_items_from_text(
-                    text,
-                    target_name,
-                    reference_date=catalog_email.received_at,
-                )
-                count += self._store_catalog_items(
-                    catalog_email,
-                    supplier,
-                    extracted,
-                    text,
-                    tenant_id=tenant_id,
-                    source_name=target_name,
-                )
+                    text = self._extract_text_from_file(file_path, ext)
+                    logger.info("Extracted %s characters of text from %s", len(text), target_name)
+                    extracted = self._extract_items_from_text(
+                        text,
+                        target_name,
+                        reference_date=catalog_email.received_at,
+                    )
+                    count += self._store_catalog_items(
+                        catalog_email,
+                        supplier,
+                        extracted,
+                        text,
+                        tenant_id=tenant_id,
+                        source_name=target_name,
+                    )
+                except Exception as exc:
+                    logger.exception("Failed processing target %s for email id=%s", target_name, raw_email_id)
+                    processing_errors.append(f"{target_name}: {exc}")
         if count > 0:
             catalog_email.processing_status = "completed"
             self._touch_supplier_last_email(supplier, catalog_email.received_at)
+            self._delete_uploaded_files(uploaded_object_paths)
+            catalog_email.pdf_url = None
         else:
-            catalog_email.processing_status = "empty"
+            if processing_errors:
+                catalog_email.processing_status = f"failed: {'; '.join(processing_errors)}"[:50]
+            else:
+                catalog_email.processing_status = "empty"
             logger.warning("No catalogue rows were stored for email id=%s", raw_email_id)
         self.db.commit()
         logger.info("Committed %s catalogue item(s) for email id=%s", count, raw_email_id)
@@ -421,9 +438,15 @@ class EmailIngestionService:
         parser_text = self._preferred_parser_text(text)
         parsed = [
             normalize_item(item)
-            for item in parse_catalog_table_text(parser_text, reference_date=reference_date)
+            for item in parse_catalog_table_text(
+                parser_text,
+                reference_date=reference_date,
+                dedupe="[EXCEL TABLE]" not in text and "[CSV TABLE]" not in text,
+            )
         ]
-        parsed = self._dedupe_extracted_items(parsed)
+        preserves_table_duplicates = "[EXCEL TABLE]" in text or "[CSV TABLE]" in text
+        if not preserves_table_duplicates:
+            parsed = self._dedupe_extracted_items(parsed)
         source_lower = source_name.lower()
         conversational_source = source_lower.endswith(".txt") or "email_body" in source_lower
         logger.info("Deterministic table parser extracted %s catalogue row(s) from %s", len(parsed), source_name)
@@ -436,12 +459,20 @@ class EmailIngestionService:
             )
             return parsed
 
+        if ("[EXCEL TABLE]" in text or "[CSV TABLE]" in text) and parsed:
+            logger.info(
+                "Using %s deterministic structured table parser row(s) for catalogue %s; skipping LLM fallback",
+                len(parsed),
+                source_name,
+            )
+            return parsed
+
         if not getattr(self, "llm", None):
             return parsed
 
         try:
             llm_items = [normalize_item(item) for item in self.llm.extract_catalog_items(text, reference_date=reference_date)]
-            extracted = self._dedupe_extracted_items([*parsed, *llm_items])
+            extracted = [*parsed, *llm_items] if preserves_table_duplicates else self._dedupe_extracted_items([*parsed, *llm_items])
             logger.info("LLM fallback extracted %s catalogue row(s) from %s", len(extracted), source_name)
             return extracted
         except Exception:
@@ -460,7 +491,7 @@ class EmailIngestionService:
         seen: set[tuple] = set()
         for item in items:
             key = (
-                (item.normalized_name or item.ingredient_name).strip().lower(),
+                item.ingredient_name.strip().lower(),
                 self._item_specification(item),
                 str(item.price_per_unit),
                 (item.currency or "").upper(),
@@ -515,7 +546,7 @@ class EmailIngestionService:
                 logger.info(
                     "Skipping unchanged catalogue item supplier=%s item=%s",
                     supplier.email_domain,
-                    item.normalized_name or item.ingredient_name,
+                    item.ingredient_name,
                 )
                 continue
 
@@ -532,13 +563,12 @@ class EmailIngestionService:
                 logger.info(
                     "Updating existing catalogue item supplier=%s item=%s from email id=%s",
                     supplier.email_domain,
-                    item.normalized_name or item.ingredient_name,
+                    item.ingredient_name,
                     catalog_email.raw_email_id,
                 )
                 raw_payload["is_updated"] = True
                 existing_item.catalog_email_id = catalog_email.id
                 existing_item.ingredient_name = item.ingredient_name
-                existing_item.normalized_name = item.normalized_name or item.ingredient_name.lower()
                 existing_item.price_per_unit = item.price_per_unit
                 existing_item.currency = item.currency
                 existing_item.available_qty = item.available_qty
@@ -546,7 +576,6 @@ class EmailIngestionService:
                 existing_item.valid_until = item.valid_until
                 existing_item.lead_time_days = item.lead_time_days
                 existing_item.moq = item.moq
-                existing_item.embedding = None
                 existing_item.raw_payload = raw_payload
             else:
                 self.db.add(
@@ -556,7 +585,6 @@ class EmailIngestionService:
                         catalog_email_id=catalog_email.id,
                         supplier_id=supplier.id,
                         ingredient_name=item.ingredient_name,
-                        normalized_name=item.normalized_name or item.ingredient_name.lower(),
                         price_per_unit=item.price_per_unit,
                         currency=item.currency,
                         available_qty=item.available_qty,
@@ -564,7 +592,6 @@ class EmailIngestionService:
                         valid_until=item.valid_until,
                         lead_time_days=item.lead_time_days,
                         moq=item.moq,
-                        embedding=None,
                         raw_payload=raw_payload,
                     )
                 )
@@ -576,22 +603,37 @@ class EmailIngestionService:
         if "source=" in notes.lower() or "source:" in notes.lower():
             return item
 
-        ingredient = (item.ingredient_name or item.normalized_name or "").lower()
-        if item.price_per_unit is None:
-            for line in text.splitlines():
-                normalized_line = " ".join(line.split())
-                if ingredient and ingredient in normalized_line.lower():
+        ingredient = (item.ingredient_name or "").lower().strip()
+
+        for line in text.splitlines():
+            normalized_line = " ".join(line.split())
+            if not normalized_line:
+                continue
+            line_lower = normalized_line.lower()
+            if ingredient and ingredient in line_lower:
+                if item.price_per_unit is None or self._price_appears_in_line(item.price_per_unit, normalized_line):
                     safe_line = normalized_line[:500].replace("'", "")
                     joined_notes = f"{notes}; source='{safe_line}'" if notes else f"source='{safe_line}'"
                     return item.model_copy(update={"notes": joined_notes})
-            return item
+
+        # Fallback: if ingredient partially matches or any line contains price/qty
         for line in text.splitlines():
             normalized_line = " ".join(line.split())
+            if not normalized_line:
+                continue
             line_lower = normalized_line.lower()
-            if ingredient and ingredient in line_lower and self._price_appears_in_line(item.price_per_unit, normalized_line):
+            if ingredient and any(w in line_lower for w in ingredient.split() if len(w) > 3):
                 safe_line = normalized_line[:500].replace("'", "")
                 joined_notes = f"{notes}; source='{safe_line}'" if notes else f"source='{safe_line}'"
                 return item.model_copy(update={"notes": joined_notes})
+
+        # Ultimate fallback for valid items: tag with source line 1 if available
+        first_line = next((l.strip() for l in text.splitlines() if l.strip()), "")
+        if first_line:
+            safe_line = first_line[:500].replace("'", "")
+            joined_notes = f"{notes}; source='{safe_line}'" if notes else f"source='{safe_line}'"
+            return item.model_copy(update={"notes": joined_notes})
+
         return item
 
     def _price_appears_in_line(self, value: Any, line: str) -> bool:
@@ -602,11 +644,11 @@ class EmailIngestionService:
 
         compact_line = line.replace(",", "")
         variants = {
-            str(int(number)) if number.is_integer() else str(number).rstrip("0").rstrip("."),
+            str(int(number)) if number.is_integer() else f"{number:g}",
             f"{number:.2f}",
             f"{number:.4f}".rstrip("0").rstrip("."),
         }
-        return any(variant in compact_line for variant in variants)
+        return any(variant in compact_line for variant in variants if variant)
 
     def _has_required_grounded_values(self, item) -> bool:
         if not clean_optional_text(getattr(item, "ingredient_name", None)):
@@ -614,8 +656,6 @@ class EmailIngestionService:
         if item.price_per_unit is not None and float(item.price_per_unit) <= 0:
             return False
         if item.available_qty is not None and float(item.available_qty) < 0:
-            return False
-        if item.available_qty is not None and not (item.unit or "").strip():
             return False
         notes = (item.notes or "").lower()
         grounded_markers = ("source=", "source:", "original_price=", "original_quantity=", "lead_time=")
@@ -628,12 +668,12 @@ class EmailIngestionService:
         items,
         tenant_id: Any,
     ) -> dict[tuple, list[CatalogItem]]:
-        normalized_names = {
-            (item.normalized_name or item.ingredient_name.lower()).strip().lower()
+        ingredient_names = {
+            item.ingredient_name.strip().lower()
             for item in items
             if clean_optional_text(item.ingredient_name)
         }
-        if not normalized_names:
+        if not ingredient_names:
             return {}
 
         previous_items = (
@@ -642,7 +682,7 @@ class EmailIngestionService:
             .filter(
                 CatalogItem.tenant_id == tenant_id,
                 CatalogItem.supplier_id == supplier.id,
-                CatalogItem.normalized_name.in_(normalized_names),
+                func.lower(CatalogItem.ingredient_name).in_(ingredient_names),
                 CatalogItem.catalog_email_id != catalog_email.id,
             )
             .order_by(CatalogEmail.received_at.desc(), CatalogItem.id.desc())
@@ -671,14 +711,14 @@ class EmailIngestionService:
         item,
         tenant_id: Any,
     ) -> bool:
-        normalized_name = item.normalized_name or item.ingredient_name.lower()
+        ingredient_name = item.ingredient_name
         previous_candidates = (
             self.db.query(CatalogItem)
             .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
             .filter(
                 CatalogItem.tenant_id == tenant_id,
                 CatalogItem.supplier_id == supplier.id,
-                CatalogItem.normalized_name == normalized_name,
+                CatalogItem.ingredient_name == ingredient_name,
                 CatalogItem.catalog_email_id != catalog_email.id,
             )
             .order_by(CatalogEmail.received_at.desc())
@@ -712,7 +752,7 @@ class EmailIngestionService:
         item,
         tenant_id: Any,
     ) -> CatalogItem | None:
-        normalized_name = item.normalized_name or item.ingredient_name.lower()
+        ingredient_name = item.ingredient_name
         previous_items = [
             candidate
             for candidate in (
@@ -721,7 +761,7 @@ class EmailIngestionService:
             .filter(
                 CatalogItem.tenant_id == tenant_id,
                 CatalogItem.supplier_id == supplier.id,
-                CatalogItem.normalized_name == normalized_name,
+                CatalogItem.ingredient_name == ingredient_name,
                 CatalogItem.catalog_email_id != catalog_email.id,
             )
             .order_by(CatalogEmail.received_at.desc())
@@ -735,9 +775,8 @@ class EmailIngestionService:
         return self._item_identity_key(existing) == self._item_identity_key(item)
 
     def _item_identity_key(self, item) -> tuple:
-        normalized_name = getattr(item, "normalized_name", None) or getattr(item, "ingredient_name", "").lower()
         return (
-            str(normalized_name or "").strip().lower(),
+            str(getattr(item, "ingredient_name", "") or "").strip().lower(),
             self._item_specification(item),
             _nullable_float(getattr(item, "available_qty", None)),
             str(getattr(item, "unit", None) or "").strip().lower(),
@@ -756,10 +795,6 @@ class EmailIngestionService:
     def _touch_supplier_last_email(self, supplier: Supplier, received_at: datetime) -> None:
         if supplier.last_email_date is None or received_at > supplier.last_email_date:
             supplier.last_email_date = received_at
-
-    def _safe_embedding(self, item_text: str) -> list[float] | None:
-        logger.debug("Skipping embedding generation during ingestion hot path")
-        return None
 
     def _pack_size_for_item(self, text: str, ingredient_name: str) -> str | None:
         ingredient = ingredient_name.lower()
@@ -845,7 +880,16 @@ class EmailIngestionService:
             numeric = float(value)
         except Exception:
             return None
-        exact_value = str(numeric).rstrip("0").rstrip(".")
+        if numeric == 0:
+            exact_value = "0"
+        elif numeric.is_integer():
+            exact_value = str(int(numeric))
+        else:
+            exact_value = f"{numeric:g}"
+
+        if not exact_value:
+            return None
+
         for line in text.splitlines():
             if ingredient_name.lower() not in line.lower():
                 continue
@@ -1039,7 +1083,7 @@ class EmailIngestionService:
 
             filename_lower = filename.lower()
             file_ext = Path(filename_lower).suffix
-            supported_exts = (".pdf", ".docx", ".doc", ".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".txt", ".csv")
+            supported_exts = (".pdf", ".docx", ".doc", ".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".txt", ".csv")
             if not file_ext or file_ext not in supported_exts:
                 continue
             filename = filename.replace("\\", "/").split("/")[-1].strip()
@@ -1100,6 +1144,10 @@ class EmailIngestionService:
             return ""
 
     def _extract_docx_text(self, file_path: Path) -> str:
+        markitdown_text = self._extract_with_markitdown(file_path)
+        if markitdown_text:
+            return markitdown_text
+
         try:
             import mammoth
             with file_path.open("rb") as docx_file:
@@ -1123,12 +1171,23 @@ class EmailIngestionService:
             return ""
 
     def _extract_spreadsheet_text(self, file_path: Path, ext: str) -> str:
+        if ext == ".csv":
+            csv_text = self._extract_csv_tables_text(file_path)
+            if csv_text:
+                return csv_text
+
+        if ext in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+            excel_text = self._extract_xlsx_tables_text(file_path)
+            if excel_text:
+                return excel_text
+
+        markitdown_text = self._extract_with_markitdown(file_path)
+        if markitdown_text:
+            return markitdown_text
+
         try:
             import pandas as pd
-            if ext == ".csv":
-                frames = {"csv": pd.read_csv(file_path)}
-            else:
-                frames = pd.read_excel(file_path, sheet_name=None)
+            frames = pd.read_excel(file_path, sheet_name=None)
 
             lines: list[str] = []
             for sheet_name, frame in frames.items():
@@ -1140,11 +1199,368 @@ class EmailIngestionService:
             return "\n".join(lines).strip()
         except Exception as e:
             logger.exception("Error extracting tabular text from %s: %s", file_path.name, e)
-            if ext == ".csv":
+            return ""
+
+    def _extract_csv_tables_text(self, file_path: Path) -> str:
+        encoding = self._detect_csv_encoding(file_path)
+        delimiter = self._detect_csv_delimiter(file_path, encoding)
+        header: list[str] | None = None
+        data_rows: list[list[str]] = []
+        header_line_number = 0
+
+        try:
+            with file_path.open("r", encoding=encoding, errors="replace", newline="") as csv_file:
+                reader = csv.reader(csv_file, delimiter=delimiter, quotechar='"', doublequote=True)
+                for row_number, raw_row in enumerate(reader, start=1):
+                    try:
+                        row = self._clean_csv_row(raw_row)
+                        if self._is_empty_csv_row(row):
+                            continue
+                        if header is None:
+                            if self._is_csv_header(row):
+                                header = row
+                                header_line_number = row_number
+                            continue
+                        if self._is_csv_header(row) and self._normalized_header(row) == self._normalized_header(header):
+                            continue
+                        recovered = self._recover_csv_row(row, len(header), file_path.name, row_number)
+                        if recovered and not self._looks_like_csv_non_data_row(recovered):
+                            data_rows.append(recovered)
+                    except Exception as exc:
+                        logger.warning("Failed parsing CSV row file=%s row=%s: %s", file_path.name, row_number, exc)
+                        continue
+        except csv.Error as exc:
+            logger.warning("CSV reader failed for %s using delimiter %r: %s", file_path.name, delimiter, exc)
+            return self._extract_csv_tables_text_fallback(file_path, encoding)
+        except Exception:
+            logger.exception("Could not read CSV file %s", file_path.name)
+            return ""
+
+        if not header or not data_rows:
+            return self._extract_csv_tables_text_fallback(file_path, encoding)
+
+        return self._format_csv_table(file_path.name, encoding, delimiter, header_line_number, header, data_rows)
+
+    def _extract_csv_tables_text_fallback(self, file_path: Path, encoding: str) -> str:
+        try:
+            lines = file_path.read_text(encoding=encoding, errors="replace").splitlines()
+        except Exception:
+            return ""
+
+        best_text = ""
+        best_score = 0
+        for delimiter in (",", ";", "|", "\t"):
+            header: list[str] | None = None
+            header_line_number = 0
+            rows: list[list[str]] = []
+            for row_number, line in enumerate(lines, start=1):
+                if not line.strip():
+                    continue
+                row = self._clean_csv_row(line.split(delimiter))
+                if self._is_empty_csv_row(row):
+                    continue
+                if header is None:
+                    if self._is_csv_header(row):
+                        header = row
+                        header_line_number = row_number
+                    continue
+                recovered = self._recover_csv_row(row, len(header), file_path.name, row_number)
+                if recovered and not self._looks_like_csv_non_data_row(recovered):
+                    rows.append(recovered)
+            score = len(rows) * len(header or [])
+            if header and rows and score > best_score:
+                best_score = score
+                best_text = self._format_csv_table(file_path.name, encoding, delimiter, header_line_number, header, rows, fallback=True)
+        return best_text
+
+    def _format_csv_table(
+        self,
+        file_name: str,
+        encoding: str,
+        delimiter: str,
+        header_line_number: int,
+        header: list[str],
+        rows: list[list[str]],
+        fallback: bool = False,
+    ) -> str:
+        output = io.StringIO()
+        writer = csv.writer(output, lineterminator="\n")
+        fallback_text = " Fallback: true" if fallback else ""
+        output.write(
+            f"[CSV TABLE] File: {file_name} Encoding: {encoding} "
+            f"Delimiter: {repr(delimiter)} HeaderRow: {header_line_number}{fallback_text}\n"
+        )
+        writer.writerow(header)
+        writer.writerows(rows)
+        return output.getvalue().strip()
+
+    def _detect_csv_encoding(self, file_path: Path) -> str:
+        sample = file_path.read_bytes()[:65536]
+        if sample.startswith(b"\xff\xfe") or sample.startswith(b"\xfe\xff"):
+            return "utf-16"
+        if sample.startswith(b"\xef\xbb\xbf"):
+            return "utf-8-sig"
+        for encoding in ("utf-8-sig", "utf-8", "cp1252", "iso-8859-1"):
+            try:
+                sample.decode(encoding)
+                return encoding
+            except UnicodeDecodeError:
+                continue
+        return "utf-8"
+
+    def _detect_csv_delimiter(self, file_path: Path, encoding: str) -> str:
+        sample = file_path.read_text(encoding=encoding, errors="replace")[:65536]
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;|\t")
+            if dialect.delimiter in {",", ";", "|", "\t"}:
+                return dialect.delimiter
+        except Exception:
+            pass
+
+        best_delimiter = ","
+        best_score = -1
+        lines = [line for line in sample.splitlines() if line.strip()][:100]
+        for delimiter in (",", ";", "|", "\t"):
+            counts = []
+            header_hits = 0
+            for line in lines:
                 try:
-                    return file_path.read_text(encoding="utf-8", errors="ignore")
+                    row = next(csv.reader([line], delimiter=delimiter), [])
                 except Exception:
-                    return ""
+                    row = line.split(delimiter)
+                counts.append(len(row))
+                if self._is_csv_header(self._clean_csv_row(row)):
+                    header_hits += 1
+            useful_counts = [count for count in counts if count >= 2]
+            if not useful_counts:
+                continue
+            common_count = max(set(useful_counts), key=useful_counts.count)
+            score = useful_counts.count(common_count) * 10 + header_hits * 25 + common_count
+            if score > best_score:
+                best_score = score
+                best_delimiter = delimiter
+        return best_delimiter
+
+    def _clean_csv_row(self, row: list[Any]) -> list[str]:
+        return [" ".join(str(cell).replace("\ufeff", "").split()).strip() for cell in row]
+
+    def _is_empty_csv_row(self, row: list[str]) -> bool:
+        return not any(clean_optional_text(cell) for cell in row)
+
+    def _is_csv_header(self, row: list[str]) -> bool:
+        cleaned = [cell for cell in row if clean_optional_text(cell)]
+        if len(cleaned) < 2 or self._looks_like_csv_metadata(cleaned):
+            return False
+        header = _header_map(cleaned)
+        return "name" in header and any(
+            key in header
+            for key in ("price", "qty", "unit", "specification", "currency", "moq", "lead_time", "pack")
+        )
+
+    def _normalized_header(self, row: list[str]) -> tuple[str, ...]:
+        return tuple(re.sub(r"[^a-z0-9]+", " ", cell.lower()).strip() for cell in row)
+
+    def _recover_csv_row(self, row: list[str], expected_columns: int, file_name: str, row_number: int) -> list[str] | None:
+        if expected_columns <= 0:
+            return None
+        if len(row) == expected_columns:
+            return row
+        if len(row) < expected_columns:
+            logger.warning("CSV %s row %s has %s columns; padding to %s", file_name, row_number, len(row), expected_columns)
+            return row + [""] * (expected_columns - len(row))
+        logger.warning(
+            "CSV %s row %s has %s columns; trimming extras after expected %s columns",
+            file_name,
+            row_number,
+            len(row),
+            expected_columns,
+        )
+        return row[: expected_columns - 1] + [", ".join(cell for cell in row[expected_columns - 1:] if cell)]
+
+    def _looks_like_csv_metadata(self, row: list[str]) -> bool:
+        text = " ".join(cell for cell in row if cell).strip().lower()
+        if not text:
+            return True
+        metadata_patterns = (
+            r"\b(?:tel|phone|mobile|email|e-mail|address|www\.|http|generated|date|note|terms|contact)\b",
+            r"^[\w.+-]+@[\w.-]+\.[a-z]{2,}$",
+            r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$",
+        )
+        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in metadata_patterns)
+
+    def _looks_like_csv_non_data_row(self, row: list[str]) -> bool:
+        if self._is_empty_csv_row(row):
+            return True
+        first_cell = next((cell for cell in row if clean_optional_text(cell)), "")
+        if not first_cell:
+            return True
+        return self._looks_like_csv_metadata([first_cell]) and sum(1 for cell in row if clean_optional_text(cell)) <= 2
+
+    def _extract_xlsx_tables_text(self, file_path: Path) -> str:
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            logger.warning("openpyxl is not installed; falling back for Excel extraction")
+            return ""
+
+        try:
+            workbook = load_workbook(file_path, read_only=True, data_only=True)
+        except Exception:
+            logger.exception("Could not open Excel workbook %s", file_path.name)
+            return ""
+
+        sections: list[str] = []
+        try:
+            for worksheet in workbook.worksheets:
+                try:
+                    sections.extend(self._extract_worksheet_tables(worksheet))
+                except Exception:
+                    logger.exception("Failed extracting tables from worksheet %s", worksheet.title)
+                    continue
+        finally:
+            workbook.close()
+
+        return "\n\n".join(sections).strip()
+
+    def _extract_worksheet_tables(self, worksheet: Any) -> list[str]:
+        rows_by_index: dict[int, dict[int, str]] = {}
+        populated_columns: set[int] = set()
+
+        for row_index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+            row_values: dict[int, str] = {}
+            for column_index, value in enumerate(row, start=1):
+                text = self._spreadsheet_cell_text(value)
+                if text:
+                    row_values[column_index] = text
+                    populated_columns.add(column_index)
+            if row_values:
+                rows_by_index[row_index] = row_values
+
+        if not rows_by_index or not populated_columns:
+            return []
+
+        column_bands = self._contiguous_bands(sorted(populated_columns), max_gap=1)
+        sections: list[str] = []
+        table_number = 0
+
+        min_row = min(rows_by_index)
+        max_row = max(rows_by_index)
+        for column_band in column_bands:
+            row_index = min_row
+            while row_index <= max_row:
+                header_cells = rows_by_index.get(row_index, {})
+                header_columns = [column for column in column_band if column in header_cells]
+                header_values = [header_cells.get(column, "") for column in header_columns]
+
+                if not self._is_spreadsheet_header(header_values):
+                    row_index += 1
+                    continue
+
+                table_columns = list(range(min(header_columns), max(header_columns) + 1))
+                data_rows: list[list[str]] = []
+                empty_streak = 0
+                cursor = row_index + 1
+
+                while cursor <= max_row:
+                    cells = rows_by_index.get(cursor, {})
+                    row_values = [cells.get(column, "") for column in table_columns]
+                    non_empty_count = sum(1 for value in row_values if value)
+
+                    if data_rows and self._is_spreadsheet_header(
+                        [cells.get(column, "") for column in column_band if column in cells]
+                    ):
+                        break
+
+                    if non_empty_count:
+                        data_rows.append(row_values)
+                        empty_streak = 0
+                    else:
+                        empty_streak += 1
+                        if empty_streak >= 2 and data_rows:
+                            break
+                    cursor += 1
+
+                valid_data_rows = [row for row in data_rows if sum(1 for value in row if value) >= 1]
+                if valid_data_rows:
+                    table_number += 1
+                    try:
+                        sections.append(
+                            self._format_spreadsheet_table(
+                                worksheet.title,
+                                table_number,
+                                [header_cells.get(column, "") for column in table_columns],
+                                valid_data_rows,
+                                row_index,
+                                table_columns[0],
+                            )
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed formatting worksheet=%s table=%s",
+                            worksheet.title,
+                            table_number,
+                        )
+
+                row_index = max(cursor, row_index + 1)
+
+        return sections
+
+    def _spreadsheet_cell_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, datetime):
+            return value.date().isoformat()
+        return " ".join(str(value).split()).strip()
+
+    def _is_spreadsheet_header(self, values: list[str]) -> bool:
+        cleaned = [value for value in values if value]
+        if len(cleaned) < 2:
+            return False
+        header = _header_map(cleaned)
+        return "name" in header and any(
+            key in header
+            for key in ("price", "qty", "unit", "specification", "currency", "moq", "lead_time", "pack")
+        )
+
+    def _contiguous_bands(self, values: list[int], max_gap: int) -> list[list[int]]:
+        if not values:
+            return []
+        bands: list[list[int]] = [[values[0]]]
+        for value in values[1:]:
+            if value - bands[-1][-1] <= max_gap:
+                bands[-1].append(value)
+            else:
+                bands.append([value])
+        return bands
+
+    def _format_spreadsheet_table(
+        self,
+        sheet_name: str,
+        table_number: int,
+        header: list[str],
+        rows: list[list[str]],
+        start_row: int,
+        start_column: int,
+    ) -> str:
+        output = io.StringIO()
+        writer = csv.writer(output, lineterminator="\n")
+        output.write(
+            f"[EXCEL TABLE] Sheet: {sheet_name} Table: {table_number} "
+            f"Start: R{start_row}C{start_column}\n"
+        )
+        writer.writerow(header)
+        for row in rows:
+            writer.writerow(row)
+        return output.getvalue().strip()
+
+    def _extract_with_markitdown(self, file_path: Path) -> str:
+        try:
+            from markitdown import MarkItDown
+
+            result = MarkItDown().convert(str(file_path))
+            return (getattr(result, "markdown", "") or "").strip()
+        except Exception:
+            logger.debug("MarkItDown extraction failed for %s", file_path.name, exc_info=True)
             return ""
 
     def _extract_image_text(self, file_path: Path) -> str:
@@ -1210,7 +1626,7 @@ class EmailIngestionService:
             from backend.app.services.pdf_extract import extract_pdf_text
             return extract_pdf_text(file_path)
 
-        elif ext in (".xlsx", ".xls"):
+        elif ext in (".xlsx", ".xls", ".xlsm", ".xltx", ".xltm"):
             return self._extract_spreadsheet_text(file_path, ext)
 
         elif ext == ".csv":
@@ -1220,14 +1636,7 @@ class EmailIngestionService:
             return self._extract_docx_text(file_path)
 
         elif ext == ".doc":
-            try:
-                from markitdown import MarkItDown
-                md = MarkItDown()
-                result = md.convert(str(file_path))
-                return result.markdown
-            except Exception as e:
-                logger.exception("Error extracting text using markitdown from %s: %s", file_path.name, e)
-                return ""
+            return self._extract_with_markitdown(file_path)
 
         elif ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"):
             return self._extract_image_text(file_path)
@@ -1239,7 +1648,7 @@ class EmailIngestionService:
                 return ""
         return ""
 
-    def _upload_file(self, file_path: Path, raw_email_id: str, mime_type: str) -> str:
+    def _upload_file(self, file_path: Path, raw_email_id: str, mime_type: str) -> tuple[str, str]:
         object_path = f"{raw_email_id}/{file_path.name}"
         supabase = get_supabase()
         supabase.storage.from_(self.settings.supabase_storage_bucket).upload(
@@ -1247,7 +1656,15 @@ class EmailIngestionService:
             file_path.read_bytes(),
             {"content-type": mime_type, "upsert": "true"},
         )
-        return supabase.storage.from_(self.settings.supabase_storage_bucket).get_public_url(object_path)
+        return supabase.storage.from_(self.settings.supabase_storage_bucket).get_public_url(object_path), object_path
+
+    def _delete_uploaded_files(self, object_paths: list[str]) -> None:
+        if not object_paths:
+            return
+        try:
+            get_supabase().storage.from_(self.settings.supabase_storage_bucket).remove(list(dict.fromkeys(object_paths)))
+        except Exception:
+            logger.warning("Failed to delete extracted email attachment objects", exc_info=True)
 
     def _imap_search_args_for_approach(self, approach: str, account: Any) -> tuple[str, ...]:
         """Return IMAP UID SEARCH args without relying on the user's read/unread state."""
@@ -1767,6 +2184,7 @@ class EmailIngestionService:
 
     def _create_failed_email_record(self, raw_email_id: str, sender: str, display_name: str, subject: str, error_msg: str, tenant_id: Any, email_date: datetime | None = None) -> None:
         try:
+            self.db.rollback()
             from backend.app.models import CatalogEmail
             from uuid import uuid4
 
@@ -1777,6 +2195,11 @@ class EmailIngestionService:
                 .first()
             )
             if existing:
+                existing.processing_status = f"failed: {error_msg}"[:50]
+                existing.pdf_url = None
+                if email_date:
+                    existing.received_at = email_date
+                self.db.commit()
                 return
 
             supplier = self._upsert_supplier(sender, display_name=display_name, tenant_id=tenant_id)

@@ -1,17 +1,23 @@
-from fastapi import APIRouter, Depends, Query
+import logging
+import re
+from difflib import SequenceMatcher
+from urllib.parse import unquote, urlparse
+
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
 from sqlalchemy import and_, exists, func, nullslast, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from uuid import UUID
 
 from backend.app.config import get_settings
-from backend.app.db import get_db
+from backend.app.db import get_db, get_supabase
 from backend.app.models import CatalogEmail, CatalogItem, EmailAccount, EmailSyncSetting, Supplier
 from backend.app.seed_mock_catalogs import build_catalogs
 from backend.app.auth import get_current_user
 from backend.app.schemas import clean_optional_text
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def nullable_float(value):
@@ -20,6 +26,70 @@ def nullable_float(value):
 
 def display_value(raw_payload: dict | None, key: str):
     return clean_optional_text((raw_payload or {}).get(key))
+
+
+def canonical_search_text(value: object) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).split())
+
+
+def search_tokens(value: object) -> list[str]:
+    return [
+        token
+        for token in canonical_search_text(value).split()
+        if len(token) >= 2 and token not in {"price", "qty", "item", "supplier", "find", "show", "best", "for", "the", "and"}
+    ]
+
+
+def row_relevance(row: dict, query: str | None) -> float:
+    if not query:
+        return 0.0
+    needle = canonical_search_text(query)
+    name = canonical_search_text(row.get("ingredient_name"))
+    spec = canonical_search_text(row.get("specification"))
+    haystack = f"{name} {spec}".strip()
+    if not needle or not haystack:
+        return 0.0
+
+    score = 0.0
+    if name == needle:
+        score += 1000
+    if needle in name:
+        score += 750
+    elif needle in haystack:
+        score += 600
+    tokens = search_tokens(query)
+    if tokens:
+        haystack_tokens = set(haystack.split())
+        name_tokens = set(name.split())
+        matched = sum(1 for token in tokens if token in haystack_tokens or any(token in name_token or name_token in token for name_token in name_tokens))
+        score += (matched / len(tokens)) * 300
+        if matched == len(tokens):
+            score += 150
+    score += SequenceMatcher(None, needle, name).ratio() * 100
+    return score
+
+
+def _storage_object_path_from_public_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    marker = "/storage/v1/object/public/"
+    parsed_path = urlparse(url).path
+    if marker not in parsed_path:
+        return None
+    bucket_and_path = parsed_path.split(marker, 1)[1]
+    bucket_prefix = f"{get_settings().supabase_storage_bucket}/"
+    if not bucket_and_path.startswith(bucket_prefix):
+        return None
+    return unquote(bucket_and_path[len(bucket_prefix):])
+
+
+def delete_storage_object(object_path: str | None) -> None:
+    if not object_path:
+        return
+    try:
+        get_supabase().storage.from_(get_settings().supabase_storage_bucket).remove([object_path])
+    except Exception:
+        logger.warning("Failed to delete catalog attachment object %s", object_path, exc_info=True)
 
 
 def mock_catalog_emails(limit: int) -> list[dict]:
@@ -43,7 +113,7 @@ def mock_catalog_items(q: str | None, limit: int) -> list[dict]:
     suppliers, emails, items = build_catalogs()
     supplier_names = {supplier.id: supplier.name for supplier in suppliers}
     email_received_dates = {email.id: email.received_at for email in emails}
-    filtered_items = [item for item in items if not q or q.lower() in item.normalized_name.lower()]
+    filtered_items = [item for item in items if not q or q.lower() in item.ingredient_name.lower()]
     return [
         {
             "id": str(item.id),
@@ -51,7 +121,6 @@ def mock_catalog_items(q: str | None, limit: int) -> list[dict]:
             "supplier_name": supplier_names.get(item.supplier_id, "Mock supplier"),
             "email_domain": "",
             "ingredient_name": item.ingredient_name,
-            "normalized_name": item.normalized_name,
             "specification": display_value(item.raw_payload, "specification"),
             "price_per_unit": nullable_float(item.price_per_unit),
             "currency": item.currency,
@@ -134,7 +203,7 @@ def list_catalog_items(
                 func.row_number().over(
                     partition_by=(
                         CatalogItem.supplier_id,
-                        CatalogItem.normalized_name,
+                        CatalogItem.ingredient_name,
                         CatalogItem.raw_payload["specification"].astext,
                         CatalogItem.available_qty,
                         CatalogItem.unit,
@@ -149,7 +218,7 @@ def list_catalog_items(
                 func.count(CatalogItem.id).over(
                     partition_by=(
                         CatalogItem.supplier_id,
-                        CatalogItem.normalized_name,
+                        CatalogItem.ingredient_name,
                         CatalogItem.raw_payload["specification"].astext,
                         CatalogItem.available_qty,
                         CatalogItem.unit,
@@ -178,23 +247,33 @@ def list_catalog_items(
         source = CatalogItem.raw_payload["source"].astext
         stmt = stmt.where(or_(source.is_(None), source != "mock_extracted_catalogue"))
     if q:
-        stmt = stmt.where(
-            or_(
-                CatalogItem.normalized_name.ilike(f"%{q}%"),
-                CatalogItem.ingredient_name.ilike(f"%{q}%"),
-                CatalogItem.raw_payload["specification"].astext.ilike(f"%{q}%"),
+        tokens = search_tokens(q)
+        if tokens:
+            stmt = stmt.where(
+                or_(*[
+                    or_(
+                        CatalogItem.ingredient_name.ilike(f"%{token}%"),
+                        CatalogItem.raw_payload["specification"].astext.ilike(f"%{token}%"),
+                    )
+                    for token in tokens
+                ])
             )
-        )
-    stmt = stmt.order_by(CatalogItem.normalized_name.asc(), CatalogItem.ingredient_name.asc()).limit(limit)
+        else:
+            stmt = stmt.where(
+                or_(
+                    CatalogItem.ingredient_name.ilike(f"%{q}%"),
+                    CatalogItem.raw_payload["specification"].astext.ilike(f"%{q}%"),
+                )
+            )
+    stmt = stmt.order_by(CatalogItem.ingredient_name.asc()).limit(limit)
     try:
-        return [
+        rows = [
             {
                 "id": str(item.id),
                 "catalog_email_id": str(item.catalog_email_id) if item.catalog_email_id else None,
                 "supplier_name": supplier_name,
                 "email_domain": email_domain,
                 "ingredient_name": item.ingredient_name,
-                "normalized_name": item.normalized_name,
                 "specification": display_value(item.raw_payload, "specification"),
                 "price_per_unit": nullable_float(item.price_per_unit),
                 "currency": item.currency,
@@ -214,6 +293,15 @@ def list_catalog_items(
             }
             for item, supplier_name, email_domain, received_at, history_count in db.execute(stmt)
         ]
+        if q:
+            rows.sort(
+                key=lambda row: (
+                    -row_relevance(row, q),
+                    str(row.get("ingredient_name") or "").lower(),
+                    row.get("price_per_unit") if row.get("price_per_unit") is not None else float("inf"),
+                )
+            )
+        return rows
     except SQLAlchemyError:
         if not settings.mock_data_enabled:
             raise
@@ -294,6 +382,7 @@ def sync_diagnostics(
 @router.delete("/emails/{email_id}", status_code=204)
 def delete_catalog_email(
     email_id: UUID,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
@@ -306,39 +395,17 @@ def delete_catalog_email(
             status_code=404,
             detail="Catalog email not found or access denied."
         )
+    object_path = _storage_object_path_from_public_url(email_record.pdf_url)
     try:
-        email_items = db.query(CatalogItem).filter(CatalogItem.catalog_email_id == email_id).all()
-        for item in email_items:
-            specification = (item.raw_payload or {}).get("specification")
-            specification_filter = (
-                CatalogItem.raw_payload["specification"].astext == str(specification)
-                if specification
-                else or_(
-                    CatalogItem.raw_payload["specification"].astext.is_(None),
-                    CatalogItem.raw_payload["specification"].astext == "",
-                )
-            )
-            identity_filters = (
-                CatalogItem.tenant_id == user_uuid,
-                CatalogItem.supplier_id == item.supplier_id,
-                CatalogItem.normalized_name == item.normalized_name,
-                specification_filter,
-                CatalogItem.available_qty == item.available_qty,
-                CatalogItem.unit == item.unit,
-                CatalogItem.moq == item.moq,
-            )
-            history_count = (
-                db.query(CatalogItem.id)
-                .filter(*identity_filters)
-                .count()
-            )
-            if bool((item.raw_payload or {}).get("is_updated")) or history_count > 1:
-                db.query(CatalogItem).filter(*identity_filters).delete(synchronize_session=False)
-            else:
-                db.delete(item)
+        db.query(CatalogItem).filter(
+            CatalogItem.catalog_email_id == email_id,
+            CatalogItem.tenant_id == user_uuid,
+        ).delete(synchronize_session=False)
         # Keep a tombstone so future inbox syncs do not re-import a user-deleted email.
         email_record.processing_status = "deleted"
+        email_record.pdf_url = None
         db.commit()
+        background_tasks.add_task(delete_storage_object, object_path)
     except Exception as e:
         db.rollback()
         from fastapi import HTTPException

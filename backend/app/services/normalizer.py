@@ -17,7 +17,6 @@ UNIT_ALIASES = {
 
 
 def normalize_item(item: ExtractedCatalogItem) -> ExtractedCatalogItem:
-    normalized_name = (item.normalized_name or item.ingredient_name).strip().lower()
     unit = None
     cleaned_unit = clean_optional_text(item.unit)
     if cleaned_unit:
@@ -25,7 +24,6 @@ def normalize_item(item: ExtractedCatalogItem) -> ExtractedCatalogItem:
         unit = UNIT_ALIASES.get(raw_unit, raw_unit)
     return item.model_copy(
         update={
-            "normalized_name": normalized_name,
             "unit": unit,
             "currency": (clean_optional_text(item.currency) or "INR").upper(),
             "specification": clean_optional_text(item.specification),

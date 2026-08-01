@@ -8,7 +8,7 @@ Ingest supplier emails, extract attached PDF catalogs, normalize item data, rank
 - Workers: Celery with Valkey broker
 - LLM: OpenRouter chat completions
 - PDF extraction: PyMuPDF with pdfplumber fallback
-- Database: Supabase Postgres with pgvector
+- Database: Supabase Postgres
 - Storage: Supabase Storage for source PDFs
 - Cache/session: Valkey
 - Frontend: Next.js chat and dashboard UI
@@ -159,7 +159,7 @@ OPENROUTER_APP_NAME=MediCORE
 ### Railway/Vercel Test Deployment:
 - Deploy FastAPI using `backend/Dockerfile`
 - Deploy Valkey or use a Redis-compatible managed service
-- Use Supabase free tier with pgvector enabled
+- Use Supabase Cloud Postgres
 - Deploy `frontend` to Vercel
 - Inject environment variables from `.env.example`
 

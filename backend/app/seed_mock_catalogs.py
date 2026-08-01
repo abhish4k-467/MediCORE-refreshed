@@ -95,7 +95,7 @@ def build_catalogs() -> tuple[list[Supplier], list[CatalogEmail], list[CatalogIt
         )
 
         sampled_items = rng.sample(ITEMS, 8)
-        for item_no, (display_name, normalized_name, unit, min_price, max_price) in enumerate(sampled_items, start=1):
+        for item_no, (display_name, canonical_name, unit, min_price, max_price) in enumerate(sampled_items, start=1):
             qty = rng.randrange(40, 420) * 100
             price = round(rng.uniform(min_price, max_price) * rng.uniform(0.94, 1.08), 2)
             lead_time_days = rng.choice([2, 3, 5, 7, 10, 14])
@@ -103,12 +103,11 @@ def build_catalogs() -> tuple[list[Supplier], list[CatalogEmail], list[CatalogIt
             valid_until = today + timedelta(days=rng.randint(14, 75))
             catalog_items.append(
                 CatalogItem(
-                    id=stable_uuid(f"catalog-item:{domain}:{normalized_name}"),
+                    id=stable_uuid(f"catalog-item:{domain}:{canonical_name}"),
                     tenant_id=TENANT_ID,
                     catalog_email_id=email_id,
                     supplier_id=supplier_id,
                     ingredient_name=display_name,
-                    normalized_name=normalized_name,
                     price_per_unit=price,
                     currency="INR",
                     available_qty=qty,
@@ -116,7 +115,6 @@ def build_catalogs() -> tuple[list[Supplier], list[CatalogEmail], list[CatalogIt
                     valid_until=valid_until,
                     lead_time_days=lead_time_days,
                     moq=moq_val,
-                    embedding=None,
                     raw_payload={
                         "source": "mock_extracted_catalogue",
                         "source_catalogue": f"MediCORE mock catalogue {catalog_no:02d}",

@@ -5,7 +5,6 @@ from uuid import UUID
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from pgvector.sqlalchemy import Vector
 
 from backend.app.db import Base
 
@@ -47,7 +46,6 @@ class CatalogItem(Base):
     catalog_email_id: Mapped[UUID] = mapped_column(ForeignKey("catalog_emails.id"))
     supplier_id: Mapped[UUID] = mapped_column(ForeignKey("suppliers.id"), index=True)
     ingredient_name: Mapped[str] = mapped_column(String(255))
-    normalized_name: Mapped[str] = mapped_column(String(255), index=True)
     price_per_unit: Mapped[float | None] = mapped_column(Numeric(14, 4), nullable=True)
     currency: Mapped[str] = mapped_column(String(8), default="INR")
     available_qty: Mapped[float | None] = mapped_column(Numeric(14, 4), nullable=True)
@@ -55,7 +53,6 @@ class CatalogItem(Base):
     valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lead_time_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     moq: Mapped[float | None] = mapped_column(Numeric(14, 4), nullable=True)
-    embedding: Mapped[list[float] | None] = mapped_column(Vector(384))
     raw_payload: Mapped[dict] = mapped_column(JSONB, default=dict)
 
 

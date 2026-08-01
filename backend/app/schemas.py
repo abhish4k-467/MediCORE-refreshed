@@ -21,7 +21,6 @@ def clean_optional_text(value: object) -> str | None:
 
 class ExtractedCatalogItem(BaseModel):
     ingredient_name: str
-    normalized_name: str | None = None
     price_per_unit: float | None = None
     currency: str = "INR"
     available_qty: float | None = None
@@ -99,7 +98,7 @@ class CatalogIngestionResult(BaseModel):
 
 class QueryPlan(BaseModel):
     operation: str = Field(pattern="^(supplier_compare|best_price|catalog_search|history_compare|supplier_activity|unrelated)$")
-    normalized_name: str | None = None
+    ingredient_name: str | None = None
     min_quantity: float | None = None
     unit: str | None = None
     date_from: datetime | None = None

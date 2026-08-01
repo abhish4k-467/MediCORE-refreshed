@@ -11,8 +11,8 @@ from backend.app.schemas import ExtractedCatalogItem, QueryPlan
 
 logger = logging.getLogger(__name__)
 
-EXTRACTION_CHUNK_CHARS = 2500
-EXTRACTION_CHUNK_OVERLAP_LINES = 2
+EXTRACTION_CHUNK_CHARS = 50000
+EXTRACTION_CHUNK_OVERLAP_LINES = 4
 
 
 class OpenRouterClient:
@@ -23,8 +23,6 @@ class OpenRouterClient:
         self.base_url = settings.openrouter_base_url.rstrip("/")
         self.site_url = settings.openrouter_site_url or settings.frontend_origin
         self.app_name = settings.openrouter_app_name or settings.app_name
-        if not self.api_key:
-            raise ValueError("OPENROUTER_API_KEY is required for LLM processing.")
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -38,6 +36,8 @@ class OpenRouterClient:
         return headers
 
     def _chat(self, messages: list[dict[str, str]], *, temperature: float = 0, json_mode: bool = False) -> str:
+        if not self.api_key:
+            raise ValueError("OPENROUTER_API_KEY is required for LLM processing.")
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -184,7 +184,7 @@ class OpenRouterClient:
                 continue
             for item in chunk_items:
                 key = (
-                    (item.normalized_name or item.ingredient_name).strip().lower(),
+                    item.ingredient_name.strip().lower(),
                     (item.specification or "").strip().lower(),
                     str(item.price_per_unit),
                     (item.currency or "").upper(),
@@ -212,9 +212,8 @@ class OpenRouterClient:
             "Do not use markdown fences, comments, trailing commas, or explanatory text.\n\n"
             "Each catalog item in the array MUST contain the following fields:\n"
             "- ingredient_name: The raw name of the chemical, ingredient, or medicine (e.g., 'Citric Acid Anhydrous', 'Paracetamol API', 'Aspirin USP')\n"
-            "- normalized_name: The lowercase, clean, canonical name of the ingredient, excluding grades, CAS, or pack sizes (e.g., 'citric acid', 'paracetamol', 'aspirin')\n"
             "- specification: The exact product specification/description/grade/purity/assay/content from the row if present, otherwise null. "
-            "Examples: '97% Powder', 'Berberine Extract 20:1', 'Fe2+: 20.0%-23.7%, Nitrogen: 10.0%-12.0%'. Do not merge this into normalized_name.\n"
+            "Examples: '97% Powder', 'Berberine Extract 20:1', 'Fe2+: 20.0%-23.7%, Nitrogen: 10.0%-12.0%'. Do not merge this into ingredient_name.\n"
             "- price_per_unit: The numeric price from a price/rate column or phrase only. "
             "Never copy the quantity value into price_per_unit. Preserve the exact decimal value visible in the source; do not round. If a price range is given, use the visible lower bound and put the full original range in notes. "
             "If no real price/rate is visible for an item, use null instead of guessing; still extract the item if the product name is visible.\n"
@@ -241,7 +240,7 @@ class OpenRouterClient:
             "CRITICAL INSTRUCTIONS FOR UNSTRUCTURED / CONVERSATIONAL TEXT:\n"
             f"1. Conversational Emails: If the text is an email conversation, locate all mentions of products, prices, quantities, and terms, and map them to the schema.{date_context}\n"
             "2. Implicit Packaging: If the text says 'Rs 3000 per 25kg bag', normalize this to a single item with price_per_unit=3000, unit='bag' or price_per_unit=120, unit='kg', depending on how the price is stated, but map it logically.\n"
-            "3. Purity & Grades: Keep grades (e.g. 'IP', 'USP', 'Food Grade') and CAS numbers in the ingredient_name and notes, but strip them out of the normalized_name.\n"
+            "3. Purity & Grades: Keep grades (e.g. 'IP', 'USP', 'Food Grade') and CAS numbers in the ingredient_name and notes.\n"
             "4. Volume / Tiered Pricing: If the email lists multiple price tiers based on quantity (e.g., '$5/kg for 100kg, or $4/kg for 500kg'), extract EACH tier as a separate catalog item in the array, setting the price_per_unit, moq, and available_qty accordingly.\n"
             "5. CAS Registry Numbers: Extract CAS numbers (e.g. 'CAS 50-78-2') and specify them clearly in the 'notes' field (e.g. 'CAS: 50-78-2').\n"
             "6. Incoterms & Conditions: Extract Incoterms (FOB, CIF, EXW, DDP, CFR) or shipping details (e.g. 'FOB Shanghai', 'origin: India') and save them in 'notes'.\n"
@@ -267,20 +266,64 @@ class OpenRouterClient:
             return [normalized]
 
         lines = normalized.splitlines()
+        header_lines: list[str] = []
+        for line in lines[:5]:
+            if line.startswith("Sheet:") or "," in line or "|" in line or "\t" in line:
+                header_lines.append(line)
+                if len(header_lines) >= 2:
+                    break
+
+        header_prefix = "\n".join(header_lines) + "\n" if header_lines else ""
+
         chunks: list[str] = []
         current: list[str] = []
         current_len = 0
         for line in lines:
             line_len = len(line) + 1
             if current and current_len + line_len > EXTRACTION_CHUNK_CHARS:
-                chunks.append("\n".join(current))
+                chunk_str = "\n".join(current)
+                if chunks and header_prefix and not chunk_str.startswith(header_lines[0]):
+                    chunk_str = header_prefix + chunk_str
+                chunks.append(chunk_str)
                 current = current[-EXTRACTION_CHUNK_OVERLAP_LINES:]
                 current_len = sum(len(row) + 1 for row in current)
             current.append(line)
             current_len += line_len
         if current:
-            chunks.append("\n".join(current))
+            chunk_str = "\n".join(current)
+            if chunks and header_prefix and not chunk_str.startswith(header_lines[0]):
+                chunk_str = header_prefix + chunk_str
+            chunks.append(chunk_str)
         return chunks
+
+    def generate_sql(self, question: str) -> str:
+        system = (
+            "You are a PostgreSQL SQL generator for a supplier catalog procurement database on Supabase Cloud. "
+            "Your task is to analyze the user's natural-language query and generate a single, highly efficient, read-only SQL query.\n\n"
+            "Database Schema Overview:\n"
+            "- suppliers (id UUID, tenant_id UUID, name TEXT, email_domain TEXT, last_email_date TIMESTAMPTZ, certifications TEXT)\n"
+            "- catalog_emails (id UUID, tenant_id UUID, supplier_id UUID, received_at TIMESTAMPTZ, raw_email_id TEXT, subject TEXT, pdf_url TEXT, processing_status TEXT)\n"
+            "- catalog_items (id UUID, tenant_id UUID, catalog_email_id UUID, supplier_id UUID, ingredient_name TEXT, price_per_unit NUMERIC(14,4), currency TEXT, available_qty NUMERIC(14,4), unit TEXT, valid_until TIMESTAMPTZ, lead_time_days INT, moq NUMERIC(14,4), raw_payload JSONB)\n"
+            "- purchase_history (id UUID, tenant_id UUID, supplier_id UUID, item_id UUID, purchased_at TIMESTAMPTZ, quantity NUMERIC(14,2), price_paid NUMERIC(14,4))\n\n"
+            "CRITICAL SQL GENERATION RULES:\n"
+            "1. ONLY generate a read-only SELECT query (or WITH ... SELECT). Never generate INSERT, UPDATE, DELETE, DROP, ALTER, or TRUNCATE statements.\n"
+            "2. Return ONLY the raw SQL code in plain text. Do not wrap in markdown markdown fences (```sql), do not include comments or explanations.\n"
+            "3. Select meaningful columns including supplier name (suppliers.name AS supplier_name), ingredient_name, price_per_unit, currency, available_qty, unit, moq, and lead_time_days.\n"
+            "4. Use case-insensitive partial matching on catalog_items.ingredient_name. For multi-word ingredient searches, split meaningful words and match each with ILIKE wildcards where practical; do not require exact names.\n"
+            "5. Rank closer ingredient_name matches first, then apply appropriate ORDER BY clauses (e.g. ORDER BY price_per_unit ASC NULLS LAST for best price/cheapest deal requests).\n"
+            "6. Always limit results to at most 50 rows (LIMIT 50)."
+        )
+        content = self._chat(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": question},
+            ],
+            temperature=0,
+        )
+        sql = self._strip_json_fences(content).strip()
+        sql = re.sub(r"^```(?:sql)?\s*", "", sql, flags=re.IGNORECASE)
+        sql = re.sub(r"\s*```$", "", sql).strip()
+        return sql
 
     def plan_query(self, question: str) -> QueryPlan:
         system = (
@@ -296,13 +339,13 @@ class OpenRouterClient:
             "you MUST classify the operation as 'unrelated'.\n\n"
             "Do not emit SQL. You MUST output a FLAT JSON object (no nested 'filters' object) containing the following fields:\n"
             "- operation: one of the allowed operations\n"
-            "- normalized_name: string or null (extract the chemical/ingredient name and normalize it to its canonical lowercase form, e.g. 'vitamin c' -> 'ascorbic acid', 'nacl' -> 'sodium chloride', 'citric acid anhydrous' -> 'citric acid', 'paracetamol api' -> 'paracetamol')\n"
+            "- ingredient_name: string or null (extract the broad chemical/ingredient search phrase, preserving the user's wording where possible; for 'marigold', use 'marigold', not one full Marigold variant)\n"
             "- min_quantity: number or null (extract any minimum quantity/stock requirements)\n"
             "- unit: string or null (normalize units, e.g. 'kg', 'g', 'litre', 'tablet')\n"
             "- semantic_query: string or null\n"
             "- limit: number (default 10)\n\n"
             "Example output for 'Compare citric acid':\n"
-            "{\"operation\": \"supplier_compare\", \"normalized_name\": \"citric acid\", \"min_quantity\": null, \"unit\": null, \"semantic_query\": null, \"limit\": 10}"
+            "{\"operation\": \"supplier_compare\", \"ingredient_name\": \"citric acid\", \"min_quantity\": null, \"unit\": null, \"semantic_query\": null, \"limit\": 10}"
         )
         payload = self._json_chat(system, question)
         return QueryPlan.model_validate(payload)
@@ -367,7 +410,7 @@ class OpenRouterClient:
         ) or "No answer generated."
 
     def _display_item_name(self, row: dict[str, Any]) -> str | None:
-        name = row.get("normalized_name") or row.get("ingredient_name")
+        name = row.get("ingredient_name")
         if not name:
             return None
         return f"{name} (U)" if row.get("is_updated") else str(name)

@@ -410,7 +410,10 @@ export default function AdminWorkspacePage({ params }: { params: Promise<{ tab?:
         throw new Error(detail.detail || "Failed to remove employee.");
       }
       setConfirmRemoveId(null);
-      fetchEmployees();
+      setEmployees((current) => current.map((employee) => (
+        employee.id === confirmRemoveId ? { ...employee, status: "Disabled", last_sync: "Never" } : employee
+      )));
+      window.setTimeout(() => fetchEmployees(), 500);
     } catch (err: any) {
       setEmployeesError(err.message);
     } finally {
@@ -435,7 +438,8 @@ export default function AdminWorkspacePage({ params }: { params: Promise<{ tab?:
         throw new Error(detail.detail || "Failed to delete employee.");
       }
       setConfirmDeleteId(null);
-      fetchEmployees();
+      setEmployees((current) => current.filter((employee) => employee.id !== confirmDeleteId));
+      window.setTimeout(() => fetchEmployees(), 500);
     } catch (err: any) {
       setEmployeesError(err.message);
     } finally {
@@ -562,7 +566,7 @@ export default function AdminWorkspacePage({ params }: { params: Promise<{ tab?:
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "32px" }}>
           <div>
             <h2 style={{ margin: 0, fontSize: "22px", fontWeight: 600, color: "#092f28" }}>Database Overview</h2>
-            <p style={{ fontSize: "14px", color: "#66736d", margin: "4px 0 0 0" }}>Storage size, index health, and semantic search queries telemetry.</p>
+            <p style={{ fontSize: "14px", color: "#66736d", margin: "4px 0 0 0" }}>Storage size, index health, and SQL query telemetry.</p>
           </div>
         </div>
 

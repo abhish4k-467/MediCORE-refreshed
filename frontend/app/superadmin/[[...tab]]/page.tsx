@@ -522,7 +522,7 @@ export default function SuperadminWorkspacePage({ params }: { params: Promise<{ 
               </div>
               <h4 style={{ margin: "0 0 8px 0", fontSize: "16px", fontWeight: 600, color: "#092f28" }}>MediCORE AI Cluster</h4>
               <p style={{ fontSize: "13.5px", color: "var(--muted)", maxWidth: "340px", margin: 0, lineHeight: 1.6 }}>
-                Global services running optimally. NLP translation engines, parsing models, and embeddings vector indices are verified operational.
+                Global services running optimally. NLP translation engines, parsing models, and Supabase SQL query engines are verified operational.
               </p>
             </div>
           </div>

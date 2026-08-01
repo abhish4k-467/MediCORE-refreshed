@@ -45,7 +45,8 @@ export default function EmailSetupPage() {
 
   useEffect(() => {
     // Check for active session and pre-fill email address or redirect if admin
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    supabase.auth.getSession().then((res) => {
+      const session = res?.data?.session;
       if (session) {
         setSession(session);
         const role = session.user?.user_metadata?.role;
@@ -59,9 +60,11 @@ export default function EmailSetupPage() {
       } else {
         router.push("/login");
       }
+    }).catch(() => {
+      router.push("/login");
     });
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const authListener = supabase.auth.onAuthStateChange((_event, session) => {
       if (session) {
         setSession(session);
         const role = session.user?.user_metadata?.role;
@@ -75,8 +78,10 @@ export default function EmailSetupPage() {
       }
     });
 
+    const subscription = authListener?.data?.subscription;
+
     return () => {
-      subscription.unsubscribe();
+      subscription?.unsubscribe();
     };
   }, [router]);
 

@@ -1,6 +1,9 @@
 from datetime import datetime
 from typing import Any
-from sqlalchemy import Select, and_, func, nullslast, select
+import re
+from difflib import SequenceMatcher
+
+from sqlalchemy import Select, and_, case, func, nullslast, select
 from sqlalchemy.orm import Session
 
 from backend.app.models import CatalogItem, Supplier
@@ -25,7 +28,7 @@ class SupplierRanker:
                 func.row_number().over(
                     partition_by=(
                         CatalogItem.supplier_id,
-                        CatalogItem.normalized_name,
+                        CatalogItem.ingredient_name,
                         CatalogItem.raw_payload["specification"].astext,
                         CatalogItem.available_qty,
                         CatalogItem.unit,
@@ -40,7 +43,7 @@ class SupplierRanker:
                 func.count(CatalogItem.id).over(
                     partition_by=(
                         CatalogItem.supplier_id,
-                        CatalogItem.normalized_name,
+                        CatalogItem.ingredient_name,
                         CatalogItem.raw_payload["specification"].astext,
                         CatalogItem.available_qty,
                         CatalogItem.unit,
@@ -62,7 +65,7 @@ class SupplierRanker:
                     latest_items.c.row_number == 1,
                 ),
             )
-            .order_by(CatalogItem.normalized_name.asc(), CatalogItem.ingredient_name.asc(), nullslast(CatalogItem.price_per_unit.asc()))
+            .order_by(CatalogItem.ingredient_name.asc(), nullslast(CatalogItem.price_per_unit.asc()))
             .limit(plan.limit)
         )
         if not settings.mock_data_enabled:
@@ -74,17 +77,28 @@ class SupplierRanker:
             )
         if tenant_id:
             stmt = stmt.where(CatalogItem.tenant_id == (UUID(str(tenant_id)) if isinstance(tenant_id, str) else tenant_id))
-        if plan.normalized_name:
-            search_tokens = [
-                token for token in self._canonical_item_key(plan.normalized_name).split()
-                if len(token) >= 3 and token not in {"price", "qty", "item", "supplier"}
-            ]
-            for token in search_tokens or [plan.normalized_name.lower()]:
-                stmt = stmt.where(
+        if plan.ingredient_name:
+            search_tokens = self._search_tokens(plan.ingredient_name)
+            if search_tokens:
+                token_clauses = [
                     or_(
-                        CatalogItem.normalized_name.ilike(f"%{token}%"),
                         CatalogItem.ingredient_name.ilike(f"%{token}%"),
                         CatalogItem.raw_payload["specification"].astext.ilike(f"%{token}%"),
+                    )
+                    for token in search_tokens
+                ]
+                stmt = stmt.where(or_(*token_clauses))
+                exact_phrase = f"%{plan.ingredient_name.strip()}%"
+                stmt = stmt.order_by(
+                    case((CatalogItem.ingredient_name.ilike(exact_phrase), 0), else_=1),
+                    CatalogItem.ingredient_name.asc(),
+                    nullslast(CatalogItem.price_per_unit.asc()),
+                )
+            else:
+                stmt = stmt.where(
+                    or_(
+                        CatalogItem.ingredient_name.ilike(f"%{plan.ingredient_name.lower()}%"),
+                        CatalogItem.raw_payload["specification"].astext.ilike(f"%{plan.ingredient_name.lower()}%"),
                     )
                 )
         if plan.min_quantity:
@@ -104,7 +118,6 @@ class SupplierRanker:
                     "email_domain": supplier.email_domain,
                     "certifications": supplier.certifications,
                     "ingredient_name": item.ingredient_name,
-                    "normalized_name": item.normalized_name,
                     "specification": clean_optional_text(raw_payload.get("specification")),
                     "price_per_unit": price,
                     "currency": item.currency,
@@ -121,7 +134,8 @@ class SupplierRanker:
                     "recommendation_score": round(score, 4),
                 }
             )
-        return self._dedupe_supplier_item_rows(rows, plan.normalized_name)
+        rows = self._rank_rows_by_relevance(rows, plan.ingredient_name)
+        return self._dedupe_supplier_item_rows(rows, plan.ingredient_name)
 
     def _dedupe_supplier_item_rows(self, rows: list[dict], requested_item: str | None = None) -> list[dict]:
         grouped: dict[tuple[str, str], dict] = {}
@@ -138,16 +152,66 @@ class SupplierRanker:
         return list(grouped.values())
 
     def _canonical_item_key(self, value: Any) -> str:
-        import re
-
         text = re.sub(r"\(u\)", "", str(value or ""), flags=re.IGNORECASE)
         text = re.sub(r"[^a-z0-9]+", " ", text.lower())
         return " ".join(text.split())
 
+    def _search_tokens(self, value: Any) -> list[str]:
+        return [
+            token
+            for token in self._canonical_item_key(value).split()
+            if len(token) >= 2 and token not in {"price", "qty", "item", "supplier", "find", "show", "best", "for", "the", "and"}
+        ]
+
+    def _row_relevance_score(self, row: dict, query: str | None) -> float:
+        if not query:
+            return 0.0
+        canonical_query = self._canonical_item_key(query)
+        canonical_name = self._canonical_item_key(row.get("ingredient_name"))
+        canonical_spec = self._canonical_item_key(row.get("specification"))
+        haystack = f"{canonical_name} {canonical_spec}".strip()
+        if not canonical_query or not haystack:
+            return 0.0
+
+        score = 0.0
+        if canonical_name == canonical_query:
+            score += 1000
+        if canonical_query in canonical_name:
+            score += 750
+        elif canonical_query in haystack:
+            score += 600
+
+        tokens = self._search_tokens(query)
+        if tokens:
+            name_tokens = set(canonical_name.split())
+            haystack_tokens = set(haystack.split())
+            matched = sum(1 for token in tokens if token in haystack_tokens or any(token in name_token or name_token in token for name_token in name_tokens))
+            score += (matched / len(tokens)) * 300
+            if matched == len(tokens):
+                score += 150
+            first_token = tokens[0]
+            if canonical_name.startswith(first_token):
+                score += 50
+
+        score += SequenceMatcher(None, canonical_query, canonical_name).ratio() * 100
+        return score
+
+    def _rank_rows_by_relevance(self, rows: list[dict], query: str | None) -> list[dict]:
+        if not query:
+            return rows
+        return sorted(
+            rows,
+            key=lambda row: (
+                -self._row_relevance_score(row, query),
+                str(row.get("ingredient_name") or "").lower(),
+                float(row.get("price_per_unit")) if row.get("price_per_unit") is not None else float("inf"),
+            ),
+        )
+
     def _catalog_line_key(self, row: dict, requested_item: str | None) -> str:
         return "|".join(
             [
-                self._canonical_item_key(requested_item or row.get("normalized_name") or row.get("ingredient_name")),
+                self._canonical_item_key(requested_item or row.get("ingredient_name")),
                 self._canonical_item_key(row.get("specification")),
                 str(row.get("available_qty") if row.get("available_qty") is not None else ""),
                 str(row.get("unit") or "").strip().lower(),

@@ -46,7 +46,6 @@ type ChatMessage = {
 
 type SupplierItem = {
   ingredient_name: string;
-  normalized_name: string;
   specification?: string | null;
   price_per_unit: number | null;
   currency: string;
@@ -293,10 +292,52 @@ function displayText(value: unknown): string {
   return isMissingDisplayValue(value) ? "-" : String(value);
 }
 
-function displayItemName(item: Pick<SupplierItem, "ingredient_name" | "normalized_name" | "is_updated"> | Record<string, unknown>): string {
-  const rawName = (item as any).normalized_name ?? (item as any).ingredient_name;
+function displayItemName(item: Pick<SupplierItem, "ingredient_name" | "is_updated"> | Record<string, unknown>): string {
+  const rawName = (item as any).ingredient_name;
   const name = displayText(rawName);
   return name !== "-" && (item as any).is_updated ? `${name} (U)` : name;
+}
+
+function canonicalSearchText(value: unknown): string {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function searchTokens(value: unknown): string[] {
+  return canonicalSearchText(value)
+    .split(" ")
+    .filter((token) => token.length >= 2 && !["price", "qty", "item", "supplier", "find", "show", "best", "for", "the", "and"].includes(token));
+}
+
+function searchRelevance(row: Pick<SupplierItem, "ingredient_name" | "specification"> | string, query: string): number {
+  const name = typeof row === "string" ? canonicalSearchText(row) : canonicalSearchText(row.ingredient_name);
+  const spec = typeof row === "string" ? "" : canonicalSearchText(row.specification);
+  const needle = canonicalSearchText(query);
+  const haystack = `${name} ${spec}`.trim();
+  if (!needle || !haystack) return 0;
+
+  let score = 0;
+  if (name === needle) score += 1000;
+  if (name.includes(needle)) score += 750;
+  else if (haystack.includes(needle)) score += 600;
+
+  const tokens = searchTokens(query);
+  if (tokens.length > 0) {
+    const haystackTokens = new Set(haystack.split(" "));
+    const nameTokens = name.split(" ");
+    const matched = tokens.filter((token) => haystackTokens.has(token) || nameTokens.some((nameToken) => nameToken.includes(token) || token.includes(nameToken))).length;
+    score += (matched / tokens.length) * 300;
+    if (matched === tokens.length) score += 150;
+  }
+  return score;
+}
+
+function matchesSearch(row: Pick<SupplierItem, "ingredient_name" | "specification"> | string, query: string): boolean {
+  if (!query.trim()) return true;
+  return searchRelevance(row, query) > 0;
 }
 
 function displaySpecification(item: Pick<SupplierItem, "specification"> | Record<string, unknown>): string {
@@ -476,7 +517,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 10000);
     try {
-      const { data: { session } } = await supabase.auth.getSession();
+      const res = await supabase.auth.getSession();
+      const session = res?.data?.session;
       if (!session) return;
       
       const response = await fetch(`${apiBaseUrl}/api/ingestion/poll-now-sync-user`, {
@@ -615,6 +657,12 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     }
   }, [syncSettings.pending_approvals]);
 
+  const failedEmailNotifications = useMemo(() => {
+    return catalogEmails.filter((email) => String(email.processing_status || "").startsWith("failed"));
+  }, [catalogEmails]);
+
+  const notificationCount = pendingApprovalsList.length + failedEmailNotifications.length;
+
   // Click outside detection to close the notifications menu
   useEffect(() => {
     function handleDocumentClick(event: MouseEvent) {
@@ -706,7 +754,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         supplier_name: email.supplier_name,
         email_domain: items[0]?.email_domain ?? meta?.email_domain ?? "-",
         item_count: items.length,
-        latest_item: email.subject || bestItem?.normalized_name || bestItem?.ingredient_name || "Email stored, extraction pending",
+        latest_item: email.subject || bestItem?.ingredient_name || "Email stored, extraction pending",
         received_at: email.received_at,
         latest_price: bestItem?.price_per_unit ?? 0,
         latest_currency: bestItem?.currency ?? "INR",
@@ -766,7 +814,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         .filter((token) => token.length >= 3 && !["price", "supplier", "suppliers", "show", "find", "give", "for", "the"].includes(token))
     );
     for (const row of rows as Array<Record<string, unknown>>) {
-      const rowName = String(row.normalized_name ?? row.ingredient_name ?? "").toLowerCase();
+      const rowName = String(row.ingredient_name ?? "").toLowerCase();
       const matchedToken = Array.from(queryTokens).find((token) => rowName.includes(token));
       const specKey = String(row.specification ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
       const qtyKey = `${String(row.available_qty ?? "")}-${String(row.unit ?? "")}-${String(row.moq ?? "")}`;
@@ -783,7 +831,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const latestSupplierRows = useMemo(() => {
     const map = new Map<string, SupplierTableRow>();
     for (const row of supplierRows) {
-      const key = `${supplierKey(row.supplier_name, row.email_domain)}-${row.normalized_name || row.ingredient_name}-${row.specification || ""}-${row.available_qty ?? ""}-${row.unit ?? ""}-${row.moq ?? ""}`;
+      const key = `${supplierKey(row.supplier_name, row.email_domain)}-${row.ingredient_name}-${row.specification || ""}-${row.available_qty ?? ""}-${row.unit ?? ""}-${row.moq ?? ""}`;
       const existing = map.get(key);
       if (!existing || new Date(row.received_at ?? 0).getTime() > new Date(existing.received_at ?? 0).getTime()) {
         map.set(key, row);
@@ -801,7 +849,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
 
     const itemGroups = new Map<string, SupplierTableRow[]>();
     for (const row of latestSupplierRows) {
-      const key = `${row.normalized_name || row.ingredient_name}-${row.specification || ""}`;
+      const key = `${row.ingredient_name}-${row.specification || ""}`;
       const group = itemGroups.get(key) ?? [];
       group.push(row);
       itemGroups.set(key, group);
@@ -888,13 +936,9 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       };
     }).filter((supplier) => {
       return !search
-        || supplier.supplier_name.toLowerCase().includes(search)
-        || supplier.email_domain.toLowerCase().includes(search)
-        || supplier.items.some((item) => (
-          (item.normalized_name || "").toLowerCase().includes(search)
-          || (item.ingredient_name || "").toLowerCase().includes(search)
-          || (item.specification || "").toLowerCase().includes(search)
-        ));
+        || canonicalSearchText(supplier.supplier_name).includes(canonicalSearchText(search))
+        || canonicalSearchText(supplier.email_domain).includes(canonicalSearchText(search))
+        || supplier.items.some((item) => matchesSearch(item, search));
     });
 
     return summaries.sort((left, right) => {
@@ -932,7 +976,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
 
   const selectedCatalogItems = useMemo(() => {
     if (!selectedCatalog) return [];
-    const search = catalogSearch.trim().toLowerCase();
+    const search = catalogSearch.trim();
     const filteredByEmail = selectedCatalogEmailId
       ? selectedCatalog.items.filter((item) => item.catalog_email_id === selectedCatalogEmailId)
       : selectedCatalog.items;
@@ -941,15 +985,17 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     const minQty = Math.min(...filteredByEmail.map((item) => safeQty(item.available_qty)));
     const bestPrice = Math.min(...filteredByEmail.map((item) => safePrice(item.price_per_unit, item.currency)));
     return filteredByEmail.filter((item) => {
-      const matchesSearch = !search
-        || (item.ingredient_name || "").toLowerCase().includes(search)
-        || (item.normalized_name || "").toLowerCase().includes(search)
-        || (item.specification || "").toLowerCase().includes(search);
-      if (!matchesSearch) return false;
+      const itemMatchesSearch = !search
+        || matchesSearch(item, search);
+      if (!itemMatchesSearch) return false;
       if (catalogFilter === "best") return safePrice(item.price_per_unit, item.currency) <= bestPrice * 1.08;
       if (catalogFilter === "low-stock") return safeQty(item.available_qty) <= minQty * 1.35;
       return true;
-    }).sort((left, right) => displayItemName(left).localeCompare(displayItemName(right)));
+    }).sort((left, right) => (
+      search
+        ? searchRelevance(right, search) - searchRelevance(left, search)
+        : displayItemName(left).localeCompare(displayItemName(right))
+    ));
   }, [catalogFilter, catalogSearch, selectedCatalog, selectedCatalogEmailId]);
 
   const emailItemsCount = useMemo(() => {
@@ -960,32 +1006,28 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   }, [selectedCatalog, selectedCatalogEmailId]);
 
   const availableIngredients = useMemo(() => {
-    return Array.from(new Set(latestSupplierRows.map((row) => row.normalized_name || row.ingredient_name)))
+    return Array.from(new Set(latestSupplierRows.map((row) => row.ingredient_name)))
       .filter(Boolean)
       .sort((left, right) => left.localeCompare(right));
   }, [latestSupplierRows]);
 
   const compareSuggestions = useMemo(() => {
-    const requested = compareIngredient.trim().toLowerCase();
-    const ranked = availableIngredients.filter((ingredient) => {
-      const normalized = ingredient.toLowerCase();
-      return !requested || normalized.startsWith(requested) || normalized.includes(requested);
-    });
+    const requested = compareIngredient.trim();
+    const ranked = availableIngredients
+      .filter((ingredient) => matchesSearch(ingredient, requested))
+      .sort((left, right) => searchRelevance(right, requested) - searchRelevance(left, requested));
     return ranked.slice(0, 8);
   }, [availableIngredients, compareIngredient]);
 
   const compareData = useMemo(() => {
-    const requested = selectedCompareIngredient.trim().toLowerCase();
+    const requested = selectedCompareIngredient.trim();
     if (!requested) {
       return { rows: [], topRows: [], otherRows: [], ingredientLabel: "ingredient" };
     }
 
     const matchedRows = latestSupplierRows.filter((row) => {
-      const normalized = (row.normalized_name || "").toLowerCase();
-      const ingredient = (row.ingredient_name || "").toLowerCase();
-      const specification = (row.specification || "").toLowerCase();
-      return !requested || normalized.includes(requested) || ingredient.includes(requested) || specification.includes(requested);
-    });
+      return matchesSearch(row, requested);
+    }).sort((left, right) => searchRelevance(right, requested) - searchRelevance(left, requested));
 
     const bySupplier = new Map<string, SupplierTableRow>();
     for (const row of matchedRows) {
@@ -1029,7 +1071,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       rows: sorted,
       topRows: sorted.slice(0, 3),
       otherRows: sorted.slice(3),
-      ingredientLabel: sorted[0]?.normalized_name || selectedCompareIngredient || "ingredient",
+      ingredientLabel: sorted[0]?.ingredient_name || selectedCompareIngredient || "ingredient",
     };
   }, [compareSort, selectedCompareIngredient, latestSupplierRows]);
 
@@ -1057,7 +1099,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     };
 
     // Get active Supabase session and set active user
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    supabase.auth.getSession().then((res) => {
+      const session = res?.data?.session;
       if (session?.user) {
         const u = session.user;
         const name = u.user_metadata?.full_name || u.email?.split("@")[0] || "User";
@@ -1092,10 +1135,13 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         router.push("/login");
       }
       setAuthChecked(true);
+    }).catch(() => {
+      setAuthUser(null);
+      setAuthChecked(true);
     });
 
     // Listen to changes in auth state (e.g. sign outs)
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+    const authListener = supabase.auth.onAuthStateChange((event, session) => {
       if (session?.user) {
         const u = session.user;
         const name = u.user_metadata?.full_name || u.email?.split("@")[0] || "User";
@@ -1131,8 +1177,10 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       }
     });
 
+    const subscription = authListener?.data?.subscription;
+
     return () => {
-      subscription.unsubscribe();
+      subscription?.unsubscribe();
     };
   }, [router]);
 
@@ -1243,11 +1291,11 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         const emails: CatalogEmailRow[] = await emailsRes.json();
 
         const supplierMeta = new Map(
-          suppliers.map((supplier) => [supplier.name, supplier])
+          suppliers.map((supplier) => [supplierKey(supplier.name, supplier.email_domain), supplier])
         );
 
         const mergedRows: SupplierTableRow[] = items.map((item) => {
-          const meta = supplierMeta.get(item.supplier_name);
+          const meta = supplierMeta.get(supplierKey(item.supplier_name, item.email_domain));
           return {
             ...item,
             email_domain: item.email_domain ?? meta?.email_domain ?? "-",
@@ -1313,7 +1361,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   async function ensureSocket() {
     if (socketRef.current?.readyState === WebSocket.OPEN) return socketRef.current;
 
-    const { data: { session } } = await supabase.auth.getSession();
+    const res = await supabase.auth.getSession();
+    const session = res?.data?.session;
     const token = session?.access_token || "";
     const authenticatedWsUrl = token ? `${wsUrl}?token=${token}` : wsUrl;
 
@@ -1331,6 +1380,10 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       if (payload.type === "error") {
         setIsTypingResponse(false);
         console.error("ProcuraAI query failed", payload.message);
+        setMessages((current) => [
+          ...current,
+          { role: "assistant", text: payload.message || "MediCORE could not complete that query." },
+        ]);
       }
     };
     socketRef.current = socket;
@@ -1445,7 +1498,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
 
   // --- Premium Settings Integration Helpers ---
   async function authFetch(url: string, options: RequestInit = {}) {
-    const { data: { session } } = await supabase.auth.getSession();
+    const res = await supabase.auth.getSession();
+    const session = res?.data?.session;
     const token = session?.access_token;
     const headers = {
       ...options.headers,
@@ -1882,12 +1936,12 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
               <Bell
                 size={18}
                 style={{
-                  color: pendingApprovalsList.length > 0 ? "var(--accent)" : "var(--muted)",
+                  color: notificationCount > 0 ? "var(--accent)" : "var(--muted)",
                   transition: "all 0.3s ease",
-                  animation: pendingApprovalsList.length > 0 ? "pulse-bell 1.5s infinite ease-in-out" : "none"
+                  animation: notificationCount > 0 ? "pulse-bell 1.5s infinite ease-in-out" : "none"
                 }}
               />
-              {pendingApprovalsList.length > 0 && (
+              {notificationCount > 0 && (
                 <span style={{
                   position: "absolute",
                   top: "-4px",
@@ -1926,9 +1980,9 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                 <span style={{ fontSize: "14px", fontWeight: 700, color: "#092f28", display: "flex", alignItems: "center", gap: "6px" }}>
                   <Bell size={16} /> Notifications
                 </span>
-                {pendingApprovalsList.length > 0 && (
+                {notificationCount > 0 && (
                   <span style={{ fontSize: "11px", background: "rgba(255, 90, 90, 0.1)", color: "#ff5a5a", padding: "2px 8px", borderRadius: "10px", fontWeight: 600 }}>
-                    {pendingApprovalsList.length} Pending Approval{pendingApprovalsList.length > 1 ? "s" : ""}
+                    {notificationCount} Notification{notificationCount > 1 ? "s" : ""}
                   </span>
                 )}
               </div>
@@ -1941,7 +1995,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                 flexDirection: "column",
                 gap: "10px"
               }}>
-                {pendingApprovalsList.length === 0 ? (
+                {notificationCount === 0 ? (
                   <div style={{
                     padding: "24px 16px",
                     textAlign: "center",
@@ -1963,10 +2017,40 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                       <CheckCircle2 size={20} />
                     </div>
                     <strong style={{ fontSize: "13px", color: "var(--ink)" }}>All Caught Up!</strong>
-                    <span style={{ fontSize: "12px", color: "var(--muted)" }}>No new supplier permission requests pending.</span>
+                    <span style={{ fontSize: "12px", color: "var(--muted)" }}>No supplier approvals or failed email extractions pending.</span>
                   </div>
                 ) : (
-                  pendingApprovalsList.map((item: any) => (
+                  <>
+                  {failedEmailNotifications.map((email) => (
+                    <div
+                      key={`failed-${email.id}`}
+                      style={{
+                        padding: "12px",
+                        borderRadius: "10px",
+                        background: "rgba(239, 68, 68, 0.06)",
+                        border: "1px solid rgba(239, 68, 68, 0.16)",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "6px",
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "8px" }}>
+                        <span style={{ fontWeight: 700, fontSize: "12.5px", color: "#9b1c1c" }}>
+                          Email failed to process
+                        </span>
+                        <span style={{ fontSize: "10px", color: "var(--muted)", whiteSpace: "nowrap" }}>
+                          {formatRelativeTime(email.received_at)}
+                        </span>
+                      </div>
+                      <span style={{ fontSize: "11.5px", color: "var(--ink)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {email.subject || "(No Subject)"}
+                      </span>
+                      <span style={{ fontSize: "11.5px", color: "#9b1c1c", lineHeight: 1.35 }}>
+                        {email.processing_status.replace(/^failed:\s*/i, "") || "Extraction failed."}
+                      </span>
+                    </div>
+                  ))}
+                  {pendingApprovalsList.map((item: any) => (
                     <div
                       key={item.email_id}
                       style={{
@@ -2043,7 +2127,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                         </button>
                       </div>
                     </div>
-                  ))
+                  ))}
+                  </>
                 )}
               </div>
             </div>
@@ -2214,7 +2299,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                     ) : dashboardData.deals.length === 0 ? (
                       <p className="dashboard-empty">No deal data available.</p>
                     ) : dashboardData.deals.map((deal, index) => (
-                      <article className={`deal-row ${index === 2 ? "warning" : ""}`} key={deal.name}>
+                      <article className={`deal-row ${index === 2 ? "warning" : ""}`} key={`${deal.name}-${supplierKey(deal.best?.supplier_name, deal.best?.email_domain)}`}>
                         <div>
                           <strong>{displayItemName(deal.best)}</strong>
                           <span>{deal.best.supplier_name} - {displayQuantity(deal.best)}</span>
@@ -2587,7 +2672,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                 <>
                   <div className="compare-card-grid">
                     {compareData.topRows.map((row, index) => (
-                      <article className="compare-card" key={`${row.supplier_name}-${row.ingredient_name}`}>
+                      <article className="compare-card" key={`${supplierKey(row.supplier_name, row.email_domain)}-${row.ingredient_name}`}>
                         <div className="compare-supplier-head">
                           <div className="supplier-badge">{supplierInitials(row.supplier_name)}</div>
                           <div>
@@ -2653,7 +2738,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                               <td colSpan={10}>Only top suppliers found for this ingredient.</td>
                             </tr>
                           ) : compareData.rows.map((row, index) => (
-                            <tr key={`${row.supplier_name}-${row.ingredient_name}-table`}>
+                            <tr key={`${supplierKey(row.supplier_name, row.email_domain)}-${row.ingredient_name}-table`}>
                               <td>{index + 1}</td>
                               <td>{row.supplier_name}</td>
                               <td className="two-line-cell">{displayItemName(row)}</td>
@@ -3855,7 +3940,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                     ) : supplierDirectory.length === 0 ? (
                       <tr><td colSpan={7}>No suppliers match your search.</td></tr>
                     ) : supplierDirectory.map((supplier) => (
-                      <tr key={supplier.supplier_name}>
+                      <tr key={supplier.supplier_key}>
                         <td>
                           <div className="supplier-name-cell">
                             <span className="supplier-mini-badge">{supplierInitials(supplier.supplier_name)}</span>

@@ -9,7 +9,8 @@ export default function RootPage() {
   const router = useRouter();
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    supabase.auth.getSession().then((res) => {
+      const session = res?.data?.session;
       if (session?.user) {
         const role = session.user.user_metadata?.role;
         if (role === "admin") {
@@ -20,7 +21,10 @@ export default function RootPage() {
       } else {
         router.replace("/login");
       }
+    }).catch(() => {
+      router.replace("/login");
     });
+
   }, [router]);
 
   return <Loader variant="fullscreen" title="MediCORE" subtitle="Verifying your session..." />;

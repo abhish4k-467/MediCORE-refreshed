@@ -10,11 +10,12 @@ export default function RegisterDonePage() {
   const [role, setRole] = useState<string | null>(null);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    supabase.auth.getSession().then((res) => {
+      const session = res?.data?.session;
       if (session) {
         setRole(session.user?.user_metadata?.role || "employee");
       }
-    });
+    }).catch(() => {});
   }, []);
 
   const isAdmin = role === "admin";

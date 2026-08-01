@@ -30,7 +30,6 @@ create table if not exists catalog_items (
     catalog_email_id uuid not null references catalog_emails(id),
     supplier_id uuid not null references suppliers(id),
     ingredient_name text not null,
-    normalized_name text not null,
     price_per_unit numeric(14,4) not null,
     currency text not null default 'INR',
     available_qty numeric(14,2) not null,
@@ -59,7 +58,7 @@ create table if not exists chat_sessions (
     created_at timestamptz not null default now()
 );
 
-create index if not exists idx_catalog_items_name_qty on catalog_items(normalized_name, available_qty);
+create index if not exists idx_catalog_items_ingredient_qty on catalog_items(ingredient_name, available_qty);
 create index if not exists idx_catalog_items_price on catalog_items(price_per_unit);
 create index if not exists idx_catalog_items_embedding on catalog_items using ivfflat (embedding vector_cosine_ops);
 

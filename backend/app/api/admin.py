@@ -66,7 +66,7 @@ def get_database_stats(db: Session = Depends(get_db), current_user: dict = Depen
     tenant_uuid = UUID(current_user["tenant_id"])
     
     total_suppliers = db.query(Supplier).filter(Supplier.tenant_id == tenant_uuid).distinct().count()
-    total_ingredients = db.query(CatalogItem.normalized_name).filter(CatalogItem.tenant_id == tenant_uuid).distinct().count()
+    total_ingredients = db.query(CatalogItem.ingredient_name).filter(CatalogItem.tenant_id == tenant_uuid).distinct().count()
     
     # simple PgDatabase size fallback if not in postgres
     db_size_mb = 0.0
@@ -272,9 +272,18 @@ def complete_activation(payload: CompleteActivationRequest, db: Session = Depend
 def list_employees(db: Session = Depends(get_db), current_user: dict = Depends(get_current_admin)):
     tenant_uuid = UUID(current_user["tenant_id"])
     
-    # Get all active/disabled profiles of employees
     profiles = db.query(Profile).filter(Profile.tenant_id == tenant_uuid, Profile.role == "employee").all()
-    # Get pending invitations
+    profile_ids = [p.id for p in profiles]
+    account_by_user = {
+        account.user_id: account
+        for account in (
+            db.query(EmailAccount)
+            .filter(EmailAccount.user_id.in_(profile_ids))
+            .all()
+            if profile_ids
+            else []
+        )
+    }
     invitations = db.query(EmployeeInvitation).filter(
         EmployeeInvitation.tenant_id == tenant_uuid,
         EmployeeInvitation.status == "Pending Activation"
@@ -285,7 +294,7 @@ def list_employees(db: Session = Depends(get_db), current_user: dict = Depends(g
     # Render profiles
     for p in profiles:
         # Fetch email account last sync details
-        email_account = db.query(EmailAccount).filter(EmailAccount.user_id == p.id).first()
+        email_account = account_by_user.get(p.id)
         last_sync = "Never"
         connected_email = "Not connected"
         if str(p.id) == current_user["id"]:
@@ -345,10 +354,15 @@ def async_remove_employee_cleanup(user_id: UUID):
         db.close()
 
 
-def async_delete_employee_cleanup(user_id: UUID, email_val: str | None):
+def async_delete_employee_cleanup(user_id: UUID):
     db = SessionLocal()
     try:
         from backend.app.models import EmailAccount, PasswordReset, EmailSyncSetting, EmployeeInvitation
+        email_val = None
+        try:
+            email_val = db.execute(text("SELECT email FROM auth.users WHERE id = :id"), {"id": user_id}).scalar()
+        except Exception as e:
+            logger.warning(f"Could not resolve email from auth.users for user_id {user_id}: {e}")
         if email_val:
             db.query(EmployeeInvitation).filter(EmployeeInvitation.email == email_val).delete(synchronize_session=False)
         db.query(EmailAccount).filter(EmailAccount.user_id == user_id).delete(synchronize_session=False)
@@ -416,19 +430,12 @@ def delete_employee(
     if profile.id == UUID(current_user["id"]):
         raise HTTPException(status_code=400, detail="You cannot delete your own admin account.")
         
-    # Resolve employee email before deleting profile
-    email_val = None
-    try:
-        email_val = db.execute(text("SELECT email FROM auth.users WHERE id = :id"), {"id": user_id}).scalar()
-    except Exception as e:
-        logger.warning(f"Could not resolve email from auth.users for user_id {user_id}: {e}")
-        
     # Delete profile synchronously (fast update)
     db.delete(profile)
     db.commit()
     
     # Run the cascading deletes and invitation clean-ups in background
-    background_tasks.add_task(async_delete_employee_cleanup, user_id, email_val)
+    background_tasks.add_task(async_delete_employee_cleanup, user_id)
     
     return {"message": f"Employee has been permanently deleted."}
 

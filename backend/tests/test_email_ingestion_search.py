@@ -46,7 +46,6 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
             extract_catalog_items=lambda text, reference_date=None: [
                 ExtractedCatalogItem(
                     ingredient_name="Aspirin USP",
-                    normalized_name="aspirin",
                     price_per_unit=9.25,
                     currency="USD",
                     available_qty=7.5,
@@ -64,9 +63,9 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
             reference_date=datetime(2026, 7, 17, tzinfo=UTC),
         )
 
-        names = {row.normalized_name for row in rows}
+        names = {row.ingredient_name.lower() for row in rows}
         self.assertIn("citric acid", names)
-        self.assertIn("aspirin", names)
+        self.assertIn("aspirin usp", names)
 
     def test_parser_keeps_rows_with_na_price_as_incomplete_items(self) -> None:
         rows = parse_catalog_table_text(
@@ -182,7 +181,6 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         service = object.__new__(EmailIngestionService)
         item = ExtractedCatalogItem(
             ingredient_name="Sea Moss Powder",
-            normalized_name="sea moss powder",
             price_per_unit=11.0,
             currency="USD",
             available_qty=446.02,
@@ -199,7 +197,6 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         service = object.__new__(EmailIngestionService)
         item = ExtractedCatalogItem(
             ingredient_name="Biotin",
-            normalized_name="biotin",
             price_per_unit=31.0,
             currency="USD",
             available_qty=125.0,
@@ -225,7 +222,6 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
                 {
                     "supplier_name": "Prince Sikotra",
                     "ingredient_name": "Nicotinamide (Vitamin B3)",
-                    "normalized_name": "nicotinamide (vitamin b3)",
                     "price_per_unit": 10.5,
                     "price_display": "CIF Vancouver $10.50/kg",
                     "currency": "USD",
@@ -258,7 +254,6 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
                 {
                     "supplier_name": "Prince Sikotra",
                     "ingredient_name": "Biotin",
-                    "normalized_name": "biotin",
                     "price_per_unit": 31.0,
                     "price_display": "USD 31/kg (DAP)",
                     "currency": "USD",
@@ -273,7 +268,7 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
 
         serialized_prompt = str(captured["messages"])
         self.assertEqual(answer, "Prince Sikotra has the best available catalogue price for Biotin.")
-        self.assertIn("biotin (U)", serialized_prompt)
+        self.assertIn("Biotin (U)", serialized_prompt)
         self.assertNotIn("99.95", serialized_prompt)
         self.assertNotIn("recommendation_score", serialized_prompt)
 
@@ -284,7 +279,7 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
                 {
                     "supplier_name": "Prince Sikotra",
                     "email_domain": "prisik.da45@gmail.com",
-                    "normalized_name": "biotin",
+                    "ingredient_name": "Biotin",
                     "specification": "",
                     "price_display": "$5/kg",
                     "quantity_display": "125 kg",
@@ -296,7 +291,7 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
                 {
                     "supplier_name": "Prince Sikotra",
                     "email_domain": "prisik.da45@gmail.com",
-                    "normalized_name": "biotin",
+                    "ingredient_name": "Biotin",
                     "specification": "",
                     "price_display": "$31.00/kg",
                     "quantity_display": "125 kg",
@@ -320,7 +315,7 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
                 {
                     "supplier_name": "Prince Sikotra",
                     "email_domain": "prisik.da45@gmail.com",
-                    "normalized_name": "berberine",
+                    "ingredient_name": "Berberine",
                     "specification": "97% Powder",
                     "quantity_display": "5,700 kg",
                     "available_qty": 5700.0,
@@ -329,7 +324,7 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
                 {
                     "supplier_name": "Prince Sikotra",
                     "email_domain": "prisik.da45@gmail.com",
-                    "normalized_name": "berberine",
+                    "ingredient_name": "Berberine",
                     "specification": "Berberine Extract 20:1",
                     "quantity_display": "1,850 kg",
                     "available_qty": 1850.0,
@@ -341,11 +336,34 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
 
         self.assertEqual(len(rows), 2)
 
+    def test_ranker_relevance_returns_all_partial_ingredient_variants(self) -> None:
+        ranker = object.__new__(SupplierRanker)
+        rows = [
+            {"ingredient_name": "Marigold Extract Zeaxanthin 5% Powder (HPLC)", "price_per_unit": 11},
+            {"ingredient_name": "Ginger Extract Powder", "price_per_unit": 8},
+            {"ingredient_name": "Marigold Extract Lutein 20% Oil (HPLC)", "price_per_unit": 10},
+            {"ingredient_name": "Marigold Extract Meso-Zeaxanthin 20% Oil (HPLC)", "price_per_unit": 12},
+        ]
+
+        ranked = ranker._rank_rows_by_relevance(rows, "marigold")
+        matched = [row for row in ranked if ranker._row_relevance_score(row, "marigold") >= 300]
+
+        self.assertEqual(len(matched), 3)
+        self.assertTrue(all("Marigold" in row["ingredient_name"] for row in matched))
+
+    def test_ranker_relevance_ignores_punctuation_for_multi_word_search(self) -> None:
+        ranker = object.__new__(SupplierRanker)
+        row = {"ingredient_name": "Vitamin D3 Powder (Lichen) 100,000 IU/g"}
+
+        self.assertGreater(ranker._row_relevance_score(row, "vitamin d3"), 0)
+        self.assertGreater(ranker._row_relevance_score(row, "Vitamin-D3"), 0)
+        self.assertGreater(ranker._row_relevance_score(row, " vitamin   d3 "), 0)
+
     def test_query_engine_dedupes_rows_after_execution_before_summary(self) -> None:
         engine = object.__new__(NaturalLanguageQueryEngine)
         engine.cache = SimpleNamespace(get=lambda key: None, setex=lambda *args, **kwargs: None)
         engine.llm = SimpleNamespace(
-            plan_query=lambda question: SimpleNamespace(operation="catalog_search", normalized_name="biotin", min_quantity=None, unit=None, limit=10),
+            plan_query=lambda question: SimpleNamespace(operation="catalog_search", ingredient_name="biotin", min_quantity=None, unit=None, limit=10),
             summarize_answer=lambda question, rows: f"{len(rows)} row(s)",
         )
         engine.ranker = object.__new__(SupplierRanker)
@@ -355,7 +373,7 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
             {
                 "supplier_name": "Prince Sikotra",
                 "email_domain": "prisik.da45@gmail.com",
-                "normalized_name": "biotin",
+                "ingredient_name": "Biotin",
                 "specification": "",
                 "price_display": "$5/kg",
                 "quantity_display": "125 kg",
@@ -367,7 +385,7 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
             {
                 "supplier_name": "Prince Sikotra",
                 "email_domain": "prisik.da45@gmail.com",
-                "normalized_name": "biotin",
+                "ingredient_name": "Biotin",
                 "specification": "",
                 "price_display": "$31.00/kg",
                 "quantity_display": "125 kg",
