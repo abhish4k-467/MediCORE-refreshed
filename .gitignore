@@ -34,6 +34,9 @@ skills-lock.json
 MediCORE_CNS_Pharma_Pitch.pptx
 Tarkshy.png
 image
-md
+md/*
+!md/
+!md/dockerize.md
 scratch
 start.py
+backups/
