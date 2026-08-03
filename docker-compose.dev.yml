@@ -64,8 +64,6 @@ services:
       VALKEY_URL: ${VALKEY_URL:-redis://:${VALKEY_PASSWORD:-medicore-local-valkey-password}@valkey:6379/0}
       REDIS_URL: ${VALKEY_URL:-redis://:${VALKEY_PASSWORD:-medicore-local-valkey-password}@valkey:6379/0}
     command:
-      - uv
-      - run
       - celery
       - -A
       - backend.app.tasks
@@ -78,6 +76,18 @@ services:
         condition: service_healthy
       api:
         condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - celery
+        - -A
+        - backend.app.tasks
+        - inspect
+        - ping
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   frontend:
     build:
