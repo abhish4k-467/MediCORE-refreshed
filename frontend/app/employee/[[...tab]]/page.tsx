@@ -87,7 +87,9 @@ type CatalogEmailRow = {
   received_at: string;
   subject: string | null;
   pdf_url: string | null;
+  body_preview?: string | null;
   processing_status: string;
+  item_count?: number;
 };
 
 type SupplierTableRow = SupplierItem & {
@@ -114,9 +116,10 @@ type InboxThread = {
   latest_qty: number;
   latest_unit: string;
   status_label: string;
-  status_tone: "processed" | "pending" | "review" | "failed";
+  status_tone: "processed" | "pending" | "review" | "failed" | "skipped";
   items: SupplierTableRow[];
   pdf_url?: string | null;
+  body_preview?: string | null;
   subject?: string | null;
 };
 
@@ -161,8 +164,30 @@ type EmailSyncSetting = {
   notify_on_new_catalog: boolean;
   ingestion_approach?: string;
   trusted_suppliers?: string;
-  keyword_filters?: string;
   pending_approvals?: string;
+};
+
+type SyncActivityEvent = {
+  id: string;
+  emailId?: string;
+  tone: "info" | "processing" | "success" | "skipped" | "failed";
+  supplier: string;
+  message: string;
+  detail?: string;
+  timestamp: number;
+};
+
+type SyncActivityJob = {
+  id: string;
+  status: "idle" | "running" | "completed" | "failed";
+  startedAt: number;
+  completedAt?: number;
+  accountIds: string[];
+  total: number;
+  processed: number;
+  skipped: number;
+  failed: number;
+  events: SyncActivityEvent[];
 };
 
 
@@ -216,6 +241,144 @@ function formatInboxDate(value: string | null | undefined): string {
 }
 
 const RUPEE_SYMBOL = "₹";
+
+function normalizedProcessingStatus(status: string | null | undefined): string {
+  return String(status || "").trim().toLowerCase();
+}
+
+function inboxStatusTone(status: string | null | undefined, itemCount: number): InboxThread["status_tone"] {
+  const normalized = normalizedProcessingStatus(status);
+  if (normalized.startsWith("failed") || normalized.startsWith("error")) {
+    return "failed";
+  }
+  if (normalized === "partial" || normalized === "partially_processed") {
+    return "review";
+  }
+  if (normalized === "empty" || normalized.startsWith("skipped") || normalized.startsWith("ignored")) {
+    return "skipped";
+  }
+  if (normalized === "completed" || itemCount > 0) {
+    return "processed";
+  }
+  return "pending";
+}
+
+function inboxStatusLabel(status: string | null | undefined, itemCount: number): string {
+  const normalized = normalizedProcessingStatus(status);
+  if (normalized.startsWith("failed") || normalized.startsWith("error")) {
+    return "Failed";
+  }
+  if (normalized === "partial" || normalized === "partially_processed") {
+    return "Partially Processed";
+  }
+  if (normalized === "empty" || normalized.startsWith("skipped") || normalized.startsWith("ignored")) {
+    return "Skipped";
+  }
+  if (normalized === "processing" || normalized === "queued") {
+    return "Processing";
+  }
+  if (normalized === "completed" || itemCount > 0) {
+    return "Processed";
+  }
+  return "Processing";
+}
+
+function syncActivityReason(status: string | null | undefined): string {
+  const raw = String(status || "").trim();
+  const isFailure = /^(failed|error):/i.test(raw);
+  const cleaned = raw
+    .replace(/^(failed|error|skipped|ignored):\s*/i, "")
+    .trim();
+  if (!cleaned || ["failed", "error", "skipped", "ignored", "empty"].includes(cleaned.toLowerCase())) {
+    return "";
+  }
+  if (isFailure) {
+    if (/timeout|timed out/i.test(cleaned)) {
+      return "Processing timed out. Please retry.";
+    }
+    if (/attachment|document|file/i.test(cleaned)) {
+      return "The email attachment could not be processed.";
+    }
+    return "Processing could not be completed for this email.";
+  }
+  if (/traceback|sqlalchemy|psycopg|invalidsql|programmingerror|operationalerror|prepared statement|select\s+|insert\s+|update\s+|ocr|debug|exception/i.test(cleaned)) {
+    return "Processing could not be completed for this email.";
+  }
+  return cleaned.length > 120 ? `${cleaned.slice(0, 117)}...` : cleaned;
+}
+
+function trustedSupplierMatches(sender: unknown, trustedSuppliers: string | null | undefined): boolean {
+  const rawSender = String(sender || "").trim().toLowerCase();
+  const address = rawSender.match(/<([^>]+)>/)?.[1]?.trim() || rawSender;
+  const domain = address.includes("@") ? address.split("@").pop() || address : address;
+  const terms = String(trustedSuppliers || "")
+    .split(",")
+    .map((term) => term.trim().toLowerCase())
+    .filter(Boolean);
+  return terms.includes(address) || terms.includes(domain);
+}
+
+function syncEmailSignature(email: CatalogEmailRow): string {
+  return `${normalizedProcessingStatus(email.processing_status)}|${Number(email.item_count || 0)}`;
+}
+
+function syncEventFromEmail(email: CatalogEmailRow, observedAt?: number): SyncActivityEvent {
+  const itemCount = Number(email.item_count || 0);
+  const status = normalizedProcessingStatus(email.processing_status);
+  const supplier = email.supplier_name || email.email_domain || "Supplier";
+  const receivedTimestamp = new Date(email.received_at || Date.now()).getTime();
+  const timestamp = observedAt ?? (receivedTimestamp || Date.now());
+  if (status.startsWith("failed") || status.startsWith("error")) {
+    return {
+      id: `email-${email.id}`,
+      emailId: email.id,
+      tone: "failed",
+      supplier,
+      message: "Processing failed",
+      detail: syncActivityReason(email.processing_status) || "Review the email attachment and retry sync.",
+      timestamp,
+    };
+  }
+  if (status === "empty" || status.startsWith("skipped") || status.startsWith("ignored")) {
+    const reason = syncActivityReason(email.processing_status);
+    return {
+      id: `email-${email.id}`,
+      emailId: email.id,
+      tone: "skipped",
+      supplier,
+      message: reason && /promo|newsletter|marketing/i.test(reason) ? "Promotional email skipped" : "Email skipped",
+      detail: reason || "No procurement catalogue data was detected.",
+      timestamp,
+    };
+  }
+  if (status === "completed" || status === "partial" || itemCount > 0) {
+    return {
+      id: `email-${email.id}`,
+      emailId: email.id,
+      tone: status === "partial" ? "skipped" : "success",
+      supplier,
+      message: itemCount > 0 ? `${itemCount} item${itemCount === 1 ? "" : "s"} extracted` : "Processed",
+      detail: status === "partial" ? "Some fields or attachments need review." : undefined,
+      timestamp,
+    };
+  }
+  return {
+    id: `email-${email.id}`,
+    emailId: email.id,
+    tone: "processing",
+    supplier,
+    message: itemCount > 0 ? "Updating catalogue..." : "Processing catalogue...",
+    timestamp,
+  };
+}
+
+function isProcurementCatalogEmail(email: CatalogEmailRow): boolean {
+  const status = normalizedProcessingStatus(email.processing_status);
+  const hasUsableItems = Number(email.item_count || 0) > 0;
+  const isSuccessfulProcurementStatus =
+    status === "completed" || status === "partial" || status === "partially_processed";
+  return isSuccessfulProcurementStatus && hasUsableItems;
+}
 
 function getBasePrice(price: number, currency: string): number {
   const curr = (currency || "INR").toUpperCase();
@@ -305,6 +468,20 @@ function displayItemName(item: Pick<SupplierItem, "ingredient_name" | "is_update
   const rawName = (item as any).ingredient_name;
   const name = displayText(rawName);
   return name !== "-" && (item as any).is_updated ? `${name} (U)` : name;
+}
+
+function renderItemName(item: Pick<SupplierItem, "ingredient_name" | "is_updated"> | Record<string, unknown>) {
+  const rawName = (item as any).ingredient_name;
+  const name = displayText(rawName);
+  if (name === "-") return name;
+  return (
+    <span className="item-name-with-badge">
+      <span>{name}</span>
+      {(item as any).is_updated ? (
+        <span className="updated-item-marker" title="Updated from latest supplier communication.">(U)</span>
+      ) : null}
+    </span>
+  );
 }
 
 function canonicalSearchText(value: unknown): string {
@@ -563,6 +740,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const [isSyncingEmails, setIsSyncingEmails] = useState(false);
   const [syncSuccess, setSyncSuccess] = useState(false);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
+  const [syncActivityJob, setSyncActivityJob] = useState<SyncActivityJob | null>(null);
 
   useEffect(() => {
     if (!syncNotice) return;
@@ -573,19 +751,29 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   async function handleSyncRealtimeEmails() {
     setIsSyncingEmails(true);
     setSyncSuccess(false);
+    const startedAt = Date.now();
+    syncEmailBaselineRef.current = new Map(
+      catalogEmails.map((email) => [email.id, syncEmailSignature(email)])
+    );
+    syncEmailObservedRef.current = new Map();
+    setUserMenuOpen(true);
+    setSyncActivityJob({
+      id: `sync-${startedAt}`,
+      status: "running",
+      startedAt,
+      accountIds: [],
+      total: 0,
+      processed: 0,
+      skipped: 0,
+      failed: 0,
+      events: [],
+    });
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 10000);
+    const timeout = window.setTimeout(() => controller.abort(), 30000);
     try {
-      const res = await supabase.auth.getSession();
-      const session = res?.data?.session;
-      if (!session) return;
-      
-      const response = await fetch(`${apiBaseUrl}/api/ingestion/poll-now-sync-user`, {
+      const response = await authFetch(`${apiBaseUrl}/api/ingestion/poll-now-sync-user`, {
         method: "POST",
         signal: controller.signal,
-        headers: {
-          Authorization: `Bearer ${session.access_token}`,
-        },
       });
       if (response.ok) {
         const result = await response.json().catch(() => null);
@@ -594,14 +782,39 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         const pending = Number(result?.pending_approvals || 0);
         const queuedAccounts = Number(result?.queued_accounts || 0);
         const failedAccounts = Number(result?.failed_accounts || 0);
-        const candidates = Number(result?.candidate_messages || 0);
         const newCandidates = Number(result?.new_candidate_messages || 0);
+        const accountIds: string[] = Array.from(new Set<string>(
+          (Array.isArray(result?.previews) ? result.previews : [])
+            .map((preview: { account_id?: unknown }) => String(preview?.account_id || ""))
+            .filter(Boolean)
+        ));
+        const apiEvents: SyncActivityEvent[] = [];
+        if (failedAccounts > 0) {
+          apiEvents.push({
+            id: `sync-${startedAt}-queue-failed`,
+            tone: "failed",
+            supplier: "Sync Queue",
+            message: `${failedAccounts} mailbox sync${failedAccounts === 1 ? "" : "s"} could not be queued`,
+            detail: result?.queue_errors?.[0]?.message || "Email worker is unavailable.",
+            timestamp: Date.now() + 2,
+          });
+        }
+        setSyncActivityJob((current) => current ? {
+          ...current,
+          accountIds,
+          total: newCandidates,
+          events: [...current.events, ...apiEvents].slice(-100),
+          status: result?.status === "error" ? "failed" : newCandidates === 0 ? "completed" : current.status,
+          completedAt: result?.status === "error" || newCandidates === 0 ? Date.now() : current.completedAt,
+        } : current);
         if (result?.status === "queued") {
           setSyncNotice(queuedAccounts > 0
-            ? `Found ${newCandidates} new of ${candidates} candidate email${candidates === 1 ? "" : "s"}; queued ${queuedAccounts} inbox sync${queuedAccounts === 1 ? "" : "s"}${failedAccounts ? ` (${failedAccounts} failed to queue)` : ""}.`
+            ? newCandidates > 0
+              ? `${newCandidates} supplier email${newCandidates === 1 ? "" : "s"} queued for processing.`
+              : "No new supplier emails require processing."
             : "No connected email accounts found.");
           window.setTimeout(() => {
-            refreshWorkspaceData().catch((err) => console.error("Delayed workspace refresh failed", err));
+            fetchSyncActivitySnapshot().catch((err) => console.error("Delayed inbox refresh failed", err));
           }, 2500);
         } else if (result?.status === "error") {
           setSyncNotice(result?.queue_errors?.[0]?.message || "Could not queue email sync. Check the Celery worker and Redis connection.");
@@ -617,12 +830,49 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         const errorPayload = await response.json().catch(() => null);
         console.error("Email sync failed", response.status, errorPayload);
         setSyncNotice(errorPayload?.detail || "Email sync failed. Check connected inbox settings and try again.");
+        setSyncActivityJob((current) => current ? {
+          ...current,
+          status: "failed",
+          failed: Math.max(current.failed, 1),
+          completedAt: Date.now(),
+          events: [
+            ...current.events,
+            {
+              id: `sync-${startedAt}-request-failed`,
+              tone: "failed",
+              supplier: "Sync Failed",
+              message: "Unable to start email processing",
+              detail: errorPayload?.detail || "Check connected inbox settings and try again.",
+              timestamp: Date.now(),
+            } satisfies SyncActivityEvent,
+          ].slice(-100),
+        } : current);
       }
     } catch (err) {
       console.error(err);
+      showConnectionFailure(err instanceof DOMException && err.name === "AbortError"
+        ? "Email sync request timed out before MediCORE responded. Please retry when the connection is stable."
+        : "Unable to communicate with MediCORE. Please check your internet connection and try again.");
       setSyncNotice(err instanceof DOMException && err.name === "AbortError"
         ? "Email sync request timed out. Check worker status and try again."
         : "Email sync failed. Check connected inbox settings and try again.");
+        setSyncActivityJob((current) => current ? {
+          ...current,
+          status: "failed",
+          failed: Math.max(current.failed, 1),
+          completedAt: Date.now(),
+          events: [
+            ...current.events,
+          {
+            id: `sync-${startedAt}-connection-failed`,
+            tone: "failed",
+            supplier: "Connection Failed",
+            message: "Unable to communicate with MediCORE",
+            detail: "Please check your internet connection and try again.",
+            timestamp: Date.now(),
+          } satisfies SyncActivityEvent,
+        ].slice(-100),
+      } : current);
     } finally {
       window.clearTimeout(timeout);
       setIsSyncingEmails(false);
@@ -643,7 +893,9 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const [catalogEmails, setCatalogEmails] = useState<CatalogEmailRow[]>([]);
   const [supplierMetaRows, setSupplierMetaRows] = useState<SupplierApiRow[]>([]);
   const [supplierLoading, setSupplierLoading] = useState(true);
+  const [isRefreshingInbox, setIsRefreshingInbox] = useState(false);
   const [supplierError, setSupplierError] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const [selectedInboxSupplier, setSelectedInboxSupplier] = useState("");
   const [selectedCatalogSupplier, setSelectedCatalogSupplier] = useState("");
   const [selectedCatalogEmailId, setSelectedCatalogEmailId] = useState<string | null>(null);
@@ -664,6 +916,9 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [dataRefreshKey, setDataRefreshKey] = useState(0);
   const [selectedInboxThreadId, setSelectedInboxThreadId] = useState<string | null>(null);
+  const [inboxItemsByEmail, setInboxItemsByEmail] = useState<Record<string, SupplierTableRow[]>>({});
+  const [inboxItemsLoadingId, setInboxItemsLoadingId] = useState<string | null>(null);
+  const [inboxItemsErrorId, setInboxItemsErrorId] = useState<string | null>(null);
   const [latestSeenEmailId, setLatestSeenEmailId] = useState<string | null>(null);
   const [visibleGuides, setVisibleGuides] = useState<Record<string, boolean>>({});
 
@@ -685,7 +940,6 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   // Local states for settings inputs
   const [localApproach, setLocalApproach] = useState<string>("approach_1");
   const [localTrusted, setLocalTrusted] = useState<string>("");
-  const [localKeywords, setLocalKeywords] = useState<string>("catalog, catalogue, price, offer, quote");
   const [localPollInterval, setLocalPollInterval] = useState<number>(15);
 
   // Profile edit states
@@ -700,6 +954,11 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const streamIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const chatMessagesEndRef = useRef<HTMLDivElement | null>(null);
   const supplierCountryFilterRef = useRef<HTMLDivElement | null>(null);
+  const syncActivityListRef = useRef<HTMLDivElement | null>(null);
+  const dataLoadInFlightRef = useRef(false);
+  const completedSyncRefreshRef = useRef<string | null>(null);
+  const syncEmailBaselineRef = useRef<Map<string, string>>(new Map());
+  const syncEmailObservedRef = useRef<Map<string, string>>(new Map());
 
   // Initial load tracking ref
   const initialLoadRef = useRef(false);
@@ -708,7 +967,6 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     if (syncSettings) {
       setLocalApproach(syncSettings.ingestion_approach || "approach_1");
       setLocalTrusted(syncSettings.trusted_suppliers || "");
-      setLocalKeywords(syncSettings.keyword_filters || "catalog, catalogue, price, offer, quote");
       setLocalPollInterval(syncSettings.poll_interval_minutes || 15);
     }
   }, [syncSettings]);
@@ -716,17 +974,48 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const pendingApprovalsList = useMemo(() => {
     try {
       const approvals = JSON.parse(syncSettings.pending_approvals || "[]");
-      return Array.isArray(approvals) ? approvals.filter((item: any) => !item?.ignored) : [];
+      return Array.isArray(approvals)
+        ? approvals.filter(
+            (item: any) => !item?.ignored && !trustedSupplierMatches(item?.sender, syncSettings.trusted_suppliers)
+          )
+        : [];
     } catch (e) {
       return [];
     }
-  }, [syncSettings.pending_approvals]);
+  }, [syncSettings.pending_approvals, syncSettings.trusted_suppliers]);
 
   const failedEmailNotifications = useMemo(() => {
     return catalogEmails.filter((email) => String(email.processing_status || "").startsWith("failed"));
   }, [catalogEmails]);
 
   const notificationCount = pendingApprovalsList.length + failedEmailNotifications.length;
+  const syncActivityVisibleEvents = useMemo(() => {
+    if (!syncActivityJob) return [];
+    const events = [...syncActivityJob.events].sort((left, right) => left.timestamp - right.timestamp);
+    if (syncActivityJob.status === "running") {
+      return events.slice(-80);
+    }
+    return events.length > 16 ? events.slice(0, 4).concat(events.slice(-12)) : events;
+  }, [syncActivityJob]);
+  const syncActivityHasCollapsedEvents = Boolean(syncActivityJob && syncActivityJob.events.length > syncActivityVisibleEvents.length);
+  const syncActivityElapsedSeconds = syncActivityJob
+    ? Math.max(1, Math.round(((syncActivityJob.completedAt || Date.now()) - syncActivityJob.startedAt) / 1000))
+    : 0;
+  const syncActivityTotal = syncActivityJob?.total || 0;
+  const syncActivityDone = syncActivityJob ? syncActivityJob.processed + syncActivityJob.skipped + syncActivityJob.failed : 0;
+  const syncActivityRemaining = Math.max(0, syncActivityTotal - syncActivityDone);
+  const syncActivityProgress = syncActivityTotal > 0
+    ? Math.min(100, Math.round((syncActivityDone / syncActivityTotal) * 100))
+    : syncActivityJob?.status === "completed" ? 100 : 0;
+  const syncActivityActiveEvent = [...syncActivityVisibleEvents].reverse().find((event) => event.tone === "processing") || null;
+  const syncActivityCompletedEvents = syncActivityVisibleEvents.filter((event) => event.tone === "success");
+  const syncActivitySkippedEvents = syncActivityVisibleEvents.filter((event) => event.tone === "skipped");
+  const syncActivityFailedEvents = syncActivityVisibleEvents.filter((event) => event.tone === "failed");
+
+  useEffect(() => {
+    if (!syncActivityListRef.current) return;
+    syncActivityListRef.current.scrollTop = syncActivityListRef.current.scrollHeight;
+  }, [syncActivityVisibleEvents.length, syncActivityJob?.status]);
 
   // Click outside detection to close the notifications menu
   useEffect(() => {
@@ -798,27 +1087,19 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     }
 
     return catalogEmails.map((email) => {
-      const items = itemsByEmail.get(email.id) ?? [];
+      const items = inboxItemsByEmail[email.id] ?? itemsByEmail.get(email.id) ?? [];
       const sortedItems = [...items].sort((left, right) => displayItemName(left).localeCompare(displayItemName(right)));
       const meta = supplierMeta.get(supplierKey(email.supplier_name, email.email_domain));
       const bestItem = sortedItems[0];
-      const hasExtractedItems = sortedItems.length > 0;
-
-      const statusTone: InboxThread["status_tone"] = hasExtractedItems 
-        ? "processed" 
-        : (email.processing_status && email.processing_status.startsWith("failed")) ? "failed" : "pending";
-
-      const statusLabel = hasExtractedItems
-        ? "Processed"
-        : (email.processing_status && email.processing_status.startsWith("failed"))
-          ? `Failed: ${email.processing_status.replace("failed:", "").trim()}`
-          : email.processing_status === "completed" ? "Stored" : "Extracting";
+      const itemCount = sortedItems.length || Number(email.item_count || 0);
+      const statusTone = inboxStatusTone(email.processing_status, itemCount);
+      const statusLabel = inboxStatusLabel(email.processing_status, itemCount);
 
       return {
         id: email.id,
         supplier_name: email.supplier_name,
         email_domain: items[0]?.email_domain ?? meta?.email_domain ?? "-",
-        item_count: items.length,
+        item_count: itemCount,
         latest_item: email.subject || bestItem?.ingredient_name || "Email stored, extraction pending",
         received_at: email.received_at,
         latest_price: bestItem?.price_per_unit ?? 0,
@@ -829,6 +1110,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         status_tone: statusTone,
         items: sortedItems,
         pdf_url: email.pdf_url,
+        body_preview: email.body_preview,
         subject: email.subject
       };
     }).sort((left, right) => {
@@ -836,7 +1118,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       const rightTime = new Date(right.received_at ?? 0).getTime();
       return rightTime - leftTime;
     });
-  }, [catalogEmails, supplierMetaRows, supplierRows]);
+  }, [catalogEmails, inboxItemsByEmail, supplierMetaRows, supplierRows]);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -896,7 +1178,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const latestSupplierRows = useMemo(() => {
     const map = new Map<string, SupplierTableRow>();
     for (const row of supplierRows) {
-      const key = `${supplierKey(row.supplier_name, row.email_domain)}-${row.ingredient_name}-${row.specification || ""}-${row.available_qty ?? ""}-${row.unit ?? ""}-${row.moq ?? ""}`;
+      const key = `${supplierKey(row.supplier_name, row.email_domain)}-${row.ingredient_name}-${row.specification || ""}`;
       const existing = map.get(key);
       if (!existing || new Date(row.received_at ?? 0).getTime() > new Date(existing.received_at ?? 0).getTime()) {
         map.set(key, row);
@@ -952,6 +1234,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     const supplierMap = new Map<string, SupplierTableRow[]>();
     const emailBySupplier = new Map<string, CatalogEmailRow[]>();
     const supplierMeta = new Map(supplierMetaRows.map((supplier) => [supplierKey(supplier.name, supplier.email_domain), supplier]));
+    const procurementEmails = catalogEmails.filter(isProcurementCatalogEmail);
 
     for (const row of supplierRows) {
       const key = supplierKey(row.supplier_name, row.email_domain);
@@ -960,7 +1243,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       supplierMap.set(key, current);
     }
 
-    for (const email of catalogEmails) {
+    for (const email of procurementEmails) {
       const key = supplierKey(email.supplier_name, email.email_domain);
       const current = emailBySupplier.get(key) ?? [];
       current.push(email);
@@ -1394,6 +1677,50 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   }, [inboxThreads, selectedInboxThreadId]);
 
   useEffect(() => {
+    if (
+      !authUser
+      || activeTab !== "inbox"
+      || !selectedInboxThreadId
+      || inboxItemsByEmail[selectedInboxThreadId]
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    const emailId = selectedInboxThreadId;
+    setInboxItemsLoadingId(emailId);
+    setInboxItemsErrorId(null);
+
+    authFetch(
+      `${apiBaseUrl}/api/catalogs/items?limit=100&latest_only=false&catalog_email_id=${encodeURIComponent(emailId)}`
+    )
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error("Unable to load extracted items.");
+        }
+        const items: SupplierTableRow[] = await response.json();
+        if (!cancelled) {
+          setInboxItemsByEmail((current) => ({ ...current, [emailId]: items }));
+        }
+      })
+      .catch((error) => {
+        console.error("Inbox item detail refresh failed", error);
+        if (!cancelled) {
+          setInboxItemsErrorId(emailId);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setInboxItemsLoadingId((current) => current === emailId ? null : current);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, apiBaseUrl, authUser, inboxItemsByEmail, selectedInboxThreadId]);
+
+  useEffect(() => {
     if (sidebarCollapsed) {
       document.body.classList.add("sidebar-collapsed");
     } else {
@@ -1409,6 +1736,10 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         setSupplierLoading(false);
         return;
       }
+      if (dataLoadInFlightRef.current) {
+        return;
+      }
+      dataLoadInFlightRef.current = true;
 
       if (!initialLoadRef.current) {
         setSupplierLoading(true);
@@ -1418,8 +1749,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       try {
         const [suppliersRes, itemsRes, emailsRes] = await Promise.all([
           authFetch(`${apiBaseUrl}/api/suppliers`),
-          authFetch(`${apiBaseUrl}/api/catalogs/items?limit=5000&latest_only=true`),
-          authFetch(`${apiBaseUrl}/api/catalogs/emails?limit=50`),
+          authFetch(`${apiBaseUrl}/api/catalogs/items?limit=100&latest_only=true`),
+          authFetch(`${apiBaseUrl}/api/catalogs/emails?limit=100`),
         ]);
 
         if (!emailsRes.ok) {
@@ -1457,6 +1788,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
           setSupplierError(error instanceof Error ? error.message : "Unable to load supplier table.");
           setSupplierLoading(false);
         }
+      } finally {
+        dataLoadInFlightRef.current = false;
       }
     }
 
@@ -1468,15 +1801,20 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   }, [apiBaseUrl, authUser, dataRefreshKey]);
 
   useEffect(() => {
-    if (!authUser) return;
+    if (!authUser || syncActivityJob?.status !== "running") return;
     const intervalId = window.setInterval(() => {
       if (document.visibilityState !== "visible") return;
-      setDataRefreshKey((current) => current + 1);
-      fetchEmailSyncSettings();
-      fetchConnectedAccounts();
-    }, 300000);
+      fetchSyncActivitySnapshot().catch((err) => console.error("Inbox sync activity refresh failed", err));
+    }, 5000);
     return () => window.clearInterval(intervalId);
-  }, [authUser, apiBaseUrl]);
+  }, [authUser, syncActivityJob?.status]);
+
+  useEffect(() => {
+    if (!syncActivityJob || syncActivityJob.status !== "completed") return;
+    if (completedSyncRefreshRef.current === syncActivityJob.id) return;
+    completedSyncRefreshRef.current = syncActivityJob.id;
+    refreshWorkspaceData().catch((err) => console.error("Post-sync workspace refresh failed", err));
+  }, [syncActivityJob?.id, syncActivityJob?.status]);
 
   useEffect(() => {
     if (authUser?.name) {
@@ -1527,6 +1865,19 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         ]);
       }
     };
+    socket.onclose = () => {
+      if (socketRef.current === socket) {
+        socketRef.current = null;
+      }
+      setIsTypingResponse(false);
+    };
+    socket.onerror = () => {
+      if (socketRef.current === socket) {
+        socketRef.current = null;
+      }
+      setIsTypingResponse(false);
+      showConnectionFailure("The MediCORE assistant connection was interrupted. Please retry when the connection is stable.");
+    };
     socketRef.current = socket;
     return socket;
   }
@@ -1541,11 +1892,17 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     // Trigger typing response indicator
     setIsTypingResponse(true);
     
-    const socket = await ensureSocket();
-    if (socket.readyState === WebSocket.OPEN) {
-      socket.send(trimmed);
-    } else {
-      socket.onopen = () => socket.send(trimmed);
+    try {
+      const socket = await ensureSocket();
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(trimmed);
+      } else {
+        socket.onopen = () => socket.send(trimmed);
+      }
+    } catch (error) {
+      console.error("Assistant connection failed", error);
+      setIsTypingResponse(false);
+      showConnectionFailure("The MediCORE assistant connection failed. Please check your connection and try again.");
     }
   }
 
@@ -1638,23 +1995,139 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   }
 
   // --- Premium Settings Integration Helpers ---
+  function showConnectionFailure(message = "Unable to communicate with MediCORE. Please check your internet connection and try again.") {
+    setConnectionError(message);
+  }
+
   async function authFetch(url: string, options: RequestInit = {}) {
-    const res = await supabase.auth.getSession();
-    const session = res?.data?.session;
-    const token = session?.access_token;
-    const headers = {
-      ...options.headers,
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    };
-    return fetch(url, { ...options, headers });
+    try {
+      const res = await supabase.auth.getSession();
+      const session = res?.data?.session;
+      const token = session?.access_token;
+      const headers = {
+        ...options.headers,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      };
+      return await fetch(url, { ...options, headers });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        showConnectionFailure("The request timed out before MediCORE responded. Please retry when the connection is stable.");
+      } else {
+        showConnectionFailure();
+      }
+      throw error;
+    }
   }
 
   async function refreshWorkspaceData() {
+    setInboxItemsByEmail({});
+    setInboxItemsErrorId(null);
     setDataRefreshKey((current) => current + 1);
     await Promise.allSettled([
       fetchConnectedAccounts(),
       fetchEmailSyncSettings(),
     ]);
+  }
+
+  async function fetchSyncActivitySnapshot() {
+    const [emailsRes, accountsRes] = await Promise.all([
+      authFetch(`${apiBaseUrl}/api/catalogs/emails?limit=100`),
+      authFetch(`${apiBaseUrl}/api/email-accounts`),
+    ]);
+    const emails: CatalogEmailRow[] = emailsRes.ok ? await emailsRes.json() : [];
+    const accounts: ConnectedEmailAccount[] = accountsRes.ok ? await accountsRes.json() : [];
+
+    if (emailsRes.ok) {
+      setCatalogEmails(emails);
+    }
+    if (accountsRes.ok) {
+      setConnectedAccounts(accounts);
+    }
+
+    const observedAt = Date.now();
+    const changedEvents: SyncActivityEvent[] = [];
+    for (const [index, email] of emails.entries()) {
+      const signature = syncEmailSignature(email);
+      const baseline = syncEmailBaselineRef.current.get(email.id);
+      const lastObserved = syncEmailObservedRef.current.get(email.id);
+      if ((baseline === undefined || baseline !== signature) && lastObserved !== signature) {
+        changedEvents.push(syncEventFromEmail(email, observedAt + index));
+        syncEmailObservedRef.current.set(email.id, signature);
+      }
+    }
+
+    setSyncActivityJob((current) => {
+      if (!current || current.status !== "running") return current;
+
+      const eventsById = new Map(current.events.map((event) => [event.id, event]));
+      for (const event of changedEvents) {
+        eventsById.set(event.id, event);
+      }
+
+      const trackedAccounts = current.accountIds
+        .map((accountId) => accounts.find((account) => account.id === accountId))
+        .filter((account): account is ConnectedEmailAccount => Boolean(account));
+      const accountSnapshotComplete = current.accountIds.length > 0
+        && trackedAccounts.length === current.accountIds.length;
+      const accountsSettled = accountSnapshotComplete
+        && trackedAccounts.every((account) => !["pending", "processing", "queued"].includes(
+          normalizedProcessingStatus(account.sync_status)
+        ));
+
+      if (accountsSettled) {
+        for (const [index, email] of emails.entries()) {
+          const baselineStatus = String(syncEmailBaselineRef.current.get(email.id) || "").split("|", 1)[0];
+          const wasRetryable = ["failed", "error", "partial", "partially_processed"].some(
+            (status) => baselineStatus.startsWith(status)
+          );
+          if (wasRetryable && !eventsById.has(`email-${email.id}`)) {
+            eventsById.set(`email-${email.id}`, syncEventFromEmail(email, observedAt + index));
+          }
+        }
+      }
+
+      for (const account of trackedAccounts.filter((item) => normalizedProcessingStatus(item.sync_status) === "error")) {
+        eventsById.set(`account-${account.id}`, {
+          id: `account-${account.id}`,
+          tone: "failed",
+          supplier: account.email_address,
+          message: "Mailbox sync failed",
+          detail: syncActivityReason(account.sync_error_msg) || "The mailbox could not be processed.",
+          timestamp: observedAt,
+        });
+      }
+
+      const events = Array.from(eventsById.values())
+        .sort((left, right) => left.timestamp - right.timestamp)
+        .slice(-100);
+      const emailEvents = events.filter((event) => event.emailId);
+      const processed = emailEvents.filter((event) => event.tone === "success").length;
+      const skipped = emailEvents.filter((event) => event.tone === "skipped").length;
+      const failed = emailEvents.filter((event) => event.tone === "failed").length;
+      const terminalCount = processed + skipped + failed;
+      const allAccountsFailed = trackedAccounts.length > 0
+        && trackedAccounts.every((account) => normalizedProcessingStatus(account.sync_status) === "error");
+
+      return {
+        ...current,
+        status: accountsSettled ? (allAccountsFailed ? "failed" : "completed") : current.status,
+        completedAt: accountsSettled ? observedAt : current.completedAt,
+        total: accountsSettled ? terminalCount : current.total,
+        processed,
+        skipped,
+        failed,
+        events,
+      };
+    });
+  }
+
+  async function refreshInboxNow() {
+    setIsRefreshingInbox(true);
+    try {
+      await refreshWorkspaceData();
+    } finally {
+      setIsRefreshingInbox(false);
+    }
   }
 
   async function fetchConnectedAccounts() {
@@ -1699,7 +2172,6 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
           notify_on_new_catalog: Boolean(merged.notify_on_new_catalog),
           ingestion_approach: String(merged.ingestion_approach || "approach_2"),
           trusted_suppliers: String(merged.trusted_suppliers || ""),
-          keyword_filters: String(merged.keyword_filters || "catalog, catalogue, price, offer, quote"),
           pending_approvals: String(merged.pending_approvals || ""),
         }),
       });
@@ -2128,6 +2600,97 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                 )}
               </div>
 
+              {syncActivityJob && (
+                <section className={`sync-activity-card ${syncActivityJob.status}`}>
+                  <div className="sync-activity-head">
+                    <div>
+                      <strong>Email Sync</strong>
+                      <span>
+                        {syncActivityTotal > 0
+                          ? `${syncActivityJob.status === "completed" ? "Processed" : "Processing"} ${syncActivityTotal} supplier email${syncActivityTotal === 1 ? "" : "s"}`
+                          : syncActivityJob.status === "completed" ? "No new supplier emails found" : "Checking supplier emails"}
+                      </span>
+                    </div>
+                    <span className="sync-activity-percent">{syncActivityProgress}%</span>
+                  </div>
+                  <div className="sync-activity-progress">
+                    <span style={{ width: `${syncActivityProgress}%` }} />
+                  </div>
+                  <div className="sync-activity-stats">
+                    <span className="success">Processed: {syncActivityJob.processed}</span>
+                    <span className="skipped">Skipped: {syncActivityJob.skipped}</span>
+                    <span className="failed">Failed: {syncActivityJob.failed}</span>
+                    <span>Remaining: {syncActivityRemaining}</span>
+                    <span>Time: {syncActivityElapsedSeconds}s</span>
+                  </div>
+                  {syncActivityHasCollapsedEvents && (
+                    <div className="sync-activity-collapsed">
+                      Older completed events collapsed to keep this feed readable.
+                    </div>
+                  )}
+                  <div className="sync-activity-list" ref={syncActivityListRef}>
+                    {syncActivityActiveEvent && (
+                      <div className="sync-activity-section">
+                        <h4>Currently Processing</h4>
+                        <div className="sync-activity-event processing">
+                          <span className="sync-activity-icon"><Loader2 size={14} /></span>
+                          <div>
+                            <p><strong>{syncActivityActiveEvent.supplier}</strong><span>{syncActivityActiveEvent.message}</span></p>
+                            {syncActivityActiveEvent.detail && <small>{syncActivityActiveEvent.detail}</small>}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    {syncActivityCompletedEvents.length > 0 && (
+                      <div className="sync-activity-section">
+                        <h4>Completed</h4>
+                        {syncActivityCompletedEvents.map((event) => (
+                          <div className="sync-activity-event success" key={event.id}>
+                            <span className="sync-activity-icon"><CheckCircle2 size={14} /></span>
+                            <div>
+                              <p><strong>{event.supplier}</strong><span>{event.message}</span></p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {syncActivitySkippedEvents.length > 0 && (
+                      <div className="sync-activity-section">
+                        <h4>Skipped</h4>
+                        {syncActivitySkippedEvents.map((event) => (
+                          <div className="sync-activity-event skipped" key={event.id}>
+                            <span className="sync-activity-icon"><Info size={14} /></span>
+                            <div>
+                              <p><strong>{event.supplier}</strong><span>{event.message}</span></p>
+                              {event.detail && <small>{event.detail}</small>}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {syncActivityFailedEvents.length > 0 && (
+                      <div className="sync-activity-section">
+                        <h4>Failed</h4>
+                        {syncActivityFailedEvents.map((event) => (
+                          <div className="sync-activity-event failed" key={event.id}>
+                            <span className="sync-activity-icon"><XCircle size={14} /></span>
+                            <div>
+                              <p><strong>{event.supplier}</strong><span>{event.message}</span></p>
+                              {event.detail && <small>{event.detail}</small>}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {!syncActivityActiveEvent && syncActivityVisibleEvents.length === 0 && syncActivityJob.status === "completed" && (
+                      <div className="sync-activity-empty">
+                        No supplier emails required processing.
+                      </div>
+                    )}
+                  </div>
+                </section>
+              )}
+
               {/* Notifications List Container */}
               <div style={{
                 maxHeight: "280px",
@@ -2184,10 +2747,10 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                         </span>
                       </div>
                       <span style={{ fontSize: "11.5px", color: "var(--ink)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {email.subject || "(No Subject)"}
+                        {email.supplier_name || "Supplier email"}
                       </span>
                       <span style={{ fontSize: "11.5px", color: "#9b1c1c", lineHeight: 1.35 }}>
-                        {email.processing_status.replace(/^failed:\s*/i, "") || "Extraction failed."}
+                        {syncActivityReason(email.processing_status) || "Processing could not be completed for this email."}
                       </span>
                     </div>
                   ))}
@@ -2442,7 +3005,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                     ) : dashboardData.deals.map((deal, index) => (
                       <article className={`deal-row ${index === 2 ? "warning" : ""}`} key={`${deal.name}-${supplierKey(deal.best?.supplier_name, deal.best?.email_domain)}`}>
                         <div>
-                          <strong>{displayItemName(deal.best)}</strong>
+                          <strong>{renderItemName(deal.best)}</strong>
                           <span>{deal.best.supplier_name} - {displayQuantity(deal.best)}</span>
                         </div>
                         <div className="deal-price">
@@ -2465,7 +3028,30 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                     <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                       <h2>Inbox</h2>
                     </div>
-                    <span className="inbox-count">{inboxThreads.length}</span>
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      <span className="inbox-count">{inboxThreads.length}</span>
+                      <button
+                        type="button"
+                        onClick={refreshInboxNow}
+                        disabled={isRefreshingInbox || supplierLoading}
+                        className={`inbox-refresh-button ${isRefreshingInbox || supplierLoading ? "refreshing" : ""}`}
+                        title="Refresh Inbox"
+                        style={{
+                          width: "30px",
+                          height: "30px",
+                          display: "inline-flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          border: "1px solid var(--line)",
+                          borderRadius: "6px",
+                          background: "#ffffff",
+                          color: "var(--ink)",
+                          cursor: isRefreshingInbox || supplierLoading ? "wait" : "pointer"
+                        }}
+                      >
+                        <RefreshCw size={14} />
+                      </button>
+                    </div>
                   </div>
                   <div className="inbox-column-header">
                     <span>Sender</span>
@@ -2562,53 +3148,78 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                         </article>
                       </div>
 
-                      <div className="results-panel inbox-table-panel">
-                        <div className="panel-title">
-                          <Search size={18} />
-                          <h2>AI extraction summary</h2>
+                      {selectedInboxThread.status_tone === "skipped" ? (
+                        <div className="results-panel inbox-email-preview-panel">
+                          <div className="panel-title">
+                            <Mail size={18} />
+                            <h2>Email preview</h2>
+                          </div>
+                          <div className="skipped-email-reason">{selectedInboxThread.status_label}</div>
+                          <div className="skipped-email-body">
+                            {selectedInboxThread.body_preview || "No readable email body was available for this skipped email."}
+                          </div>
                         </div>
-                        <div className="table-wrap">
-                          <table>
-                            <thead>
-                              <tr>
-                                <th>#</th>
-                                <th>Ingredient</th>
-                                <th className="specification-header">Specification</th>
-                                <th>Price/Unit</th>
-                                <th>Qty Avail.</th>
-                                <th>Lead Time</th>
-                                <th>MOQ</th>
-                                <th>Date</th>
-                                <th>Status</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {selectedInboxThread.items.length === 0 ? (
+                      ) : (
+                        <div className="results-panel inbox-table-panel">
+                          <div className="panel-title">
+                            <Search size={18} />
+                            <h2>AI extraction summary</h2>
+                          </div>
+                          <div className="table-wrap">
+                            <table>
+                              <thead>
                                 <tr>
-                                  <td colSpan={9}>No catalogue items were extracted for this supplier.</td>
+                                  <th>#</th>
+                                  <th>Ingredient</th>
+                                  <th className="specification-header">Specification</th>
+                                  <th>Price/Unit</th>
+                                  <th>Qty Avail.</th>
+                                  <th>Lead Time</th>
+                                  <th>MOQ</th>
+                                  <th>Date</th>
+                                  <th>Status</th>
                                 </tr>
-                              ) : (
-                                selectedInboxThread.items.slice(0, 4).map((item, index) => {
-                                  const bestPrice = Math.min(...selectedInboxThread.items.map((row) => safePrice(row.price_per_unit, row.currency)));
-                                  return (
-                                    <tr key={`${item.supplier_name}-${item.ingredient_name}-${index}`}>
-                                      <td>{index + 1}</td>
-                                      <td className="two-line-cell">{displayItemName(item)}</td>
-                                      <td className="two-line-cell specification-cell">{displaySpecification(item)}</td>
-                                      <td>{displayPrice(item)}</td>
-                                      <td>{displayQuantity(item)}</td>
-                                      <td>{displayLeadTime(item)}</td>
-                                      <td>{displayMoq(item)}</td>
-                                      <td>{formatDDMMYY(selectedInboxThread.received_at)}</td>
-                                      <td>{safePrice(item.price_per_unit, item.currency) === bestPrice ? "Best price" : "-"}</td>
-                                    </tr>
-                                  );
-                                })
-                              )}
-                            </tbody>
-                          </table>
+                              </thead>
+                              <tbody>
+                                {inboxItemsLoadingId === selectedInboxThread.id ? (
+                                  <tr>
+                                    <td colSpan={9}>Loading extracted items...</td>
+                                  </tr>
+                                ) : inboxItemsErrorId === selectedInboxThread.id ? (
+                                  <tr>
+                                    <td colSpan={9}>Unable to load extracted item details. Use Refresh to retry.</td>
+                                  </tr>
+                                ) : selectedInboxThread.items.length === 0 ? (
+                                  <tr>
+                                    <td colSpan={9}>
+                                      {selectedInboxThread.item_count > 0
+                                        ? "Extracted item details are temporarily unavailable."
+                                        : "No catalogue items were extracted from this email."}
+                                    </td>
+                                  </tr>
+                                ) : (
+                                  selectedInboxThread.items.slice(0, 4).map((item, index) => {
+                                    const bestPrice = Math.min(...selectedInboxThread.items.map((row) => safePrice(row.price_per_unit, row.currency)));
+                                    return (
+                                      <tr key={`${item.supplier_name}-${item.ingredient_name}-${index}`}>
+                                        <td>{index + 1}</td>
+                                        <td className="two-line-cell">{renderItemName(item)}</td>
+                                        <td className="two-line-cell specification-cell">{displaySpecification(item)}</td>
+                                        <td>{displayPrice(item)}</td>
+                                        <td>{displayQuantity(item)}</td>
+                                        <td>{displayLeadTime(item)}</td>
+                                        <td>{displayMoq(item)}</td>
+                                        <td>{formatDDMMYY(selectedInboxThread.received_at)}</td>
+                                        <td>{safePrice(item.price_per_unit, item.currency) === bestPrice ? "Best price" : "-"}</td>
+                                      </tr>
+                                    );
+                                  })
+                                )}
+                              </tbody>
+                            </table>
+                          </div>
                         </div>
-                      </div>
+                      )}
 
                       <div className="inbox-actions">
                         <button type="button" onClick={() => setActiveTab("compare")}>Compare suppliers</button>
@@ -2720,7 +3331,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                           return (
                             <tr key={`${item.supplier_name}-${item.ingredient_name}-${index}`}>
                               <td>{index + 1}</td>
-                              <td className="two-line-cell">{displayItemName(item)}</td>
+                              <td className="two-line-cell">{renderItemName(item)}</td>
                               <td className="two-line-cell specification-cell">{displaySpecification(item)}</td>
                               <td>{displayPrice(item)}</td>
                               <td>{displayQuantity(item)}</td>
@@ -2852,7 +3463,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                                     type="button"
                                     onClick={() => setExpandedCompareRows((current) => ({ ...current, [rowKey]: !current[rowKey] }))}
                                   >
-                                    <span>{displayItemName(row)}</span>
+                                    <span>{renderItemName(row)}</span>
                                   </button>
                                   {expanded && (
                                     <div className="expanded-supplier-inline">
@@ -2933,7 +3544,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                                   type="button"
                                   onClick={() => setExpandedAssistantRows((current) => ({ ...current, [rowKey]: !current[rowKey] }))}
                                 >
-                                  <span>{displayItemName(row)}</span>
+                                  <span>{renderItemName(row)}</span>
                                 </button>
                                 {expanded && (
                                   <div className="expanded-supplier-inline">
@@ -3842,41 +4453,6 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                             />
                           </div>
 
-                          <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                              <label style={{ fontWeight: 600, fontSize: "14px", color: "#092f28", margin: 0 }}>Smart Ingestion Keywords</label>
-                              <span
-                                onMouseEnter={() => setVisibleGuides(p => ({ ...p, email_smart_keywords: true }))}
-                                onMouseLeave={() => setVisibleGuides(p => ({ ...p, email_smart_keywords: false }))}
-                                style={{ position: "relative", display: "inline-flex", alignItems: "center", color: "var(--muted)", cursor: "default" }}
-                              >
-                                <Info size={14} />
-                                {visibleGuides.email_smart_keywords && (
-                                  <span className="settings-tooltip centered" style={{ width: "240px" }}>
-                                    Comma-separated words to scan incoming emails (subject/body) for potential catalogue files from new/unrecognized suppliers.
-                                  </span>
-                                )}
-                              </span>
-                            </div>
-                            <textarea
-                              value={localKeywords}
-                              onChange={(e) => setLocalKeywords(e.target.value)}
-                              placeholder="e.g. catalog, catalogue, price, offer, quote, inventory, sheet"
-                              rows={2}
-                              style={{
-                                padding: "10px 12px",
-                                borderRadius: "8px",
-                                border: "1px solid var(--line)",
-                                background: "#fff",
-                                fontSize: "13.5px",
-                                lineHeight: "1.5",
-                                resize: "vertical",
-                                fontFamily: "inherit",
-                                outline: "none",
-                                transition: "border-color 0.15s ease"
-                              }}
-                            />
-                          </div>
                         </div>
                       )}
 
@@ -3944,7 +4520,6 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                           onClick={() => saveEmailSyncSettings({
                             ingestion_approach: localApproach,
                             trusted_suppliers: localTrusted,
-                            keyword_filters: localKeywords,
                             poll_interval_minutes: localPollInterval,
                             auto_extract_catalog: true,
                             notify_on_new_catalog: true
@@ -4256,6 +4831,26 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
             ProcuraAI can make mistakes. Your data is never used to train our model.
           </div>
         </aside>
+      )}
+
+      {connectionError && (
+        <div className="connection-modal-backdrop">
+          <div className="connection-modal">
+            <div className="connection-modal-icon">
+              <ShieldAlert size={24} />
+            </div>
+            <h3>Connection Failed</h3>
+            <p>{connectionError}</p>
+            <div className="connection-modal-actions">
+              <button type="button" onClick={() => window.location.reload()}>
+                Retry
+              </button>
+              <button type="button" onClick={() => setConnectionError(null)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Action Confirmation Modals (Disconnect Account & Delete Catalog Email) */}

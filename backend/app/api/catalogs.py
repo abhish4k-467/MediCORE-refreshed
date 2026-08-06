@@ -4,7 +4,7 @@ from difflib import SequenceMatcher
 from urllib.parse import unquote, urlparse
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query
-from sqlalchemy import and_, exists, func, nullslast, or_, select
+from sqlalchemy import and_, func, nullslast, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from uuid import UUID
@@ -180,13 +180,14 @@ def list_catalog_emails(
     settings = get_settings()
     user_uuid = UUID(current_user["tenant_id"])
     stmt = (
-        select(CatalogEmail, Supplier.name, Supplier.email_domain)
+        select(CatalogEmail, Supplier.name, Supplier.email_domain, func.count(CatalogItem.id).label("item_count"))
         .join(Supplier, Supplier.id == CatalogEmail.supplier_id)
+        .outerjoin(CatalogItem, CatalogItem.catalog_email_id == CatalogEmail.id)
         .where(
             CatalogEmail.tenant_id == user_uuid,
-            CatalogEmail.processing_status == "completed",
-            exists().where(CatalogItem.catalog_email_id == CatalogEmail.id),
+            CatalogEmail.processing_status != "deleted",
         )
+        .group_by(CatalogEmail.id, Supplier.name, Supplier.email_domain)
     )
     if not settings.mock_data_enabled:
         stmt = stmt.where(CatalogEmail.raw_email_id.not_like("core-mock-catalog-%"))
@@ -200,9 +201,11 @@ def list_catalog_emails(
                 "received_at": email.received_at,
                 "subject": email.subject,
                 "pdf_url": email.pdf_url,
+                "body_preview": email.body_preview,
                 "processing_status": email.processing_status,
+                "item_count": int(item_count or 0),
             }
-            for email, supplier_name, email_domain in db.execute(stmt)
+            for email, supplier_name, email_domain, item_count in db.execute(stmt)
         ]
     except SQLAlchemyError:
         if not settings.mock_data_enabled:
@@ -214,8 +217,9 @@ def list_catalog_emails(
 def list_catalog_items(
     db: Session = Depends(get_db),
     q: str | None = None,
-    limit: int = Query(500, ge=1, le=5000),
+    limit: int = Query(100, ge=1, le=100),
     latest_only: bool = Query(True),
+    catalog_email_id: UUID | None = Query(None),
     current_user: dict = Depends(get_current_user)
 ) -> list[dict]:
     settings = get_settings()
@@ -225,7 +229,7 @@ def list_catalog_items(
         .join(Supplier, Supplier.id == CatalogItem.supplier_id)
         .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
     )
-    if latest_only:
+    if latest_only and catalog_email_id is None:
         latest_items = (
             select(
                 CatalogItem.id.label("item_id"),
@@ -234,9 +238,6 @@ def list_catalog_items(
                         CatalogItem.supplier_id,
                         CatalogItem.ingredient_name,
                         CatalogItem.raw_payload["specification"].astext,
-                        CatalogItem.available_qty,
-                        CatalogItem.unit,
-                        CatalogItem.moq,
                     ),
                     order_by=(
                         CatalogEmail.received_at.desc(),
@@ -249,14 +250,14 @@ def list_catalog_items(
                         CatalogItem.supplier_id,
                         CatalogItem.ingredient_name,
                         CatalogItem.raw_payload["specification"].astext,
-                        CatalogItem.available_qty,
-                        CatalogItem.unit,
-                        CatalogItem.moq,
                     ),
                 ).label("history_count"),
             )
             .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
-            .where(CatalogItem.tenant_id == user_uuid)
+            .where(
+                CatalogItem.tenant_id == user_uuid,
+                CatalogEmail.processing_status.in_(["completed", "partial"]),
+            )
             .subquery()
         )
         stmt = (
@@ -271,7 +272,12 @@ def list_catalog_items(
                 latest_items.c.row_number == 1,
             ),
         )
-    stmt = stmt.where(CatalogItem.tenant_id == user_uuid)
+    stmt = stmt.where(
+        CatalogItem.tenant_id == user_uuid,
+        CatalogEmail.processing_status.in_(["completed", "partial"]),
+    )
+    if catalog_email_id is not None:
+        stmt = stmt.where(CatalogItem.catalog_email_id == catalog_email_id)
     if not settings.mock_data_enabled:
         source = CatalogItem.raw_payload["source"].astext
         stmt = stmt.where(or_(source.is_(None), source != "mock_extracted_catalogue"))
@@ -389,7 +395,6 @@ def sync_diagnostics(
         "sync_settings": {
             "ingestion_approach": sync_setting.ingestion_approach if sync_setting else None,
             "trusted_suppliers": sync_setting.trusted_suppliers if sync_setting else None,
-            "keyword_filters": sync_setting.keyword_filters if sync_setting else None,
             "pending_approval_count": len([item for item in pending_approvals if not item.get("ignored")]),
             "pending_approvals": pending_approvals[:limit],
         },

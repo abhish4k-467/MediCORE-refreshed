@@ -16,15 +16,22 @@ logger = logging.getLogger(__name__)
 
 def extract_pdf_text(path: str | Path) -> str:
     pdf_path = Path(path)
-    text = _extract_with_pymupdf(pdf_path)
-    if text:
-        return text
+    text_parts: list[str] = []
+    pymupdf_text = _extract_with_pymupdf(pdf_path)
+    if pymupdf_text:
+        text_parts.append(pymupdf_text)
 
-    text = _extract_with_pdfplumber(pdf_path)
-    if text:
-        return text
+    plumber_text = _extract_with_pdfplumber(pdf_path)
+    if plumber_text:
+        text_parts.append(plumber_text)
 
-    return _extract_with_ocr(pdf_path)
+    combined_text = "\n\n".join(dict.fromkeys(part.strip() for part in text_parts if part.strip()))
+    if not combined_text or _pdf_has_images(pdf_path):
+        ocr_text = _extract_with_ocr(pdf_path)
+        if ocr_text:
+            text_parts.append(ocr_text)
+
+    return "\n\n".join(dict.fromkeys(part.strip() for part in text_parts if part.strip()))
 
 
 def _extract_with_pymupdf(pdf_path: Path) -> str:
@@ -38,6 +45,15 @@ def _extract_with_pymupdf(pdf_path: Path) -> str:
 def _extract_with_pdfplumber(pdf_path: Path) -> str:
     with pdfplumber.open(pdf_path) as pdf:
         return "\n".join(page.extract_text() or "" for page in pdf.pages).strip()
+
+
+def _pdf_has_images(pdf_path: Path) -> bool:
+    try:
+        with fitz.open(pdf_path) as doc:
+            return any(page.get_images(full=True) for page in doc)
+    except Exception:
+        logger.debug("Could not inspect PDF images for %s", pdf_path.name, exc_info=True)
+        return False
 
 
 def _extract_with_ocr(pdf_path: Path) -> str:

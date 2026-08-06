@@ -29,6 +29,19 @@ class IngredientMatchResult:
     matched_names: list[str]
     best_match: str | None
     confidence: float
+    suggestions: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class QueryUnderstanding:
+    intent: str
+    operation: str
+    requires_item: bool
+    entity_phrase: str
+    is_follow_up: bool = False
+    asks_memory: bool = False
+    needs_database: bool = True
+    filters: dict[str, Any] | None = None
 
 
 class NaturalLanguageQueryEngine:
@@ -37,6 +50,7 @@ class NaturalLanguageQueryEngine:
         self.cache = cache
         self.llm = OpenRouterClient()
         self.ranker = SupplierRanker(db)
+        self.conversation_state: dict[str, Any] = {}
 
     def _answer(
         self,
@@ -45,43 +59,80 @@ class NaturalLanguageQueryEngine:
         user_id: Any | None = None,
     ) -> ChatResponse:
         try:
-            cache_key = f"chat:answer:v14:{tenant_id}:{question.strip().lower()}"
+            understanding = self._understand_query(question)
+            state = getattr(self, "conversation_state", {})
+            if understanding.asks_memory:
+                remembered = state.get("last_search_phrase") or state.get("last_ingredient_name")
+                answer = f"You asked about {remembered}." if remembered else "I do not have an item in the current chat context yet."
+                self._log_query(question, tenant_id=tenant_id, user_id=user_id, operation_type="follow_up")
+                return ChatResponse(answer=answer, rows=[])
+
+            if understanding.operation == "unrelated":
+                self._log_query(question, tenant_id=tenant_id, user_id=user_id, operation_type="unrelated")
+                return ChatResponse(
+                    answer="I'm sorry, but I can only answer questions related to the MediCORE procurement intelligence system, such as suppliers, catalogue items, prices, stock, MOQ, lead time, country, certificates, and procurement decisions.",
+                    rows=[]
+                )
+
+            if not understanding.needs_database:
+                self._log_query(question, tenant_id=tenant_id, user_id=user_id, operation_type=understanding.intent)
+                return ChatResponse(answer=self._procurement_advice_answer(question), rows=[])
+
+            context_phrase = ""
+            if understanding.is_follow_up:
+                context_phrase = str(state.get("last_search_phrase") or state.get("last_ingredient_name") or "")
+            entity_phrase = understanding.entity_phrase or context_phrase
+
+            match_result: IngredientMatchResult | None = None
+            if understanding.requires_item:
+                if not entity_phrase:
+                    self._log_query(question, tenant_id=tenant_id, user_id=user_id, operation_type=understanding.intent)
+                    return ChatResponse(
+                        answer="Which ingredient or product should I use for this procurement query?",
+                        rows=[],
+                    )
+                try:
+                    match_result = self._resolve_ingredient_from_db(entity_phrase, tenant_id=tenant_id)
+                except Exception as exc:
+                    logger.warning("Catalogue ingredient match failed after intent detection; continuing without rows: %s", exc)
+                    if not hasattr(self, "db"):
+                        match_result = IngredientMatchResult(entity_phrase, entity_phrase, [], entity_phrase, 1.0)
+                    else:
+                        match_result = IngredientMatchResult(entity_phrase, None, [], None, 0.0)
+
+                if not match_result.search_phrase:
+                    answer = self._ingredient_clarification_answer(entity_phrase, match_result)
+                    self._log_query(question, tenant_id=tenant_id, user_id=user_id, operation_type=understanding.intent)
+                    return ChatResponse(answer=answer, rows=[])
+
+            cache_context = ""
+            if understanding.is_follow_up:
+                cache_context = str(state.get("last_search_phrase") or state.get("last_ingredient_name") or "")
+            cache_key = f"chat:answer:v18:{tenant_id}:{cache_context}:{question.strip().lower()}"
             cached = self._cache_get(cache_key)
             if cached:
                 payload = json.loads(cached)
                 self._log_query(question, tenant_id=tenant_id, user_id=user_id, operation_type="cached")
                 return ChatResponse(**payload)
 
-            match_result: IngredientMatchResult | None = None
-            try:
-                match_result = self._resolve_ingredient_from_db(question, tenant_id=tenant_id)
-            except Exception as exc:
-                logger.warning("Catalogue ingredient pre-match failed; continuing with query plan: %s", exc)
-
             try:
                 plan = self.llm.plan_query(question)
             except Exception:
                 plan = self._fallback_plan(question)
 
-            detected_operation = self._extract_query_intent(question)
+            detected_operation = understanding.operation
             if match_result and match_result.search_phrase:
-                plan = plan.model_copy(
-                    update={
-                        "operation": detected_operation if plan.operation in {"unrelated", "supplier_activity"} else plan.operation,
+                plan = self._copy_plan(
+                    plan,
+                    {
+                        "operation": detected_operation,
                         "ingredient_name": match_result.search_phrase,
-                    }
+                    },
                 )
-            elif match_result and match_result.extracted_phrase and self._looks_like_procurement_question(question):
-                logger.info(
-                    "ProcuraAI ingredient match failed original_query=%r extracted_ingredient=%r best_database_match=%r confidence=%.3f generated_sql=%r",
-                    question,
-                    match_result.extracted_phrase,
-                    match_result.best_match,
-                    match_result.confidence,
-                    "",
-                )
-                self._log_query(question, tenant_id=tenant_id, user_id=user_id, operation_type="catalog_search")
-                return ChatResponse(answer="No matching ingredient found.", rows=[])
+            else:
+                plan = self._copy_plan(plan, {"operation": detected_operation, "ingredient_name": None})
+                if understanding.filters:
+                    plan = self._copy_plan(plan, {"limit": 50})
 
             if plan.operation == "unrelated":
                 self._log_query(question, tenant_id=tenant_id, user_id=user_id, operation_type=plan.operation)
@@ -93,9 +144,9 @@ class NaturalLanguageQueryEngine:
             try:
                 validate_operation(plan.operation)
             except ValueError:
-                plan = plan.model_copy(update={"operation": "catalog_search"})
+                plan = self._copy_plan(plan, {"operation": understanding.operation})
 
-            if not (match_result and match_result.matched_names):
+            if understanding.requires_item and not (match_result and match_result.matched_names):
                 plan = self._ground_plan_in_catalog(question, plan, tenant_id=tenant_id)
             self._log_query(question, tenant_id=tenant_id, user_id=user_id, operation_type=plan.operation)
 
@@ -104,9 +155,11 @@ class NaturalLanguageQueryEngine:
             rows: list[dict[str, Any]] = []
             if match_result and match_result.matched_names:
                 rows = self._execute_matched_ingredient_query(plan, match_result.matched_names, tenant_id=tenant_id)
-            elif getattr(plan, "ingredient_name", None):
+                rows = self._apply_query_filters(rows, understanding.filters or {})
+            elif getattr(plan, "ingredient_name", None) or not understanding.requires_item:
                 try:
                     rows = self._execute_plan(plan, tenant_id=tenant_id)
+                    rows = self._apply_query_filters(rows, understanding.filters or {})
                 except Exception as exc:
                     logger.warning("Structured query plan execution failed: %s", exc)
                     rows = []
@@ -115,7 +168,7 @@ class NaturalLanguageQueryEngine:
             try:
                 generated_sql = (
                     self.llm.generate_sql(self._grounded_sql_question(question, plan))
-                    if not rows and not (match_result and match_result.extracted_phrase)
+                    if not rows and not understanding.requires_item
                     else ""
                 )
                 if generated_sql:
@@ -130,17 +183,18 @@ class NaturalLanguageQueryEngine:
 
             # 3. Fallback to structured QueryPlan execution if AI SQL produced no results
             if not rows:
-                if match_result and match_result.extracted_phrase:
+                if understanding.requires_item and match_result and match_result.extracted_phrase:
                     rows = []
                 else:
                     try:
                         rows = self._execute_plan(plan, tenant_id=tenant_id)
+                        rows = self._apply_query_filters(rows, understanding.filters or {})
                     except Exception as exc:
                         logger.warning("Structured query plan execution failed: %s", exc)
                         rows = []
 
-            if match_result and match_result.extracted_phrase and not rows:
-                response = ChatResponse(answer="No matching ingredient found.", rows=[])
+            if understanding.requires_item and match_result and match_result.extracted_phrase and not rows:
+                response = ChatResponse(answer=f"I found {match_result.search_phrase}, but there are no supplier rows available for that item yet.", rows=[])
                 self._cache_set(cache_key, response.model_dump_json())
                 return response
 
@@ -161,6 +215,7 @@ class NaturalLanguageQueryEngine:
                 answer = self._fallback_summary(question, rows)
 
             response = ChatResponse(answer=answer, rows=rows)
+            self._update_conversation_state(question, understanding, plan, match_result, rows)
             self._cache_set(cache_key, response.model_dump_json())
             return response
         except Exception:
@@ -382,6 +437,242 @@ class NaturalLanguageQueryEngine:
         except Exception:
             self.db.rollback()
 
+    def _copy_plan(self, plan: Any, updates: dict[str, Any]) -> Any:
+        if hasattr(plan, "model_copy"):
+            return plan.model_copy(update=updates)
+        for key, value in updates.items():
+            setattr(plan, key, value)
+        return plan
+
+    def _understand_query(self, question: str) -> QueryUnderstanding:
+        lowered = question.lower().strip()
+        tokens = set(re.findall(r"[a-z0-9]+", lowered))
+        entity_phrase = self._extract_ingredient_phrase(question)
+        filters = self._extract_query_filters(question)
+        is_follow_up = bool(tokens & {"it", "this", "that", "them", "they", "same", "previous"}) or lowered in {
+            "compare them",
+            "which one is cheapest",
+            "which is cheapest",
+            "which country",
+            "any cheaper option",
+            "cheaper option",
+            "only india",
+            "only china",
+            "only germany",
+            "any updated quotation",
+        }
+
+        if re.search(r"\b(which|what)\s+(item|ingredient|product)\s+did\s+i\s+ask\b", lowered):
+            return QueryUnderstanding("memory_check", "supplier_activity", False, "", True, True, False)
+
+        procurement_related = self._looks_like_procurement_question(question) or bool(tokens & {
+            "procure", "procurement", "sourcing", "negotiate", "negotiation", "rfq", "quote", "vendor", "vendors",
+            "supplier", "suppliers", "catalog", "catalogue", "certificate", "certified", "country", "origin",
+        })
+        if not procurement_related:
+            return QueryUnderstanding("unrelated", "unrelated", False, "", False, False, False)
+
+        if any(phrase in lowered for phrase in ("general advice", "how should", "how do i", "recommend supplier", "recommend a supplier", "negotiate", "rfq strategy")) and not entity_phrase and not filters and not is_follow_up:
+            return QueryUnderstanding("general_procurement_advice", "supplier_activity", False, "", False, False, False)
+
+        if any(term in lowered for term in ("compare", "vs", "versus")):
+            requires_item = bool(entity_phrase or is_follow_up) and not self._looks_like_supplier_comparison(question)
+            return QueryUnderstanding("compare_suppliers", "supplier_compare", requires_item, entity_phrase, is_follow_up, False, True, filters)
+        if any(term in lowered for term in ("updated", "update", "latest quotation", "latest updated", "new catalogue", "new catalog")):
+            return QueryUnderstanding("updates", "history_compare", bool(entity_phrase or is_follow_up), entity_phrase, is_follow_up, False, True, filters)
+        if any(term in lowered for term in ("cheapest", "lowest price", "best price", "price", "rate", "cost", "cheaper")):
+            return QueryUnderstanding("price_lookup", "best_price", bool(entity_phrase or is_follow_up), entity_phrase, is_follow_up, False, True, filters)
+        if any(term in lowered for term in ("available", "availability", "stock", "inventory")):
+            return QueryUnderstanding("availability", "catalog_search", bool(entity_phrase or is_follow_up), entity_phrase, is_follow_up, False, True, filters)
+        if "moq" in tokens or "minimum" in tokens:
+            return QueryUnderstanding("moq", "catalog_search", bool(entity_phrase or is_follow_up), entity_phrase, is_follow_up, False, True, filters)
+        if "lead" in tokens or "delivery" in tokens or "dispatch" in tokens:
+            return QueryUnderstanding("lead_time", "catalog_search", bool(entity_phrase or is_follow_up), entity_phrase, is_follow_up, False, True, filters)
+        if any(term in lowered for term in ("certificate", "certificates", "certification", "certified", "coa", "halal", "kosher", "gmp", "iso")):
+            requires_item = bool(entity_phrase or is_follow_up)
+            return QueryUnderstanding("certifications", "catalog_search", requires_item, entity_phrase, is_follow_up, False, True, filters)
+        if "country" in tokens or "origin" in tokens or "from germany" in lowered or "from india" in lowered or "from china" in lowered:
+            requires_item = bool(entity_phrase or is_follow_up)
+            return QueryUnderstanding("country_origin", "catalog_search" if requires_item else "supplier_activity", requires_item, entity_phrase, is_follow_up, False, True, filters)
+        if any(term in lowered for term in ("who sells", "supplier", "suppliers", "vendor", "vendors", "source", "sells")):
+            return QueryUnderstanding("find_suppliers", "supplier_compare", bool(entity_phrase or is_follow_up), entity_phrase, is_follow_up, False, True, filters)
+        if any(term in lowered for term in ("item", "items", "product", "products", "ingredient", "ingredients", "catalog", "catalogue", "search")):
+            return QueryUnderstanding("product_search", "catalog_search", bool(entity_phrase), entity_phrase, is_follow_up, False, True, filters)
+        if is_follow_up:
+            return QueryUnderstanding("follow_up", "catalog_search", True, "", True, False, True, filters)
+        if filters:
+            return QueryUnderstanding("supplier_search", "supplier_activity", False, "", False, False, True, filters)
+        return QueryUnderstanding("general_procurement_advice", "supplier_activity", False, "", False, False, False, filters)
+
+    def _procurement_advice_answer(self, question: str) -> str:
+        lowered = question.lower()
+        if "country" in lowered or "origin" in lowered or re.search(r"\bfrom\s+[a-z]+", lowered):
+            return "I can filter supplier country/origin once you specify the ingredient or product. For example: 'suppliers from Germany for vitamin C'."
+        if any(term in lowered for term in ("certificate", "certified", "coa", "halal", "kosher", "gmp", "iso")):
+            return "I can check certification fit once you specify the ingredient or product. For example: 'show GMP certified suppliers for ashwagandha'."
+        if "recommend" in lowered and ("moq" in lowered or "lead" in lowered):
+            return "For procurement selection, balance landed price with MOQ, lead time, available stock, supplier country, and certificate fit. If you name the ingredient, I can rank actual suppliers from MediCORE data."
+        if "negotiate" in lowered or "rfq" in lowered:
+            return "For supplier negotiation, ask for price breaks by quantity, confirm MOQ, lead time, payment terms, certificate availability, and validity date. Share the ingredient name when you want me to compare actual supplier offers."
+        return "I can help with supplier discovery, price comparison, availability, MOQ, lead time, certificates, country/origin, and procurement recommendations. Please name an ingredient or supplier constraint if you want me to check MediCORE data."
+
+    def _extract_query_filters(self, question: str) -> dict[str, Any]:
+        lowered = question.lower()
+        tokens = set(re.findall(r"[a-z0-9]+", lowered))
+        filters: dict[str, Any] = {}
+        country = self._extract_country_filter(lowered)
+        if country:
+            filters["country"] = country
+        moq_match = re.search(r"\bmoq\b\s*(?:below|under|less than|<=|<)?\s*(\d+(?:\.\d+)?)", lowered)
+        if not moq_match:
+            moq_match = re.search(r"\b(?:below|under|less than|<=|<)\s*(\d+(?:\.\d+)?)\s*(?:kg|units?)?\s*moq\b", lowered)
+        if moq_match:
+            filters["max_moq"] = float(moq_match.group(1))
+        if any(term in lowered for term in ("certificate", "certificates", "certification", "certified", "coa", "halal", "kosher", "gmp", "iso")):
+            filters["has_certificate"] = True
+        if any(term in lowered for term in ("updated", "update", "latest quotation", "latest updated", "new catalogue", "new catalog")):
+            filters["updated_only"] = True
+        if "today" in tokens:
+            filters["date_hint"] = "today"
+        if "lead" in tokens or "delivery" in tokens or "dispatch" in tokens:
+            filters["rank_by"] = "lead_time"
+        if any(term in lowered for term in ("cheapest", "lowest price", "best price", "cheaper")):
+            filters["rank_by"] = "price"
+        supplier_names = self._extract_supplier_names(question)
+        if supplier_names:
+            filters["supplier_names"] = supplier_names
+        return filters
+
+    def _extract_country_filter(self, lowered: str) -> str | None:
+        aliases = {
+            "india": "India",
+            "indian": "India",
+            "china": "China",
+            "chinese": "China",
+            "germany": "Germany",
+            "german": "Germany",
+            "usa": "USA",
+            "us": "USA",
+            "united states": "USA",
+            "canada": "Canada",
+            "canadian": "Canada",
+            "uk": "UK",
+            "united kingdom": "UK",
+        }
+        for source, target in aliases.items():
+            if re.search(rf"\b{re.escape(source)}\b", lowered):
+                return target
+        country_match = re.search(r"\bfrom\s+([a-z][a-z\s]{2,30})\b", lowered)
+        if country_match:
+            raw = country_match.group(1).strip()
+            raw = re.split(r"\b(?:for|with|and|supplier|suppliers|vendor|vendors)\b", raw)[0].strip()
+            if raw:
+                return raw.title()
+        return None
+
+    def _extract_supplier_names(self, question: str) -> list[str]:
+        if not self._looks_like_supplier_comparison(question):
+            return []
+        parts = re.split(r"\b(?:compare|vs|versus|and)\b", question, flags=re.IGNORECASE)
+        names = []
+        for part in parts:
+            cleaned = re.sub(r"[^A-Za-z0-9\s.&-]+", " ", part).strip()
+            cleaned = re.sub(r"\b(supplier|suppliers|vendor|vendors)\b", " ", cleaned, flags=re.IGNORECASE)
+            cleaned = " ".join(cleaned.split())
+            if len(cleaned) >= 2:
+                names.append(cleaned)
+        return names[:4]
+
+    def _looks_like_supplier_comparison(self, question: str) -> bool:
+        lowered = question.lower()
+        if not any(term in lowered for term in ("compare", " vs ", " versus ")):
+            return False
+        if " vs " in lowered or " versus " in lowered:
+            return True
+        return " and " in lowered and not any(term in lowered for term in ("ingredient", "ingredients", "item", "items", "product", "products", "catalog", "catalogue"))
+
+    def _apply_query_filters(self, rows: list[dict[str, Any]], filters: dict[str, Any]) -> list[dict[str, Any]]:
+        if not rows or not filters:
+            return rows
+        filtered = rows
+        country = filters.get("country")
+        if country:
+            country_key = self._canonical_filter_text(country)
+            filtered = [
+                row for row in filtered
+                if country_key in self._canonical_filter_text(row.get("country"))
+            ]
+        supplier_names = filters.get("supplier_names") or []
+        if supplier_names:
+            supplier_keys = [self._canonical_filter_text(name) for name in supplier_names]
+            filtered = [
+                row for row in filtered
+                if any(
+                    key in self._canonical_filter_text(row.get("supplier_name"))
+                    or self._canonical_filter_text(row.get("supplier_name")) in key
+                    for key in supplier_keys
+                )
+            ]
+        if filters.get("has_certificate"):
+            filtered = [
+                row for row in filtered
+                if bool(row.get("certificate_pdfs")) or bool(str(row.get("certifications") or "").strip())
+            ]
+        if filters.get("updated_only"):
+            filtered = [row for row in filtered if row.get("is_updated")]
+        if filters.get("max_moq") is not None:
+            max_moq = float(filters["max_moq"])
+            filtered = [
+                row for row in filtered
+                if row.get("moq") is not None and self._safe_float(row.get("moq")) <= max_moq
+            ]
+        rank_by = filters.get("rank_by")
+        if rank_by == "lead_time":
+            filtered = sorted(filtered, key=lambda row: (row.get("lead_time_days") is None, self._safe_float(row.get("lead_time_days"))))
+        elif rank_by == "price":
+            filtered = sorted(filtered, key=lambda row: (row.get("price_per_unit") is None, self._safe_float(row.get("price_per_unit"))))
+        return filtered
+
+    def _canonical_filter_text(self, value: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+    def _safe_float(self, value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("inf")
+
+    def _ingredient_clarification_answer(self, entity_phrase: str, match_result: IngredientMatchResult | None) -> str:
+        if match_result and match_result.suggestions:
+            choices = ", ".join(match_result.suggestions[:5])
+            return f"I found these possible matches for '{entity_phrase}': {choices}. Which one should I use?"
+        if match_result and match_result.best_match:
+            return f"I could not confidently match '{entity_phrase}' to a catalogue item. Did you mean {match_result.best_match}?"
+        return f"I could not confidently identify an ingredient from '{entity_phrase}'. Please choose or type the exact product name you want me to check."
+
+    def _update_conversation_state(
+        self,
+        question: str,
+        understanding: QueryUnderstanding,
+        plan: Any,
+        match_result: IngredientMatchResult | None,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        state = getattr(self, "conversation_state", {})
+        state["last_question"] = question
+        state["last_intent"] = understanding.intent
+        if match_result and match_result.search_phrase:
+            state["last_search_phrase"] = match_result.search_phrase
+            state["last_matched_names"] = match_result.matched_names
+            state["last_ingredient_name"] = rows[0].get("ingredient_name") if rows else match_result.best_match
+        elif getattr(plan, "ingredient_name", None):
+            state["last_search_phrase"] = plan.ingredient_name
+        if rows:
+            state["last_rows"] = rows[:20]
+            if rows[0].get("supplier_name"):
+                state["last_supplier_name"] = rows[0].get("supplier_name")
+        self.conversation_state = state
+
     def _execute_plan(self, plan, tenant_id: Any | None = None) -> list[dict[str, Any]]:
         if plan.operation in {"supplier_compare", "best_price", "catalog_search"}:
             return self.ranker.ranked_items(plan, tenant_id=tenant_id)
@@ -418,17 +709,16 @@ class NaturalLanguageQueryEngine:
             except (ValueError, TypeError):
                 return (True, 0.0)
 
-        if "sort" in lowered or "order" in lowered:
-            if "lead" in lowered:
-                return sorted(rows, key=lambda row: safe_float(row.get("lead_time_days")))
-            if "quantity" in lowered or "qty" in lowered or "stock" in lowered:
-                return sorted(rows, key=lambda row: safe_float(row.get("available_qty")))
-            if "moq" in lowered:
-                return sorted(rows, key=lambda row: safe_float(row.get("moq")))
-            if "date" in lowered or "latest" in lowered or "recent" in lowered:
-                return sorted(rows, key=lambda row: str(row.get("received_at") or ""), reverse=True)
-            if "price" in lowered or "rate" in lowered or "cost" in lowered:
-                return sorted(rows, key=lambda row: safe_float(row.get("price_per_unit")))
+        if "lead" in lowered and ("sort" in lowered or "order" in lowered or "fast" in lowered or "quick" in lowered):
+            return sorted(rows, key=lambda row: safe_float(row.get("lead_time_days")))
+        if any(term in lowered for term in ("quantity", "qty", "stock", "available", "availability")) and ("sort" in lowered or "order" in lowered or "most" in lowered):
+            return sorted(rows, key=lambda row: safe_float(row.get("available_qty")))
+        if "moq" in lowered and ("sort" in lowered or "order" in lowered or "lowest" in lowered):
+            return sorted(rows, key=lambda row: safe_float(row.get("moq")))
+        if any(term in lowered for term in ("date", "latest", "recent", "2025", "2026")):
+            rows = sorted(rows, key=lambda row: str(row.get("received_at") or ""), reverse=True)
+        if any(term in lowered for term in ("cheapest", "lowest price", "best price", "price", "rate", "cost", "cheaper")):
+            return sorted(rows, key=lambda row: safe_float(row.get("price_per_unit")))
 
         return sorted(
             rows,
@@ -457,11 +747,11 @@ class NaturalLanguageQueryEngine:
         if getattr(plan, "ingredient_name", None):
             matched_item = self._match_catalog_item_name(str(plan.ingredient_name), tenant_id=tenant_id)
             if matched_item and matched_item != plan.ingredient_name:
-                return plan.model_copy(update={"ingredient_name": matched_item})
+                return self._copy_plan(plan, {"ingredient_name": matched_item})
             return plan
         matched_item = self._match_catalog_item_name(question, tenant_id=tenant_id)
         if matched_item:
-            return plan.model_copy(update={"ingredient_name": matched_item, "operation": plan.operation if plan.operation != "supplier_activity" else "catalog_search"})
+            return self._copy_plan(plan, {"ingredient_name": matched_item, "operation": plan.operation if plan.operation != "supplier_activity" else "catalog_search"})
         return plan
 
     def _match_catalog_item_name(self, question: str, tenant_id: Any | None = None) -> str | None:
@@ -480,7 +770,16 @@ class NaturalLanguageQueryEngine:
         if not extracted_phrase:
             return IngredientMatchResult("", None, [], None, 0.0)
 
-        stmt = select(CatalogItem.ingredient_name).where(CatalogItem.ingredient_name.is_not(None)).distinct().limit(5000)
+        stmt = (
+            select(CatalogItem.ingredient_name)
+            .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
+            .where(
+                CatalogItem.ingredient_name.is_not(None),
+                CatalogEmail.processing_status.in_(["completed", "partial"]),
+            )
+            .distinct()
+            .limit(5000)
+        )
         if tenant_id:
             stmt = stmt.where(CatalogItem.tenant_id == (UUID(str(tenant_id)) if isinstance(tenant_id, str) else tenant_id))
 
@@ -517,12 +816,37 @@ class NaturalLanguageQueryEngine:
                 scored.append((score, str(ingredient_name), anchor))
 
         if not scored:
-            return IngredientMatchResult(extracted_phrase, None, [], None, 0.0)
+            loose_scored = sorted(
+                (
+                    (
+                        max(
+                            SequenceMatcher(None, token, name_token).ratio()
+                            for token in query_tokens
+                            for name_token in self._catalog_name_tokens(ingredient_name)
+                        ),
+                        str(ingredient_name),
+                    )
+                    for ingredient_name in dict.fromkeys(name for name in candidates if name)
+                    if self._catalog_name_tokens(ingredient_name)
+                ),
+                key=lambda row: (-row[0], row[1].lower()),
+            )
+            suggestions = [candidate for score, candidate in loose_scored if score >= 0.45][:5]
+            return IngredientMatchResult(
+                extracted_phrase,
+                None,
+                [],
+                suggestions[0] if suggestions else None,
+                loose_scored[0][0] if loose_scored else 0.0,
+                suggestions or None,
+            )
 
         scored.sort(key=lambda row: (-row[0], row[1].lower()))
         best_score, best_name, best_anchor = scored[0]
         if best_score < 0.70:
-            return IngredientMatchResult(extracted_phrase, None, [], best_name, best_score)
+            floor = max(0.45, best_score - 0.12)
+            suggestions = [candidate for score, candidate, _ in scored if score >= floor][:5]
+            return IngredientMatchResult(extracted_phrase, None, [], best_name, best_score, suggestions)
 
         broad_anchor = best_anchor or self._best_matching_catalog_token(query_tokens, best_name)
         search_phrase = self._resolved_search_phrase(query_tokens, best_name, broad_anchor)
@@ -550,6 +874,7 @@ class NaturalLanguageQueryEngine:
             matched_names=list(dict.fromkeys(matched_names)),
             best_match=best_name,
             confidence=best_score,
+            suggestions=None,
         )
 
     def _ingredient_match_score(
@@ -639,28 +964,55 @@ class NaturalLanguageQueryEngine:
         tokens = {
             token
             for token in self._canonical_ingredient_text(value).split()
-            if len(token) >= 2 and token not in {
+            if (len(token) >= 2 or token.isdigit()) and not re.fullmatch(r"20\d{2}", token) and token not in {
+                "all",
                 "any",
+                "at",
+                "based",
+                "below",
+                "by",
+                "do",
+                "does",
                 "have",
                 "has",
+                "is",
                 "find",
                 "give",
                 "me",
                 "get",
                 "list",
+                "compare",
+                "related",
+                "item",
+                "items",
+                "product",
+                "products",
+                "ingredient",
+                "ingredients",
                 "supplier",
                 "suppliers",
+                "who",
+                "what",
+                "which",
+                "sell",
+                "sells",
+                "selling",
                 "vendor",
                 "vendors",
                 "name",
                 "names",
                 "price",
+                "prices",
                 "rate",
                 "cost",
                 "stock",
                 "inventory",
                 "available",
                 "availability",
+                "cheapest",
+                "cheap",
+                "cheaper",
+                "lowest",
                 "sort",
                 "show",
                 "best",
@@ -674,7 +1026,9 @@ class NaturalLanguageQueryEngine:
                 "with",
                 "from",
                 "quote",
+                "quotes",
                 "quotation",
+                "quotations",
                 "moq",
                 "lead",
                 "time",
@@ -682,6 +1036,38 @@ class NaturalLanguageQueryEngine:
                 "certificates",
                 "certification",
                 "certifications",
+                "certified",
+                "country",
+                "origin",
+                "there",
+                "today",
+                "updated",
+                "update",
+                "latest",
+                "vs",
+                "versus",
+                "catalog",
+                "catalogue",
+                "germany",
+                "german",
+                "india",
+                "indian",
+                "china",
+                "chinese",
+                "usa",
+                "us",
+                "them",
+                "they",
+                "same",
+                "previous",
+                "one",
+                "option",
+                "options",
+                "only",
+                "under",
+                "less",
+                "than",
+                "recommend",
             }
         }
         return self._expand_abbreviations(tokens)
@@ -700,6 +1086,8 @@ class NaturalLanguageQueryEngine:
             return ""
         canonical = self._canonical_ingredient_text(question)
         ordered = [token for token in canonical.split() if token in tokens]
+        if ordered and all(token.isdigit() for token in ordered):
+            return ""
         return " ".join(dict.fromkeys(ordered))
 
     def _looks_like_procurement_question(self, question: str) -> bool:
@@ -731,6 +1119,26 @@ class NaturalLanguageQueryEngine:
     def _canonical_ingredient_text(self, value: Any) -> str:
         text = str(value or "").lower()
         text = re.sub(r"(\d+)\s*:\s*(\d+)", r"\1 \2", text)
+        text = re.sub(r"\bashwagandha\s*12(?:\s*1)?\b", "ashwagandha 12 1", text)
+        text = re.sub(r"([a-z]{2,})(\d)", r"\1 \2", text)
+        replacements = {
+            "citrous": "citrus",
+            "citris": "citrus",
+            "citruss": "citrus",
+            "citrus": "citrus",
+            "aswaghanda": "ashwagandha",
+            "ashvagandha": "ashwagandha",
+            "ashwagnda": "ashwagandha",
+            "ashwagandhaa": "ashwagandha",
+            "ashwangandha": "ashwagandha",
+            "aswahgandha": "ashwagandha",
+            "ashwaganda": "ashwagandha",
+            "vit c": "vitamin c",
+            "vitamin c": "vitamin c ascorbic acid",
+            "zinc 12": "zinc gluconate 12",
+        }
+        for source, target in replacements.items():
+            text = re.sub(rf"\b{re.escape(source)}\b", target, text)
         text = re.sub(r"[^a-z0-9]+", " ", text)
         return " ".join(text.split())
 
@@ -745,6 +1153,7 @@ class NaturalLanguageQueryEngine:
         expanded = set(tokens)
         abbreviation_map = {
             "vit": "vitamin",
+            "c": "ascorbic",
             "vitamin": "vit",
             "d3": "d3",
             "b3": "b3",

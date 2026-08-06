@@ -35,9 +35,6 @@ class SupplierRanker:
                         CatalogItem.supplier_id,
                         CatalogItem.ingredient_name,
                         CatalogItem.raw_payload["specification"].astext,
-                        CatalogItem.available_qty,
-                        CatalogItem.unit,
-                        CatalogItem.moq,
                     ),
                     order_by=(
                         CatalogEmail.received_at.desc(),
@@ -50,13 +47,11 @@ class SupplierRanker:
                         CatalogItem.supplier_id,
                         CatalogItem.ingredient_name,
                         CatalogItem.raw_payload["specification"].astext,
-                        CatalogItem.available_qty,
-                        CatalogItem.unit,
-                        CatalogItem.moq,
                     ),
                 ).label("history_count"),
             )
             .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
+            .where(CatalogEmail.processing_status.in_(["completed", "partial"]))
             .subquery()
         )
         result_limit = 50 if matched_ingredient_names else plan.limit
@@ -74,6 +69,7 @@ class SupplierRanker:
             .order_by(CatalogItem.ingredient_name.asc(), nullslast(CatalogItem.price_per_unit.asc()))
             .limit(result_limit)
         )
+        stmt = stmt.where(CatalogEmail.processing_status.in_(["completed", "partial"]))
         if not settings.mock_data_enabled:
             stmt = stmt.where(
                 or_(
@@ -118,6 +114,7 @@ class SupplierRanker:
                 {
                     "supplier_name": supplier.name,
                     "email_domain": supplier.email_domain,
+                    "country": supplier.country,
                     "certifications": supplier.certifications,
                     "ingredient_name": item.ingredient_name,
                     "specification": clean_optional_text(raw_payload.get("specification")),

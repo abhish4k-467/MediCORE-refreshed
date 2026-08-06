@@ -351,20 +351,6 @@ class OpenRouterClient:
         payload = self._json_chat(system, question)
         return QueryPlan.model_validate(payload)
 
-    def classify_supplier_subject(self, subject: str, keywords: list[str] | None = None) -> bool:
-        keyword_context = ", ".join(keywords or [])
-        system = (
-            "Classify whether an email subject is semantically about a supplier selling, quoting, "
-            "offering, or sharing availability for pharmaceutical ingredients, chemicals, APIs, "
-            "excipients, raw materials, catalogues, COA/specifications, stock, or procurement pricing. "
-            "Do not require exact keyword matches. Reject newsletters, webinars, job emails, generic "
-            "marketing, account notifications, unrelated support, and personal messages. "
-            "Return JSON only: {\"is_supplier_sales_email\": true|false, \"reason\": \"short\"}."
-        )
-        user = json.dumps({"subject": subject, "smart_ingestion_keywords": keyword_context})
-        payload = self._json_chat(system, user)
-        return bool(payload.get("is_supplier_sales_email"))
-
     def summarize_answer(self, question: str, rows: list[dict[str, Any]]) -> str:
         compact_rows = [
             {

@@ -34,6 +34,7 @@ class CatalogEmail(Base):
     raw_email_id: Mapped[str] = mapped_column(Text)
     subject: Mapped[str | None] = mapped_column(Text)
     pdf_url: Mapped[str | None] = mapped_column(Text)
+    body_preview: Mapped[str | None] = mapped_column(Text)
     processing_status: Mapped[str] = mapped_column(String(50), default="queued")
 
     supplier: Mapped[Supplier] = relationship(back_populates="emails")
@@ -111,7 +112,6 @@ class EmailSyncSetting(Base):
     notify_on_new_catalog: Mapped[bool] = mapped_column(Boolean, default=True)
     ingestion_approach: Mapped[str] = mapped_column(Text, default="approach_1")
     trusted_suppliers: Mapped[str] = mapped_column(Text, default="")
-    keyword_filters: Mapped[str] = mapped_column(Text, default="catalog, catalogue, price, offer, quote")
     pending_approvals: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

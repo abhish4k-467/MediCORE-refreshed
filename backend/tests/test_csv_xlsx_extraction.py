@@ -45,6 +45,40 @@ class TestCsvXlsxExtraction(unittest.TestCase):
         self.assertEqual(items[3].unit, "kg")
         self.assertEqual(items[3].price_per_unit, 3.10)
 
+    def test_quantity_header_unit_is_added_to_numeric_only_cells(self):
+        csv_text = """Product Name,Specification,Quantity(KG),Price (USD)
+"Marigold Extract","Lutein 20%","446.02","11.00"
+"Ginger Extract","Powder","399.42","8.50"
+"""
+        items = parse_catalog_table_text(csv_text)
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].available_qty, 446.02)
+        self.assertEqual(items[0].unit, "kg")
+        self.assertIn("original_quantity=446.02 kg", items[0].notes or "")
+        self.assertEqual(items[1].available_qty, 399.42)
+        self.assertEqual(items[1].unit, "kg")
+        self.assertIn("original_quantity=399.42 kg", items[1].notes or "")
+
+    def test_header_context_is_added_to_price_moq_and_lead_time_cells(self):
+        csv_text = """Product Name,Specification,Quantity(KG),Price (CAD),MOQ (KG),Lead Time (Days)
+"Marigold Extract","Lutein 20%","446.02","5","25","14"
+"""
+        items = parse_catalog_table_text(csv_text)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].available_qty, 446.02)
+        self.assertEqual(items[0].unit, "kg")
+        self.assertEqual(items[0].currency, "CAD")
+        self.assertEqual(items[0].price_per_unit, 5.0)
+        self.assertEqual(items[0].moq, 25.0)
+        self.assertEqual(items[0].lead_time_days, 14)
+        self.assertEqual(items[0].lead_time_text, "14 days")
+        self.assertIn("original_quantity=446.02 kg", items[0].notes or "")
+        self.assertIn("original_price=CAD 5", items[0].notes or "")
+        self.assertIn("moq=25 kg", items[0].notes or "")
+        self.assertIn("lead_time=14 days", items[0].notes or "")
+
     def test_quantity_column_variations(self):
         csv_text = """Item Name,Stock Qty,Rate/Unit
 Paracetamol,500 kgs,4.50

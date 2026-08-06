@@ -1,11 +1,13 @@
 import csv
 import io
+import logging
 import re
 from datetime import UTC, datetime
 
 from backend.app.schemas import ExtractedCatalogItem, clean_optional_text
 
 CATALOG_TABLE_PARSER_VERSION = "2026-07-27.specification-alignment-v1"
+logger = logging.getLogger(__name__)
 
 MONTHS = {
     "jan": 1,
@@ -54,11 +56,22 @@ QUOTE_ROW_PATTERN = re.compile(
 )
 HEADER_CURRENCY_PATTERN = re.compile(r"price\s*\(\s*(?P<currency>[A-Z$₹€]+)\s*\)", re.IGNORECASE)
 HEADER_UNIT_PATTERN = re.compile(r"(?:quantity|qty|stock|available)\s*(?:\(\s*|\bin\s+)?(?P<unit>[A-Za-z]+)\s*\)?", re.IGNORECASE)
+HEADER_CURRENCY_PATTERN = re.compile(r"(?:price|rate|quote|cost|unit price)\s*\(\s*(?P<currency>[A-Z$â‚¹â‚¬]+)\s*\)", re.IGNORECASE)
+HEADER_MOQ_UNIT_PATTERN = re.compile(r"(?:MOQ|M\.?O\.?Q\.?|minimum order|min qty|minimum quantity)\s*(?:\(\s*|\bin\s+)?(?P<unit>[A-Za-z]+)\s*\)?", re.IGNORECASE)
+HEADER_LEAD_TIME_UNIT_PATTERN = re.compile(r"(?:lead\s*time|lead|delivery|dispatch|delivery\s*time)\s*(?:\(\s*|\bin\s+)?(?P<unit>days?|weeks?|months?)\s*\)?", re.IGNORECASE)
 MOQ_PATTERN = re.compile(
     r"\b(?:MOQ|M\.?O\.?Q\.?)\s*:?\s*(?P<moq>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>kg|g|mg|ml|l|units?|packs?)\b",
     re.IGNORECASE,
 )
 PRODUCT_CODE_PATTERN = re.compile(r"^[A-Z]{2,}\d{3,}[A-Z0-9-]*$")
+PRODUCT_CODE_HEADER_PATTERN = re.compile(
+    r"\b(?:product\s*)?(?:code|sku|item\s*code|item\s*no|ref(?:erence)?|part\s*(?:no|number)|catalog(?:ue)?\s*(?:no|number))\b",
+    re.IGNORECASE,
+)
+CHEMICAL_NAME_HINT_PATTERN = re.compile(
+    r"[a-z]{3,}|(?:acid|chloride|citrate|extract|powder|vitamin|sodium|magnesium|zinc|amino|methyl|quinolinium|hcl|usp|bp|ip)\b",
+    re.IGNORECASE,
+)
 STANDALONE_PRICE_PATTERN = re.compile(r"^(?:US\$|\$|USD|INR|Rs\.?|₹|EUR|€)?\s*\d[\d,]*(?:\.\d+)?\s*$", re.IGNORECASE)
 FOOTER_OR_HEADER_PATTERN = re.compile(
     r"^(?:real-time raw material|sanyuan jinrui|tel:|add:|jinrui product code|product name|"
@@ -127,7 +140,7 @@ def parse_catalog_table_text(
         if quote_item and (not dedupe or _item_key(quote_item) not in seen):
             seen.add(_item_key(quote_item))
             items.append(quote_item)
-    return items
+    return _valid_catalog_items(items)
 
 
 def _parse_vertical_catalog_rows(
@@ -404,7 +417,8 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
         if not name or _looks_like_header(name):
             continue
 
-        price = _number_from_text(_cell(parts, header_map.get("price")))
+        raw_price_cell = _cell(parts, header_map.get("price"))
+        price = _number_from_text(raw_price_cell)
 
         raw_qty = _cell(parts, header_map.get("qty"))
         qty = _number_from_text(raw_qty) if "qty" in header_map else None
@@ -425,12 +439,19 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
 
         currency = _currency_code(
             _cell(parts, header_map.get("currency"))
-            or _currency_from_text(_cell(parts, header_map.get("price")))
+            or _currency_from_text(raw_price_cell)
             or context.get("currency")
             or "INR"
         )
-        moq = _number_from_text(_cell(parts, header_map.get("moq"))) if "moq" in header_map else None
-        lead_time_days = _lead_time_days(_cell(parts, header_map.get("lead_time")))
+        raw_moq = _cell(parts, header_map.get("moq"))
+        moq = _number_from_text(raw_moq) if "moq" in header_map else None
+        moq_header_text = header[header_map["moq"]] if header and "moq" in header_map else ""
+        moq_unit = _header_moq_unit(moq_header_text) or _unit_from_text(raw_moq) or unit
+        raw_lead_time = clean_optional_text(_cell(parts, header_map.get("lead_time")))
+        lead_time_header_text = header[header_map["lead_time"]] if header and "lead_time" in header_map else ""
+        lead_time_unit = _header_lead_time_unit(lead_time_header_text)
+        lead_time_text = _display_with_header_unit(raw_lead_time, lead_time_unit)
+        lead_time_days = _lead_time_days(lead_time_text or raw_lead_time)
         specification = clean_optional_text(_cell(parts, header_map.get("specification")))
         notes_parts = []
         if specification:
@@ -438,15 +459,20 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
         pack = clean_optional_text(_cell(parts, header_map.get("pack")))
         if pack:
             notes_parts.append(f"packaging={pack}")
-        raw_price = clean_optional_text(_cell(parts, header_map.get("price")))
+        raw_price = clean_optional_text(raw_price_cell)
         if raw_price:
-            notes_parts.append(f"original_price={raw_price}")
+            notes_parts.append(f"original_price={_display_price_with_header_currency(raw_price, currency)}")
         raw_qty_note = clean_optional_text(raw_qty)
         if raw_qty_note:
-            notes_parts.append(f"original_quantity={raw_qty_note}")
-        raw_lead_time = clean_optional_text(_cell(parts, header_map.get("lead_time")))
-        if raw_lead_time:
-            notes_parts.append(f"lead_time={raw_lead_time}")
+            original_quantity = raw_qty_note
+            if unit and not _unit_from_text(raw_qty_note):
+                original_quantity = f"{raw_qty_note} {unit}"
+            notes_parts.append(f"original_quantity={original_quantity}")
+        raw_moq_note = clean_optional_text(raw_moq)
+        if raw_moq_note:
+            notes_parts.append(f"moq={_display_with_header_unit(raw_moq_note, moq_unit)}")
+        if lead_time_text:
+            notes_parts.append(f"lead_time={lead_time_text}")
 
         rows.append(
             ExtractedCatalogItem(
@@ -457,7 +483,7 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
                 available_qty=qty,
                 unit=unit,
                 lead_time_days=lead_time_days,
-                lead_time_text=raw_lead_time,
+                lead_time_text=lead_time_text,
                 moq=moq,
                 notes="; ".join(notes_parts) if notes_parts else None,
             )
@@ -501,6 +527,8 @@ def _header_map(parts: list[str]) -> dict[str, int]:
     mapped: dict[str, int] = {}
     for index, part in enumerate(parts):
         lowered = part.lower().strip()
+        if PRODUCT_CODE_HEADER_PATTERN.search(lowered):
+            continue
         if lowered in {"rate/unit", "price/unit", "price/kg", "rate/kg", "price (usd)", "price (inr)"}:
             if "price" not in mapped:
                 mapped["price"] = index
@@ -510,10 +538,47 @@ def _header_map(parts: list[str]) -> dict[str, int]:
             if key not in mapped and any(name in lowered for name in names):
                 mapped[key] = index
 
-    if "name" not in mapped and "specification" in mapped:
-        mapped["name"] = mapped["specification"]
+    if "name" not in mapped:
+        for index, part in enumerate(parts):
+            lowered = part.lower().strip()
+            if lowered in {"description", "item description", "product description"}:
+                mapped["name"] = index
+                break
 
     return mapped
+
+
+def is_valid_ingredient_name(name: object) -> bool:
+    value = clean_optional_text(name)
+    if not value:
+        return False
+    value = value.strip()
+    lowered = value.lower()
+    if _looks_like_header(value):
+        return False
+    if PRODUCT_CODE_PATTERN.match(value):
+        return False
+    if PRODUCT_CODE_HEADER_PATTERN.search(value):
+        return False
+    if STANDALONE_PRICE_PATTERN.match(value):
+        return False
+    if _number_from_text(value) is not None and not re.search(r"[A-Za-z]", value):
+        return False
+    if lowered in {"product", "product name", "ingredient", "ingredient name", "specification", "description", "quantity", "qty", "price", "moq", "unit"}:
+        return False
+    if len(value) < 3:
+        return False
+    return bool(CHEMICAL_NAME_HINT_PATTERN.search(value))
+
+
+def _valid_catalog_items(items: list[ExtractedCatalogItem]) -> list[ExtractedCatalogItem]:
+    valid: list[ExtractedCatalogItem] = []
+    for item in items:
+        if is_valid_ingredient_name(item.ingredient_name):
+            valid.append(item)
+        else:
+            logger.info("Skipping extracted row with invalid ingredient name: %r", item.ingredient_name)
+    return valid
 
 
 def _cell(parts: list[str], index: int | None) -> str:
@@ -536,6 +601,9 @@ def _currency_code(raw: str | None) -> str:
 def _currency_from_text(raw: str | None) -> str | None:
     if not raw:
         return None
+    code_match = re.search(r"(?<![A-Z])(?:USD|INR|EUR|GBP|CAD|AUD|SGD|CHF|AED|CNY|JPY|Rs\.?)(?![A-Z])", raw, flags=re.IGNORECASE)
+    if code_match:
+        return code_match.group(0)
     match = re.search(r"(US\$|\$|₹|€|(?<![A-Z])(?:USD|INR|EUR|Rs\.?)(?![A-Z]))", raw, flags=re.IGNORECASE)
     return match.group(1) if match else None
 
@@ -596,6 +664,41 @@ def _unit_from_text(raw: str | None) -> str | None:
         flags=re.IGNORECASE,
     )
     return _normalize_unit(match.group(1)) if match else None
+
+
+def _header_moq_unit(header: str | None) -> str | None:
+    match = HEADER_MOQ_UNIT_PATTERN.search(header or "")
+    return _normalize_unit(match.group("unit")) if match else None
+
+
+def _header_lead_time_unit(header: str | None) -> str | None:
+    match = HEADER_LEAD_TIME_UNIT_PATTERN.search(header or "")
+    if not match:
+        return None
+    value = match.group("unit").lower().strip()
+    if value.startswith("day"):
+        return "days"
+    if value.startswith("week"):
+        return "weeks"
+    if value.startswith("month"):
+        return "months"
+    return value
+
+
+def _display_with_header_unit(value: str | None, unit: str | None) -> str | None:
+    cleaned = clean_optional_text(value)
+    if not cleaned:
+        return None
+    if not unit or re.search(r"[A-Za-z]", cleaned):
+        return cleaned
+    return f"{cleaned} {unit}"
+
+
+def _display_price_with_header_currency(value: str, currency: str) -> str:
+    cleaned = value.strip()
+    if _currency_from_text(cleaned):
+        return cleaned
+    return f"{currency} {cleaned}".strip()
 
 
 def _extract_moq(text: str) -> tuple[float | None, str | None]:

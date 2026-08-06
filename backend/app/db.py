@@ -43,7 +43,11 @@ def repair_database_url(url: str) -> str:
 
 
 def build_pooler_url() -> URL | None:
-    if not settings.supabase_pooler_host or not settings.supabase_db_password:
+    if (
+        not settings.supabase_pooler_host
+        or not settings.supabase_db_password
+        or not (settings.supabase_pooler_user or settings.supabase_db_user)
+    ):
         return None
 
     return URL.create(
@@ -60,8 +64,24 @@ def is_direct_supabase_url(url: str) -> bool:
     return ".supabase.co:5432" in url and "pooler.supabase.com" not in url
 
 
+def has_explicit_database_url(url: str) -> bool:
+    return bool(url.strip()) and repair_database_url(url) != DEFAULT_DATABASE_URL
+
+
 def build_database_url() -> URL | str:
-    # First, if direct Supabase host is provided, prioritize it for stable direct connection
+    raw_url = settings.database_url.strip()
+    pooler_url = build_pooler_url()
+
+    # Supabase direct hosts can resolve to IPv6-only addresses inside containers.
+    # When the pooler is configured, prefer it over any direct Supabase URL.
+    if has_explicit_database_url(raw_url) and not (
+        pooler_url is not None and is_direct_supabase_url(raw_url)
+    ):
+        return repair_database_url(raw_url)
+
+    if pooler_url is not None:
+        return pooler_url
+
     if settings.supabase_db_host and settings.supabase_db_password:
         return URL.create(
             "postgresql+psycopg",
@@ -71,14 +91,6 @@ def build_database_url() -> URL | str:
             port=settings.supabase_db_port,
             database=settings.supabase_db_name,
         )
-
-    raw_url = settings.database_url.strip()
-    if raw_url and raw_url != DEFAULT_DATABASE_URL and not is_direct_supabase_url(raw_url):
-        return repair_database_url(raw_url)
-
-    pooler_url = build_pooler_url()
-    if pooler_url is not None:
-        return pooler_url
 
     return repair_database_url(raw_url)
 
@@ -92,11 +104,36 @@ def database_url_summary() -> str:
     return f"{parsed.hostname}:{parsed.port or 'default'}{parsed.path or ''}"
 
 
+def is_supabase_transaction_pooler(url: URL | str) -> bool:
+    if isinstance(url, URL):
+        host = str(url.host or "").lower()
+        port = url.port
+    else:
+        parsed = urllib.parse.urlparse(str(url))
+        host = str(parsed.hostname or "").lower()
+        port = parsed.port
+    return host.endswith(".pooler.supabase.com") and port == 6543
+
+
+def database_connect_args(url: URL | str) -> dict:
+    connect_args: dict = {"sslmode": "require"}
+    if is_supabase_transaction_pooler(url):
+        # Transaction pooling can route consecutive transactions to different
+        # PostgreSQL sessions, where Psycopg's named prepared statement is absent.
+        connect_args["prepare_threshold"] = None
+    return connect_args
+
+
 
 def create_app_engine():
     try:
+        database_url = build_database_url()
         logger.info("Using database host: %s", database_url_summary())
-        return create_engine(build_database_url(), pool_pre_ping=True, connect_args={"sslmode": "require"})
+        return create_engine(
+            database_url,
+            pool_pre_ping=True,
+            connect_args=database_connect_args(database_url),
+        )
     except Exception:
         if settings.environment == "production":
             raise

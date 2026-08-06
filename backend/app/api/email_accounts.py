@@ -9,6 +9,7 @@ from backend.app.db import get_db
 from backend.app.auth import get_current_user, encrypt_password
 from backend.app.models import EmailAccount, EmailFilter
 from backend.app.security import validate_public_network_host
+from backend.app.services.email_ingestion import filter_trusted_pending_approvals
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -120,7 +121,6 @@ class EmailSyncSettingResponse(BaseModel):
     notify_on_new_catalog: bool
     ingestion_approach: str
     trusted_suppliers: str
-    keyword_filters: str
     pending_approvals: str
 
     class Config:
@@ -132,7 +132,6 @@ class EmailSyncSettingUpdate(BaseModel):
     notify_on_new_catalog: bool
     ingestion_approach: str
     trusted_suppliers: str
-    keyword_filters: str
     pending_approvals: str
 
 # --- Helpers ---
@@ -286,7 +285,6 @@ def save_email_account(
                 user_id=user_uuid,
                 ingestion_approach=request.ingestion_approach or "approach_1",
                 trusted_suppliers="",
-                keyword_filters="catalog, catalogue, price, offer, quote",
                 pending_approvals=""
             )
             db.add(sync_settings)
@@ -352,7 +350,6 @@ def get_sync_settings(
                 notify_on_new_catalog=True,
                 ingestion_approach="approach_1",
                 trusted_suppliers="",
-                keyword_filters="catalog, catalogue, price, offer, quote",
                 pending_approvals=""
             )
             db.add(settings_row)
@@ -383,7 +380,6 @@ def update_sync_settings(
             poll_interval_minutes=15,
             ingestion_approach="approach_1",
             trusted_suppliers="",
-            keyword_filters="catalog, catalogue, price, offer, quote",
             pending_approvals=""
         )
         db.add(settings_row)
@@ -394,8 +390,10 @@ def update_sync_settings(
         settings_row.notify_on_new_catalog = request.notify_on_new_catalog
         settings_row.ingestion_approach = request.ingestion_approach
         settings_row.trusted_suppliers = request.trusted_suppliers
-        settings_row.keyword_filters = request.keyword_filters
-        settings_row.pending_approvals = request.pending_approvals
+        settings_row.pending_approvals = filter_trusted_pending_approvals(
+            request.pending_approvals,
+            request.trusted_suppliers,
+        )
         db.commit()
         db.refresh(settings_row)
 
@@ -494,7 +492,6 @@ def update_email_account(
                 user_id=user_uuid,
                 ingestion_approach=request.ingestion_approach or "approach_1",
                 trusted_suppliers="",
-                keyword_filters="catalog, catalogue, price, offer, quote",
                 pending_approvals=""
             )
             db.add(sync_settings)

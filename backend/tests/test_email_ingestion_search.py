@@ -5,7 +5,12 @@ from types import SimpleNamespace
 from backend.app.schemas import ExtractedCatalogItem
 from backend.app.services.catalog_table_parser import parse_catalog_table_text
 from backend.app.services.country_detection import detect_supplier_country
-from backend.app.services.email_ingestion import EmailIngestionService
+from backend.app.services.email_ingestion import (
+    EmailIngestionService,
+    filter_trusted_pending_approvals,
+    public_processing_failure,
+    trusted_sender_matches,
+)
 from backend.app.services.nl_query import NaturalLanguageQueryEngine
 from backend.app.services.ranking import SupplierRanker
 
@@ -19,16 +24,94 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
 
         args = self.service._imap_search_args_for_approach("approach_1", account)
 
-        self.assertEqual(args, ("ALL",))
+        self.assertEqual(args, ("UNDELETED", "ALL"))
         self.assertNotIn("UNSEEN", args)
+        self.assertIn("UNDELETED", args)
+
+    def test_trusted_supplier_matches_exact_email_or_domain(self) -> None:
+        trusted = "prisik.da45@gmail.com, example.com"
+
+        self.assertTrue(trusted_sender_matches("Prince <PRISIK.DA45@gmail.com>", trusted))
+        self.assertTrue(trusted_sender_matches("sales@example.com", trusted))
+        self.assertFalse(trusted_sender_matches("other@gmail.com", trusted))
+
+    def test_trusted_supplier_is_removed_from_pending_approvals(self) -> None:
+        pending = (
+            '[{"email_id":"1","sender":"princesikotra.05@gmail.com","ignored":false},'
+            '{"email_id":"2","sender":"new@supplier.com","ignored":false}]'
+        )
+
+        cleaned = filter_trusted_pending_approvals(
+            pending,
+            "princesikotra.05@gmail.com",
+        )
+
+        self.assertNotIn("princesikotra.05@gmail.com", cleaned)
+        self.assertIn("new@supplier.com", cleaned)
+
+    def test_database_exception_is_never_stored_as_public_failure(self) -> None:
+        public_message = public_processing_failure(
+            'Failed: (psycopg.errors.InvalidSqlStatementName) prepared statement "_pg3_1" does not exist'
+        )
+
+        self.assertEqual(public_message, "email extraction could not be completed")
+        self.assertNotIn("psycopg", public_message)
 
     def test_approach_2_new_to_system_is_not_based_on_seen_state(self) -> None:
         account = SimpleNamespace(created_at=datetime(2026, 7, 17, tzinfo=UTC))
 
         args = self.service._imap_search_args_for_approach("approach_2", account)
 
-        self.assertEqual(args, ("SINCE", "17-Jul-2026"))
+        self.assertEqual(args, ("UNDELETED", "SINCE", "17-Jul-2026"))
         self.assertNotIn("UNSEEN", args)
+        self.assertIn("UNDELETED", args)
+
+    def test_email_retry_status_rules_skip_success_but_retry_failed_and_partial(self) -> None:
+        self.assertTrue(self.service._should_skip_logged_email("completed"))
+        self.assertTrue(self.service._should_skip_logged_email("skipped: newsletter or promotional email"))
+        self.assertTrue(self.service._should_skip_logged_email("deleted"))
+        self.assertFalse(self.service._should_skip_logged_email("failed: OCR error"))
+        self.assertFalse(self.service._should_skip_logged_email("partial"))
+
+    def test_supplier_catalogue_intent_accepts_image_attachments(self) -> None:
+        attachments = [{"filename": "supplier-catalogue.jpeg", "ext": ".jpeg"}]
+
+        self.assertTrue(self.service._has_supplier_catalogue_intent("", "", attachments))
+
+    def test_item_identity_uses_ingredient_and_specification_only(self) -> None:
+        previous = SimpleNamespace(
+            ingredient_name="Ashwagandha Extract",
+            price_per_unit=20,
+            currency="USD",
+            available_qty=25,
+            unit="kg",
+            lead_time_days=None,
+            moq=10,
+            raw_payload={"specification": "KSM-66"},
+        )
+        updated = ExtractedCatalogItem(
+            ingredient_name="Ashwagandha Extract",
+            specification="KSM-66",
+            price_per_unit=18,
+            currency="USD",
+            available_qty=100,
+            unit="kg",
+            moq=25,
+            notes="source='Updated Price: Ashwagandha Extract KSM-66 $18/kg'",
+        )
+
+        self.assertEqual(self.service._item_identity_key(previous), self.service._item_identity_key(updated))
+        self.assertTrue(self.service._catalog_item_values_changed(previous, updated))
+
+    def test_commercial_reply_update_extracts_price_moq_and_lead_time(self) -> None:
+        updates = self.service._commercial_updates_from_text(
+            "Updated Price: $18/kg\nMOQ: 25 kg\nLead Time: 14 days"
+        )
+
+        self.assertEqual(updates["price_per_unit"], 18.0)
+        self.assertEqual(updates["currency"], "USD")
+        self.assertEqual(updates["moq"], 25.0)
+        self.assertEqual(updates["lead_time_days"], 14)
 
     def test_parser_preserves_lead_time_range_text(self) -> None:
         rows = parse_catalog_table_text(
@@ -118,6 +201,28 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         self.assertIn("supplier_sku=JRG1287-A319", rows[0].notes or "")
         self.assertEqual(rows[0].specification, "Assay: >=99.0%")
         self.assertIn("original_price=$30/kg", rows[0].notes or "")
+
+    def test_product_code_column_is_not_mapped_as_ingredient_name(self) -> None:
+        rows = parse_catalog_table_text(
+            "Product Code | Product Name | Specification | Price\n"
+            "JRG1291-A322 | 5-Amino-1-methylquinolinium Chloride | Purity >=98.0% | 1477\n"
+            "JRG0436-A32 | 3,3'-Diindolylmethane | Assay >=99.0% | 30\n"
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].ingredient_name, "5-Amino-1-methylquinolinium Chloride")
+        self.assertEqual(rows[0].specification, "Purity >=98.0%")
+        self.assertEqual(rows[0].price_per_unit, 1477.0)
+        self.assertEqual(rows[1].ingredient_name, "3,3'-Diindolylmethane")
+        self.assertNotIn("JRG1291-A322", [row.ingredient_name for row in rows])
+
+    def test_code_only_or_spec_only_rows_are_skipped(self) -> None:
+        rows = parse_catalog_table_text(
+            "Product Code | Specification | Price | MOQ\n"
+            "JRG1291-A322 | Purity >=98.0% | 1477 | 1 kg\n"
+        )
+
+        self.assertEqual(rows, [])
 
     def test_generic_table_extracts_specification_column_and_keeps_variants(self) -> None:
         rows = parse_catalog_table_text(
@@ -477,6 +582,113 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
             set(matched.matched_names),
             {"Vitamin D3 Powder (Lichen)", "Vitamin D3 100,000 IU/g"},
         )
+
+    def test_query_engine_normalizes_common_typos_and_partial_entities(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+
+        citrus = engine._best_ingredient_result_from_candidates(
+            "who sells citrous",
+            ["Citrus Bioflavonoids", "Citric Acid", "Ashwagandha Extract"],
+        )
+        zinc = engine._best_ingredient_result_from_candidates(
+            "zinc 12 supplier",
+            ["Zinc Gluconate 12%", "Zinc Oxide", "Magnesium Citrate"],
+        )
+        vitamin_c = engine._best_ingredient_result_from_candidates(
+            "best supplier for vit c",
+            ["Ascorbic Acid", "Vitamin D3 Powder", "Citric Acid"],
+        )
+
+        self.assertEqual(citrus.search_phrase, "citrus")
+        self.assertIn("Citrus Bioflavonoids", citrus.matched_names)
+        self.assertEqual(zinc.search_phrase, "zinc gluconate 12")
+        self.assertIn("Zinc Gluconate 12%", zinc.matched_names)
+        self.assertIn(vitamin_c.search_phrase, {"ascorbic", "ascorbic acid", "vitamin c"})
+        self.assertIn("Ascorbic Acid", vitamin_c.matched_names)
+
+    def test_query_understanding_does_not_force_item_for_general_procurement_question(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+
+        understood = engine._understand_query("Supplier from Germany")
+
+        self.assertEqual(understood.intent, "country_origin")
+        self.assertFalse(understood.requires_item)
+        self.assertTrue(understood.needs_database)
+        self.assertEqual(understood.filters["country"], "Germany")
+
+    def test_query_understanding_extracts_entity_before_filters(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+
+        price_query = engine._understand_query("Citrus available at what price in 2025")
+        related_query = engine._understand_query("List all citrus related items")
+        supplier_query = engine._understand_query("Cheapest citrus supplier")
+
+        self.assertEqual(price_query.intent, "price_lookup")
+        self.assertEqual(price_query.entity_phrase, "citrus")
+        self.assertEqual(related_query.intent, "product_search")
+        self.assertEqual(related_query.entity_phrase, "citrus")
+        self.assertEqual(supplier_query.intent, "price_lookup")
+        self.assertEqual(supplier_query.operation, "best_price")
+        self.assertEqual(supplier_query.entity_phrase, "citrus")
+
+    def test_query_understanding_supports_no_item_supplier_filters(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+
+        india = engine._understand_query("is there any supplier from india")
+        moq = engine._understand_query("best supplier with MOQ below 100")
+        certificate = engine._understand_query("show suppliers with certificate")
+        updates = engine._understand_query("which supplier updated prices today")
+        lead_time = engine._understand_query("which supplier has lowest lead time")
+        supplier_compare = engine._understand_query("compare Prince Sikotra and CSN")
+
+        self.assertEqual(india.intent, "country_origin")
+        self.assertFalse(india.requires_item)
+        self.assertTrue(india.needs_database)
+        self.assertEqual(india.entity_phrase, "")
+        self.assertEqual(india.filters["country"], "India")
+        self.assertEqual(moq.intent, "moq")
+        self.assertFalse(moq.requires_item)
+        self.assertEqual(moq.filters["max_moq"], 100.0)
+        self.assertEqual(certificate.intent, "certifications")
+        self.assertFalse(certificate.requires_item)
+        self.assertTrue(certificate.filters["has_certificate"])
+        self.assertEqual(updates.intent, "updates")
+        self.assertFalse(updates.requires_item)
+        self.assertTrue(updates.filters["updated_only"])
+        self.assertEqual(updates.entity_phrase, "")
+        self.assertEqual(lead_time.intent, "lead_time")
+        self.assertFalse(lead_time.requires_item)
+        self.assertEqual(lead_time.filters["rank_by"], "lead_time")
+        self.assertEqual(supplier_compare.intent, "compare_suppliers")
+        self.assertFalse(supplier_compare.requires_item)
+        self.assertEqual(supplier_compare.filters["supplier_names"], ["Prince Sikotra", "CSN"])
+
+    def test_query_normalization_preserves_spec_ratio_for_joined_terms(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+
+        self.assertEqual(engine._extract_ingredient_phrase("ashwagandha12 supplier"), "ashwagandha 12 1")
+
+    def test_query_engine_offers_possible_matches_for_low_confidence_ingredient(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+
+        matched = engine._best_ingredient_result_from_candidates(
+            "ashwgnd supplier",
+            ["Ashwagandha Extract", "Amla Extract", "Citrus Extract"],
+        )
+        answer = engine._ingredient_clarification_answer("ashwgnd", matched)
+
+        self.assertIsNone(matched.search_phrase)
+        self.assertIn("possible matches", answer)
+
+    def test_query_engine_answers_current_item_from_memory_without_database(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+        engine.conversation_state = {"last_search_phrase": "citrus"}
+        engine._log_query = lambda *args, **kwargs: None
+
+        response = engine.answer("Which item did I ask?")
+
+        self.assertEqual(response.answer, "You asked about citrus.")
+        self.assertEqual(response.rows, [])
 
     def test_query_engine_rejects_unrelated_weak_ingredient_match(self) -> None:
         engine = object.__new__(NaturalLanguageQueryEngine)

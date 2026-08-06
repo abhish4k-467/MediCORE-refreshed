@@ -37,7 +37,9 @@ services:
     ports:
       - "8000:8000"
     volumes:
-       - .:/app
+      - ./backend:/app/backend
+      - ./pyproject.toml:/app/pyproject.toml:ro
+      - ./uv.lock:/app/uv.lock:ro 
     depends_on:
       valkey:
         condition: service_healthy
