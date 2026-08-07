@@ -52,6 +52,9 @@ type CertificatePdf = {
 
 type SupplierItem = {
   ingredient_name: string;
+  supplier_name?: string;
+  email_domain?: string | null;
+  country?: string | null;
   specification?: string | null;
   price_per_unit: number | null;
   currency: string;
@@ -108,6 +111,7 @@ type InboxThread = {
   id: string;
   supplier_name: string;
   email_domain: string;
+  country?: string | null;
   item_count: number;
   latest_item: string;
   received_at: string | null;
@@ -906,6 +910,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const [certificateModalItems, setCertificateModalItems] = useState<CertificatePdf[] | null>(null);
   const [expandedCompareRows, setExpandedCompareRows] = useState<Record<string, boolean>>({});
   const [expandedAssistantRows, setExpandedAssistantRows] = useState<Record<string, boolean>>({});
+  const [expandedCatalogRows, setExpandedCatalogRows] = useState<Record<string, boolean>>({});
+  const [expandedInboxRows, setExpandedInboxRows] = useState<Record<string, boolean>>({});
   const [catalogSearch, setCatalogSearch] = useState("");
   const [catalogFilter, setCatalogFilter] = useState<"all" | "best" | "low-stock">("all");
   const [compareIngredient, setCompareIngredient] = useState("");
@@ -1099,6 +1105,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         id: email.id,
         supplier_name: email.supplier_name,
         email_domain: items[0]?.email_domain ?? meta?.email_domain ?? "-",
+        country: meta?.country ?? (items[0] as any)?.country ?? "Unknown",
         item_count: itemCount,
         latest_item: email.subject || bestItem?.ingredient_name || "Email stored, extraction pending",
         received_at: email.received_at,
@@ -1770,7 +1777,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
           return {
             ...item,
             email_domain: item.email_domain ?? meta?.email_domain ?? "-",
-            country: meta?.country ?? "Unknown",
+            country: (item as any).country ?? meta?.country ?? "Unknown",
             certifications: meta?.certifications ?? null,
           };
         });
@@ -3200,10 +3207,27 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                                 ) : (
                                   selectedInboxThread.items.slice(0, 4).map((item, index) => {
                                     const bestPrice = Math.min(...selectedInboxThread.items.map((row) => safePrice(row.price_per_unit, row.currency)));
+                                    const rowKey = `${item.supplier_name || selectedInboxThread.supplier_name}-${item.ingredient_name}-${index}`;
+                                    const expanded = Boolean(expandedInboxRows[rowKey]);
                                     return (
-                                      <tr key={`${item.supplier_name}-${item.ingredient_name}-${index}`}>
+                                      <tr key={rowKey}>
                                         <td>{index + 1}</td>
-                                        <td className="two-line-cell">{renderItemName(item)}</td>
+                                        <td className="two-line-cell">
+                                          <button
+                                            className="expandable-item-button"
+                                            type="button"
+                                            onClick={() => setExpandedInboxRows((current) => ({ ...current, [rowKey]: !current[rowKey] }))}
+                                          >
+                                            <span>{renderItemName(item)}</span>
+                                          </button>
+                                          {expanded && (
+                                            <div className="expanded-supplier-inline">
+                                              <span><b>Supplier:</b> <strong>{displayText(item.supplier_name || selectedInboxThread.supplier_name)}</strong></span>
+                                              <span><b>Email:</b> <strong>{displayText(item.email_domain || selectedInboxThread.email_domain)}</strong></span>
+                                              <span><b>Country:</b> <strong>{displayText(item.country || selectedInboxThread.country || "Unknown")}</strong></span>
+                                            </div>
+                                          )}
+                                        </td>
                                         <td className="two-line-cell specification-cell">{displaySpecification(item)}</td>
                                         <td>{displayPrice(item)}</td>
                                         <td>{displayQuantity(item)}</td>
@@ -3328,10 +3352,27 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                             : safeQty(item.available_qty) <= minQty * 1.35
                               ? "Low stock"
                               : "Good";
+                          const rowKey = `${item.supplier_name || selectedCatalog.supplier_name}-${item.ingredient_name}-${index}`;
+                          const expanded = Boolean(expandedCatalogRows[rowKey]);
                           return (
-                            <tr key={`${item.supplier_name}-${item.ingredient_name}-${index}`}>
+                            <tr key={rowKey}>
                               <td>{index + 1}</td>
-                              <td className="two-line-cell">{renderItemName(item)}</td>
+                              <td className="two-line-cell">
+                                <button
+                                  className="expandable-item-button"
+                                  type="button"
+                                  onClick={() => setExpandedCatalogRows((current) => ({ ...current, [rowKey]: !current[rowKey] }))}
+                                >
+                                  <span>{renderItemName(item)}</span>
+                                </button>
+                                {expanded && (
+                                  <div className="expanded-supplier-inline">
+                                    <span><b>Supplier:</b> <strong>{displayText(item.supplier_name || selectedCatalog.supplier_name)}</strong></span>
+                                    <span><b>Email:</b> <strong>{displayText(item.email_domain || selectedCatalog.email_domain)}</strong></span>
+                                    <span><b>Country:</b> <strong>{displayText(item.country || selectedCatalog.country || "Unknown")}</strong></span>
+                                  </div>
+                                )}
+                              </td>
                               <td className="two-line-cell specification-cell">{displaySpecification(item)}</td>
                               <td>{displayPrice(item)}</td>
                               <td>{displayQuantity(item)}</td>
@@ -3467,8 +3508,9 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                                   </button>
                                   {expanded && (
                                     <div className="expanded-supplier-inline">
-                                      <span><b>Supplier:</b> <strong>{row.supplier_name}</strong></span>
-                                      <span><b>Email:</b> <strong>{row.email_domain || "-"}</strong></span>
+                                      <span><b>Supplier:</b> <strong>{displayText(row.supplier_name)}</strong></span>
+                                      <span><b>Email:</b> <strong>{displayText(row.email_domain)}</strong></span>
+                                      <span><b>Country:</b> <strong>{displayText(row.country || "Unknown")}</strong></span>
                                     </div>
                                   )}
                                 </td>
@@ -3550,6 +3592,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                                   <div className="expanded-supplier-inline">
                                     <span><b>Supplier:</b> <strong>{displayText(row.supplier_name)}</strong></span>
                                     <span><b>Email:</b> <strong>{displayText(row.email_domain)}</strong></span>
+                                    <span><b>Country:</b> <strong>{displayText((row as any).country || "Unknown")}</strong></span>
                                   </div>
                                 )}
                               </td>

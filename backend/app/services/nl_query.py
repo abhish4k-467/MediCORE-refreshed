@@ -246,6 +246,8 @@ class NaturalLanguageQueryEngine:
                     if norm.get(alias):
                         norm["email_domain"] = norm[alias]
                         break
+            if not norm.get("country"):
+                norm["country"] = "Unknown"
 
             self._normalize_received_at(norm)
 
@@ -365,7 +367,7 @@ class NaturalLanguageQueryEngine:
             row["certificate_pdfs"] = self._certificate_pdfs(raw_payload)
 
     def _hydrate_missing_supplier_email(self, rows: list[dict[str, Any]]) -> None:
-        missing_rows = [row for row in rows if not row.get("email_domain")]
+        missing_rows = [row for row in rows if not row.get("email_domain") or not row.get("country") or row.get("country") == "Unknown"]
         item_ids = {
             self._coerce_uuid(row.get("id") or row.get("item_id") or row.get("catalog_item_id"))
             for row in missing_rows
@@ -374,21 +376,25 @@ class NaturalLanguageQueryEngine:
         if not item_ids:
             return
 
-        email_by_item_id: dict[Any, str] = {}
+        info_by_item_id: dict[Any, tuple[str, str]] = {}
         try:
-            for item_id, email_domain in self.db.execute(
-                select(CatalogItem.id, Supplier.email_domain)
+            for item_id, email_domain, country in self.db.execute(
+                select(CatalogItem.id, Supplier.email_domain, Supplier.country)
                 .join(Supplier, Supplier.id == CatalogItem.supplier_id)
                 .where(CatalogItem.id.in_(item_ids))
             ):
-                email_by_item_id[item_id] = email_domain
+                info_by_item_id[item_id] = (email_domain, country or "Unknown")
         except Exception:
             return
 
         for row in missing_rows:
             item_id = self._coerce_uuid(row.get("id") or row.get("item_id") or row.get("catalog_item_id"))
-            if item_id and email_by_item_id.get(item_id):
-                row["email_domain"] = email_by_item_id[item_id]
+            if item_id and info_by_item_id.get(item_id):
+                email_domain, country = info_by_item_id[item_id]
+                if not row.get("email_domain"):
+                    row["email_domain"] = email_domain
+                if not row.get("country") or row.get("country") == "Unknown":
+                    row["country"] = country
 
     def _certificate_pdfs(self, raw_payload: dict | None) -> list[dict[str, str]]:
         values = (raw_payload or {}).get("certificate_pdfs")

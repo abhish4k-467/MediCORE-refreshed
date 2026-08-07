@@ -140,6 +140,7 @@ def mock_catalog_emails(limit: int) -> list[dict]:
 def mock_catalog_items(q: str | None, limit: int) -> list[dict]:
     suppliers, emails, items = build_catalogs()
     supplier_names = {supplier.id: supplier.name for supplier in suppliers}
+    supplier_countries = {supplier.id: supplier.country for supplier in suppliers}
     email_received_dates = {email.id: email.received_at for email in emails}
     filtered_items = [item for item in items if not q or q.lower() in item.ingredient_name.lower()]
     return [
@@ -148,6 +149,7 @@ def mock_catalog_items(q: str | None, limit: int) -> list[dict]:
             "catalog_email_id": str(item.catalog_email_id) if getattr(item, "catalog_email_id", None) else None,
             "supplier_name": supplier_names.get(item.supplier_id, "Mock supplier"),
             "email_domain": "",
+            "country": supplier_countries.get(item.supplier_id, "Unknown"),
             "ingredient_name": item.ingredient_name,
             "specification": display_value(item.raw_payload, "specification"),
             "price_per_unit": nullable_float(item.price_per_unit),
@@ -225,7 +227,7 @@ def list_catalog_items(
     settings = get_settings()
     user_uuid = UUID(current_user["tenant_id"])
     stmt = (
-        select(CatalogItem, Supplier.name, Supplier.email_domain, CatalogEmail.received_at, None)
+        select(CatalogItem, Supplier.name, Supplier.email_domain, Supplier.country, CatalogEmail.received_at, None)
         .join(Supplier, Supplier.id == CatalogItem.supplier_id)
         .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
     )
@@ -261,7 +263,7 @@ def list_catalog_items(
             .subquery()
         )
         stmt = (
-            select(CatalogItem, Supplier.name, Supplier.email_domain, CatalogEmail.received_at, latest_items.c.history_count)
+            select(CatalogItem, Supplier.name, Supplier.email_domain, Supplier.country, CatalogEmail.received_at, latest_items.c.history_count)
             .join(Supplier, Supplier.id == CatalogItem.supplier_id)
             .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
         )
@@ -308,6 +310,7 @@ def list_catalog_items(
                 "catalog_email_id": str(item.catalog_email_id) if item.catalog_email_id else None,
                 "supplier_name": supplier_name,
                 "email_domain": email_domain,
+                "country": country or "Unknown",
                 "ingredient_name": item.ingredient_name,
                 "specification": display_value(item.raw_payload, "specification"),
                 "price_per_unit": nullable_float(item.price_per_unit),
@@ -327,7 +330,7 @@ def list_catalog_items(
                 "is_updated": bool((item.raw_payload or {}).get("is_updated")) or bool(history_count and history_count > 1),
                 "received_at": received_at,
             }
-            for item, supplier_name, email_domain, received_at, history_count in db.execute(stmt)
+            for item, supplier_name, email_domain, country, received_at, history_count in db.execute(stmt)
         ]
         if q:
             rows.sort(

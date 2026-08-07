@@ -13,16 +13,16 @@ TENANT_ID = UUID(os.getenv("MOCK_TENANT_ID", "11111111-1111-4111-8111-1111111111
 NAMESPACE = UUID("22222222-2222-4222-8222-222222222222")
 
 SUPPLIERS = [
-    ("Aarav Pharma Excipients", "aaravpharma.example"),
-    ("BioNova Ingredients", "bionova.example"),
-    ("Cedar API Traders", "cedarapi.example"),
-    ("Dhanvantari Nutraceuticals", "dhanvantari.example"),
-    ("Evergreen Fine Chemicals", "evergreenfine.example"),
-    ("Fusion Life Sciences", "fusionlife.example"),
-    ("Galaxy Medisource", "galaxymedi.example"),
-    ("Horizon Bulk Actives", "horizonbulk.example"),
-    ("Indigo Healthcare Inputs", "indigohealth.example"),
-    ("Jasmine Specialty Pharma", "jasminespecialty.example"),
+    ("Aarav Pharma Excipients", "aaravpharma.example", "India"),
+    ("BioNova Ingredients", "bionova.example", "Germany"),
+    ("Cedar API Traders", "cedarapi.example", "China"),
+    ("Dhanvantari Nutraceuticals", "dhanvantari.example", "India"),
+    ("Evergreen Fine Chemicals", "evergreenfine.example", "USA"),
+    ("Fusion Life Sciences", "fusionlife.example", "Switzerland"),
+    ("Galaxy Medisource", "galaxymedi.example", "India"),
+    ("Horizon Bulk Actives", "horizonbulk.example", "China"),
+    ("Indigo Healthcare Inputs", "indigohealth.example", "India"),
+    ("Jasmine Specialty Pharma", "jasminespecialty.example", "Germany"),
 ]
 
 ITEMS = [
@@ -65,7 +65,7 @@ def build_catalogs() -> tuple[list[Supplier], list[CatalogEmail], list[CatalogIt
         "ISO, GMP, Halal",
     ]
 
-    for catalog_no, (supplier_name, domain) in enumerate(SUPPLIERS, start=1):
+    for catalog_no, (supplier_name, domain, country) in enumerate(SUPPLIERS, start=1):
         supplier_id = stable_uuid(f"supplier:{domain}")
         received_at = today - timedelta(days=rng.randint(0, 21), hours=rng.randint(1, 9))
         certs = cert_list[(catalog_no - 1) % len(cert_list)]
@@ -75,6 +75,7 @@ def build_catalogs() -> tuple[list[Supplier], list[CatalogEmail], list[CatalogIt
                 tenant_id=TENANT_ID,
                 name=supplier_name,
                 email_domain=domain,
+                country=country,
                 last_email_date=received_at,
                 certifications=certs,
             )

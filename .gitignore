@@ -40,3 +40,5 @@ md/*
 scratch
 start.py
 backups/
+.uv-verify-venv
+MediCORE-Admin/md
