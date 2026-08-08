@@ -155,7 +155,7 @@ def _grid_row_cells(
         text = " ".join(line.text for line in sorted(cell_lines, key=lambda value: (value.center_y, value.center_x))).strip()
         header = headers[column_index] if headers and column_index < len(headers) else ""
         if image is not None and _needs_cell_ocr(text, header):
-            text = _ocr_grid_cell(image, left, top, right, bottom) or text
+            text = _ocr_grid_cell(image, left, top, right, bottom, header) or text
         cells.append(text)
     return cells
 
@@ -166,12 +166,16 @@ def _needs_cell_ocr(text: str, header: str) -> bool:
         return header in {"product", "price", "quantity", "quantity_kg", "lead_time"}
     if header == "product" and re.search(r"[\[\]{}*]{2,}|CdSSC|Suess", cleaned, flags=re.IGNORECASE):
         return True
+    if header == "lead_time" and cleaned.lower() in {"d", "day", "days"}:
+        return True
     if header == "price" and re.search(r"\b(?:CIF|FOB|EXW|CNF|C&F)\b", cleaned, flags=re.IGNORECASE) and not re.search(r"\$|USD|INR|Rs\.?|\d+\s*/\s*[A-Za-z]+", cleaned, flags=re.IGNORECASE):
+        return True
+    if header == "price" and cleaned and not _ocr_price_text_has_signal(cleaned):
         return True
     return False
 
 
-def _ocr_grid_cell(image: Image.Image, left: int, top: int, right: int, bottom: int) -> str:
+def _ocr_grid_cell(image: Image.Image, left: int, top: int, right: int, bottom: int, header: str = "") -> str:
     try:
         import pytesseract
 
@@ -188,15 +192,27 @@ def _ocr_grid_cell(image: Image.Image, left: int, top: int, right: int, bottom: 
             )
         )
         crop = ImageOps.autocontrast(crop.convert("L")).convert("RGB")
+        config = "--oem 1 --psm 7 -c preserve_interword_spaces=1"
+        if header == "price":
+            config += " -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789$./-"
+        elif header == "lead_time":
+            config += " -c tessedit_char_whitelist=0123456789DdAaYySsWwEeKkMmOoNnTtHh-~"
         text = pytesseract.image_to_string(
             crop,
             lang=settings.tesseract_lang,
-            config="--oem 1 --psm 7 -c preserve_interword_spaces=1",
+            config=config,
         )
         return clean_text(text)
     except Exception:
         logger.debug("Cell OCR failed", exc_info=True)
         return ""
+
+
+def _ocr_price_text_has_signal(text: str) -> bool:
+    return bool(
+        re.search(r"\$|USD|INR|Rs\.?|EUR|GBP|\d[\d,]*(?:\.\d+)?\s*/\s*[A-Za-z]+", text, flags=re.IGNORECASE)
+        or re.search(r"\b(?:CIF|FOB|EXW|CNF|C&F|on request|upon request|negotiable|market price|quote)\b", text, flags=re.IGNORECASE)
+    )
 
 
 def _extract_unbordered_table(lines: list[OCRTextLine], source_name: str) -> GridExtractionResult | None:
@@ -390,7 +406,27 @@ def extract_price_parts(text: str) -> tuple[str, str]:
     )
     if match:
         return clean_text(match.group(1)), currency
-    return clean_text(text), currency
+    cleaned = clean_text(text or "")
+    if re.search(
+        r"\b(?:on request|upon request|ask|negotiable|market price|current price|quote)\b",
+        cleaned,
+        flags=re.IGNORECASE,
+    ):
+        return cleaned, currency
+    return "", currency
+
+
+def normalize_lead_time_text(text: str) -> str:
+    cleaned = clean_text(text)
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"\b(\d+\s*(?:-|to|~)\s*\d+)\s*d\b", r"\1 days", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(\d+)\s*d\b", r"\1 days", cleaned, flags=re.IGNORECASE)
+    if re.search(r"\d+\s*(?:-|to|~)\s*\d+\s*days?\b|\d+\s*days?\b", cleaned, flags=re.IGNORECASE):
+        return cleaned
+    if re.search(r"\b(?:ready|stock|dispatch|delivery|lead)\b", cleaned, flags=re.IGNORECASE):
+        return cleaned
+    return ""
 
 
 def rows_to_catalog_table_text(rows: list[dict[str, Any]]) -> str:
@@ -406,9 +442,7 @@ def rows_to_catalog_table_text(rows: list[dict[str, Any]]) -> str:
         unit_text = clean_text(cells.get("unit", ""))
         price_text = clean_text(cells.get("price", ""))
         currency_text = clean_text(cells.get("currency", ""))
-        lead_text = clean_text(cells.get("lead_time", ""))
-        if lead_text and not re.search(r"\d|days?|weeks?|months?", lead_text, flags=re.IGNORECASE):
-            lead_text = ""
+        lead_text = normalize_lead_time_text(cells.get("lead_time", ""))
         moq_text = clean_text(cells.get("moq", ""))
         quantity, quantity_unit, moq, pack_size = extract_quantity_parts(" ".join([quantity_text, moq_text]))
         price, currency = extract_price_parts(" ".join([price_text, currency_text]).strip())
@@ -418,8 +452,8 @@ def rows_to_catalog_table_text(rows: list[dict[str, Any]]) -> str:
             notes.append(f"original_quantity={quantity_text}")
         if specification:
             notes.append(f"specification={specification}")
-        if price_text:
-            notes.append(f"original_price={price_text}")
+        if price:
+            notes.append(f"original_price={price}")
         if lead_text:
             notes.append(f"lead_time={lead_text}")
         lines.append(

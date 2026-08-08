@@ -25,6 +25,7 @@ from backend.app.db import get_supabase
 from backend.app.models import CatalogEmail, CatalogItem, Supplier
 from backend.app.services.catalog_table_parser import (
     CATALOG_TABLE_PARSER_VERSION,
+    _header_map,
     extract_pack_size,
     is_valid_ingredient_name,
     parse_catalog_table_text,
@@ -1834,13 +1835,241 @@ class EmailIngestionService:
         return "\n\n".join(dict.fromkeys(texts))
 
     def _extract_spreadsheet_text(self, file_path: Path, ext: str) -> str:
+        if ext in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+            xlsx_text = self._extract_xlsx_tables_text(file_path)
+            if xlsx_text:
+                return xlsx_text
         return self._extract_with_anydoc(file_path, fallback_format=ext.lstrip("."))
 
     def _extract_csv_tables_text(self, file_path: Path) -> str:
         return self._extract_with_anydoc(file_path, fallback_format="csv")
 
     def _extract_xlsx_tables_text(self, file_path: Path) -> str:
+        text = self._extract_xlsx_tables_from_xml(file_path)
+        if text:
+            return text
         return self._extract_with_anydoc(file_path, fallback_format=file_path.suffix.lower().lstrip("."))
+
+    def _extract_xlsx_tables_from_xml(self, file_path: Path) -> str:
+        try:
+            with zipfile.ZipFile(file_path) as workbook:
+                shared_strings = self._xlsx_shared_strings(workbook)
+                sheets = self._xlsx_sheets(workbook)
+                sections: list[str] = []
+                global_table_number = 0
+                for sheet_name, sheet_path in sheets:
+                    try:
+                        cells = self._xlsx_sheet_cells(workbook, sheet_path, shared_strings)
+                    except Exception:
+                        logger.debug("Failed reading worksheet %s in %s", sheet_name, file_path.name, exc_info=True)
+                        continue
+                    for table in self._detect_xlsx_tables(cells):
+                        global_table_number += 1
+                        sections.append(
+                            self._format_xlsx_table(
+                                sheet_name,
+                                global_table_number,
+                                table["start_row"],
+                                table["start_col"],
+                                table["header"],
+                                table["rows"],
+                            )
+                        )
+                text = "\n\n".join(sections).strip()
+                if text:
+                    logger.info(
+                        "XLSX XML scanner extracted %s table(s) from %s",
+                        global_table_number,
+                        file_path.name,
+                    )
+                return text
+        except Exception:
+            logger.debug("XLSX XML scanner failed for %s; falling back to anydoc", file_path.name, exc_info=True)
+            return ""
+
+    def _xlsx_shared_strings(self, workbook: zipfile.ZipFile) -> list[str]:
+        try:
+            root = self._xml_root(workbook.read("xl/sharedStrings.xml"))
+        except KeyError:
+            return []
+        ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        strings: list[str] = []
+        for si in root.findall("s:si", ns):
+            text = "".join(node.text or "" for node in si.findall(".//s:t", ns))
+            strings.append(" ".join(text.split()).strip())
+        return strings
+
+    def _xlsx_sheets(self, workbook: zipfile.ZipFile) -> list[tuple[str, str]]:
+        root = self._xml_root(workbook.read("xl/workbook.xml"))
+        rels_root = self._xml_root(workbook.read("xl/_rels/workbook.xml.rels"))
+        workbook_ns = {
+            "s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        }
+        rel_ns = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+        targets = {
+            rel.attrib.get("Id"): rel.attrib.get("Target", "")
+            for rel in rels_root.findall("r:Relationship", rel_ns)
+        }
+        sheets: list[tuple[str, str]] = []
+        for sheet in root.findall(".//s:sheet", workbook_ns):
+            rel_id = sheet.attrib.get(f"{{{workbook_ns['r']}}}id")
+            target = targets.get(rel_id)
+            if not target:
+                continue
+            path = target.lstrip("/")
+            if not path.startswith("xl/"):
+                path = f"xl/{path}"
+            sheets.append((sheet.attrib.get("name", "Sheet"), path))
+        return sheets
+
+    def _xlsx_sheet_cells(
+        self,
+        workbook: zipfile.ZipFile,
+        sheet_path: str,
+        shared_strings: list[str],
+    ) -> dict[tuple[int, int], str]:
+        root = self._xml_root(workbook.read(sheet_path))
+        ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        cells: dict[tuple[int, int], str] = {}
+        for cell in root.findall(".//s:sheetData/s:row/s:c", ns):
+            ref = cell.attrib.get("r", "")
+            row_index, col_index = self._xlsx_cell_ref_to_indexes(ref)
+            if row_index <= 0 or col_index <= 0:
+                continue
+            text = self._xlsx_cell_text(cell, shared_strings, ns)
+            if text:
+                cells[(row_index, col_index)] = text
+        return cells
+
+    def _xlsx_cell_text(self, cell: Any, shared_strings: list[str], ns: dict[str, str]) -> str:
+        cell_type = cell.attrib.get("t")
+        if cell_type == "s":
+            value = cell.find("s:v", ns)
+            try:
+                return shared_strings[int(value.text or "0")].strip() if value is not None else ""
+            except (IndexError, ValueError):
+                return ""
+        if cell_type == "inlineStr":
+            return " ".join((node.text or "") for node in cell.findall(".//s:t", ns)).strip()
+        value = cell.find("s:v", ns)
+        if value is None or value.text is None:
+            return ""
+        return " ".join(value.text.split()).strip()
+
+    def _detect_xlsx_tables(self, cells: dict[tuple[int, int], str]) -> list[dict[str, Any]]:
+        if not cells:
+            return []
+        rows = sorted({row for row, _ in cells})
+        tables: list[dict[str, Any]] = []
+        occupied_headers: set[tuple[int, int, int]] = set()
+        for row_index in rows:
+            populated_cols = sorted(col for (row, col), value in cells.items() if row == row_index and value)
+            for band in self._contiguous_number_bands(populated_cols, max_gap=1):
+                header = [cells.get((row_index, col), "") for col in range(band[0], band[-1] + 1)]
+                if not self._is_catalogue_table_header(header):
+                    continue
+                header_key = (row_index, band[0], band[-1])
+                if header_key in occupied_headers:
+                    continue
+                data_rows, end_row = self._xlsx_table_rows(cells, row_index, band[0], band[-1])
+                if not data_rows:
+                    continue
+                tables.append(
+                    {
+                        "start_row": row_index,
+                        "start_col": band[0],
+                        "end_row": end_row,
+                        "header": header,
+                        "rows": data_rows,
+                    }
+                )
+                for col in range(band[0], band[-1] + 1):
+                    occupied_headers.add((row_index, band[0], band[-1]))
+        tables.sort(key=lambda table: (table["start_row"], table["start_col"]))
+        return tables
+
+    def _xlsx_table_rows(
+        self,
+        cells: dict[tuple[int, int], str],
+        header_row: int,
+        start_col: int,
+        end_col: int,
+    ) -> tuple[list[list[str]], int]:
+        max_row = max(row for row, _ in cells)
+        rows: list[list[str]] = []
+        empty_streak = 0
+        cursor = header_row + 1
+        while cursor <= max_row:
+            values = [cells.get((cursor, col), "") for col in range(start_col, end_col + 1)]
+            non_empty = sum(1 for value in values if clean_optional_text(value))
+            if rows and self._is_catalogue_table_header(values):
+                break
+            if non_empty == 0:
+                empty_streak += 1
+                if rows and empty_streak >= 2:
+                    break
+            else:
+                empty_streak = 0
+                rows.append(values)
+            cursor += 1
+        return rows, cursor - 1
+
+    def _is_catalogue_table_header(self, values: list[str]) -> bool:
+        cleaned = [value for value in values if clean_optional_text(value)]
+        if len(cleaned) < 2:
+            return False
+        mapped = _header_map(cleaned)
+        return "name" in mapped and any(
+            key in mapped
+            for key in ("price", "qty", "unit", "specification", "currency", "moq", "lead_time", "pack")
+        )
+
+    def _format_xlsx_table(
+        self,
+        sheet_name: str,
+        table_number: int,
+        start_row: int,
+        start_col: int,
+        header: list[str],
+        rows: list[list[str]],
+    ) -> str:
+        output = [
+            f"[XLSX TABLE] Sheet: {sheet_name} Table: {table_number} Start: R{start_row}C{start_col}",
+            self._markdown_table_row(header),
+            self._markdown_table_row(["---"] * len(header)),
+        ]
+        output.extend(self._markdown_table_row(row) for row in rows)
+        return "\n".join(output)
+
+    def _markdown_table_row(self, cells: list[str]) -> str:
+        escaped = [str(cell or "").replace("|", "\\|").strip() for cell in cells]
+        return "| " + " | ".join(escaped) + " |"
+
+    def _contiguous_number_bands(self, values: list[int], max_gap: int) -> list[list[int]]:
+        if not values:
+            return []
+        bands: list[list[int]] = [[values[0]]]
+        for value in values[1:]:
+            if value - bands[-1][-1] <= max_gap:
+                bands[-1].append(value)
+            else:
+                bands.append([value])
+        return bands
+
+    def _xlsx_cell_ref_to_indexes(self, ref: str) -> tuple[int, int]:
+        match = re.fullmatch(r"([A-Z]+)(\d+)", ref or "", flags=re.IGNORECASE)
+        if not match:
+            return 0, 0
+        col = 0
+        for char in match.group(1).upper():
+            col = col * 26 + (ord(char) - ord("A") + 1)
+        return int(match.group(2)), col
+
+    def _xml_root(self, raw_xml: bytes) -> Any:
+        import xml.etree.ElementTree as ET
+
+        return ET.fromstring(raw_xml)
 
     def _extract_with_anydoc(self, file_path: Path, fallback_format: str | None = None) -> str:
         try:

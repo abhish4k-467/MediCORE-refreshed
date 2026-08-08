@@ -448,8 +448,23 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
     header: list[str] | None = None
     header_map: dict[str, int] = {}
     header_meta: dict[int, dict[str, str | None]] = {}
+    source_sheet: str | None = None
+    source_table: str | None = None
 
     for line in lines:
+        source_match = re.match(
+            r"^\[XLSX TABLE\]\s+Sheet:\s*(?P<sheet>.*?)\s+Table:\s*(?P<table>\d+)\b",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if source_match:
+            source_sheet = source_match.group("sheet").strip()
+            source_table = source_match.group("table").strip()
+            header = None
+            header_map = {}
+            header_meta = {}
+            continue
+
         parts = _split_table_line(line)
         if len(parts) < 2:
             continue
@@ -460,7 +475,10 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
         possible_map = _header_map(parts)
         is_header_candidate = (
             "name" in possible_map
-            and any(key in possible_map for key in ("price", "qty", "specification"))
+            and any(
+                key in possible_map
+                for key in ("price", "qty", "specification", "unit", "currency", "moq", "lead_time", "pack")
+            )
             and not has_numeric_data
         )
 
@@ -534,6 +552,10 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
         lead_time_days = _lead_time_days(lead_time_text or raw_lead_time)
         specification = clean_optional_text(_cell(parts, header_map.get("specification")))
         notes_parts = []
+        if source_sheet:
+            notes_parts.append(f"source_sheet={source_sheet.replace(';', ',')}")
+        if source_table:
+            notes_parts.append(f"source_table={source_table}")
         if specification:
             notes_parts.append(f"specification={specification.replace(';', ',')}")
         pack = clean_optional_text(_cell(parts, header_map.get("pack")))

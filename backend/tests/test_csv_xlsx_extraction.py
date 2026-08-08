@@ -167,6 +167,64 @@ Paracetamol 500mg,10000 kg
         self.assertEqual(items[1].ingredient_name, "Paracetamol 500mg")
         self.assertIsNone(items[1].price_per_unit)
 
+    def test_xlsx_extraction_detects_horizontal_vertical_and_multi_sheet_tables(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workbook_path = Path(tmp_dir) / "multi-table.xlsx"
+            self._write_xlsx_workbook(
+                workbook_path,
+                {
+                    "Inventory": {
+                        "A1": "Product",
+                        "B1": "Stock",
+                        "C1": "Unit",
+                        "A2": "Aspirin 100mg",
+                        "B2": "5000",
+                        "C2": "kg",
+                        "E1": "Product",
+                        "F1": "Price",
+                        "G1": "Unit",
+                        "E2": "Paracetamol 500mg",
+                        "F2": "4.20",
+                        "G2": "kg",
+                        "A6": "Product",
+                        "B6": "MOQ",
+                        "C6": "Lead Time",
+                        "A7": "Ibuprofen 400mg",
+                        "B7": "25",
+                        "C7": "14 days",
+                    },
+                    "Specials": {
+                        "C3": "Product Name",
+                        "D3": "Specification",
+                        "E3": "FOB($/kg)",
+                        "C4": "Vitamin C",
+                        "D4": "USP 99%",
+                        "E4": "5",
+                    },
+                },
+            )
+
+            service = object.__new__(EmailIngestionService)
+            text = service._extract_xlsx_tables_text(workbook_path)
+
+        self.assertEqual(text.count("[XLSX TABLE]"), 4)
+        self.assertIn("Sheet: Inventory Table: 1 Start: R1C1", text)
+        self.assertIn("Sheet: Inventory Table: 2 Start: R1C5", text)
+        self.assertIn("Sheet: Inventory Table: 3 Start: R6C1", text)
+        self.assertIn("Sheet: Specials Table: 4 Start: R3C3", text)
+        items = parse_catalog_table_text(text, dedupe=False)
+        names = [item.ingredient_name for item in items]
+        self.assertIn("Aspirin 100mg", names)
+        self.assertIn("Paracetamol 500mg", names)
+        self.assertIn("Ibuprofen 400mg", names)
+        self.assertIn("Vitamin C", names)
+        self.assertEqual(len(items), 4)
+        by_name = {item.ingredient_name: item for item in items}
+        self.assertIn("source_sheet=Inventory", by_name["Aspirin 100mg"].notes or "")
+        self.assertIn("source_table=1", by_name["Aspirin 100mg"].notes or "")
+        self.assertIn("source_table=2", by_name["Paracetamol 500mg"].notes or "")
+        self.assertIn("source_sheet=Specials", by_name["Vitamin C"].notes or "")
+
     def test_docx_anydoc_table_keeps_multiclause_specification_in_same_row(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             docx_path = Path(tmp_dir) / "catalogue.docx"
@@ -308,6 +366,82 @@ Paracetamol 500mg,10000 kg
             docx.writestr("[Content_Types].xml", content_types)
             docx.writestr("_rels/.rels", rels)
             docx.writestr("word/document.xml", document)
+
+    def _write_xlsx_workbook(self, path: Path, sheets: dict[str, dict[str, str]]) -> None:
+        def xml_escape(value: str) -> str:
+            return escape(str(value), {'"': "&quot;"})
+
+        content_types = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            + "".join(
+                f'<Override PartName="/xl/worksheets/sheet{index}.xml" '
+                'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                for index in range(1, len(sheets) + 1)
+            )
+            + "</Types>"
+        )
+        root_rels = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+            'Target="xl/workbook.xml"/>'
+            "</Relationships>"
+        )
+        workbook = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            "<sheets>"
+            + "".join(
+                f'<sheet name="{xml_escape(name)}" sheetId="{index}" r:id="rId{index}"/>'
+                for index, name in enumerate(sheets, start=1)
+            )
+            + "</sheets></workbook>"
+        )
+        workbook_rels = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            + "".join(
+                f'<Relationship Id="rId{index}" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+                f'Target="worksheets/sheet{index}.xml"/>'
+                for index in range(1, len(sheets) + 1)
+            )
+            + "</Relationships>"
+        )
+
+        with zipfile.ZipFile(path, "w") as xlsx:
+            xlsx.writestr("[Content_Types].xml", content_types)
+            xlsx.writestr("_rels/.rels", root_rels)
+            xlsx.writestr("xl/workbook.xml", workbook)
+            xlsx.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+            for index, cells in enumerate(sheets.values(), start=1):
+                rows: dict[int, list[tuple[str, str]]] = {}
+                for ref, value in cells.items():
+                    row_index = int("".join(char for char in ref if char.isdigit()))
+                    rows.setdefault(row_index, []).append((ref, value))
+                sheet_data = "".join(
+                    f'<row r="{row_index}">'
+                    + "".join(
+                        f'<c r="{ref}" t="inlineStr"><is><t>{xml_escape(value)}</t></is></c>'
+                        for ref, value in sorted(row_cells)
+                    )
+                    + "</row>"
+                    for row_index, row_cells in sorted(rows.items())
+                )
+                worksheet = (
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                    f"<sheetData>{sheet_data}</sheetData>"
+                    "</worksheet>"
+                )
+                xlsx.writestr(f"xl/worksheets/sheet{index}.xml", worksheet)
 
 
 if __name__ == "__main__":
