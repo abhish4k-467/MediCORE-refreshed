@@ -164,8 +164,26 @@ def verify_imap_credentials(host: str, port: int, email_address: str, password: 
 def queue_email_account_sync(account_id: UUID) -> str:
     from backend.app.tasks import poll_email_account
 
-    task = poll_email_account.apply_async(args=[str(account_id)], retry=False)
-    return task.id
+    try:
+        task = poll_email_account.apply_async(args=[str(account_id)], retry=False)
+        return task.id
+    except Exception as e:
+        logger.warning(f"Celery queueing failed for account {account_id}, running background fallback thread: {e}")
+        import threading
+
+        def _fallback_sync(acc_id: UUID):
+            from backend.app.db import SessionLocal
+            from backend.app.services.email_ingestion import EmailIngestionService
+            with SessionLocal() as db:
+                service = EmailIngestionService(db)
+                try:
+                    service.poll_account_inbox(acc_id)
+                except Exception as ex:
+                    logger.error(f"Fallback thread sync failed for account {acc_id}: {ex}")
+
+        t = threading.Thread(target=_fallback_sync, args=(account_id,), daemon=True)
+        t.start()
+        return f"fallback-{account_id}"
 
 # --- Endpoints ---
 

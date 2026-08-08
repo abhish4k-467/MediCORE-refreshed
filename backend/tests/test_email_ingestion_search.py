@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from backend.app.schemas import ExtractedCatalogItem
 from backend.app.services.catalog_table_parser import parse_catalog_table_text
 from backend.app.services.country_detection import detect_supplier_country
+from backend.app.services.document_classifier import CATALOGUE, CERTIFICATE, OTHER, classify_document
 from backend.app.services.email_ingestion import (
     EmailIngestionService,
     filter_trusted_pending_approvals,
@@ -223,6 +224,29 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         )
 
         self.assertEqual(rows, [])
+
+    def test_country_label_is_never_accepted_as_a_catalogue_ingredient(self) -> None:
+        rows = parse_catalog_table_text(
+            "Product | Price | Quantity\n"
+            "Canada | 12 | 100 kg\n"
+            "Citric Acid | 12 | 100 kg\n"
+        )
+
+        self.assertEqual([row.ingredient_name for row in rows], ["Citric Acid"])
+
+    def test_unverified_llm_item_is_not_given_fake_source_provenance(self) -> None:
+        service = object.__new__(EmailIngestionService)
+        item = ExtractedCatalogItem(
+            ingredient_name="Citric Acid",
+            price_per_unit=12,
+            currency="USD",
+            notes="original_price=USD 12",
+        )
+
+        ungrounded = service._with_source_note(item, "Supplier address: Toronto, Canada")
+
+        self.assertNotIn("source=", ungrounded.notes or "")
+        self.assertFalse(service._has_required_grounded_values(ungrounded))
 
     def test_generic_table_extracts_specification_column_and_keeps_variants(self) -> None:
         rows = parse_catalog_table_text(
@@ -565,6 +589,23 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
             {"Ginger Powder", "Ginger Extract", "Organic Ginger Root Powder"},
         )
 
+    def test_query_engine_prefers_an_exact_catalogue_chemical_name(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+
+        matched = engine._best_ingredient_result_from_candidates(
+            "Show supplier prices for Citric Acid",
+            [
+                "Citric Acid",
+                "Citric Acid Anhydrous",
+                "Citric Acid Monohydrate",
+                "Sodium Citrate",
+            ],
+        )
+
+        self.assertEqual(matched.search_phrase, "Citric Acid")
+        self.assertEqual(matched.matched_names, ["Citric Acid"])
+        self.assertEqual(matched.confidence, 1.0)
+
     def test_query_engine_expands_common_ingredient_abbreviations(self) -> None:
         engine = object.__new__(NaturalLanguageQueryEngine)
 
@@ -601,7 +642,7 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
 
         self.assertEqual(citrus.search_phrase, "citrus")
         self.assertIn("Citrus Bioflavonoids", citrus.matched_names)
-        self.assertEqual(zinc.search_phrase, "zinc gluconate 12")
+        self.assertEqual(zinc.search_phrase, "Zinc Gluconate 12%")
         self.assertIn("Zinc Gluconate 12%", zinc.matched_names)
         self.assertIn(vitamin_c.search_phrase, {"ascorbic", "ascorbic acid", "vitamin c"})
         self.assertIn("Ascorbic Acid", vitamin_c.matched_names)
@@ -719,6 +760,27 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         self.assertEqual(detect_supplier_country("Sales Team\nShanghai, China\nTel: 021-5555"), "China")
         self.assertEqual(detect_supplier_country("Regards\nAhmedabad, Gujarat, India"), "India")
 
+    def test_supplier_country_prefers_registered_footer_address(self) -> None:
+        self.assertEqual(
+            detect_supplier_country(
+                "Ship to: Newark, New Jersey, United States\n"
+                "Product catalogue\n"
+                "Registered office: 88 Nanhai Road, Shenzhen, Guangdong, China\n"
+                "Tel: +86 755 5555"
+            ),
+            "China",
+        )
+
+    def test_general_chat_uses_personal_assistant_without_catalogue_rows(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+        engine.llm = SimpleNamespace(personal_assistant_answer=lambda question: "Set a reminder for 3 PM.")
+        engine._log_query = lambda *args, **kwargs: None
+
+        response = engine.answer("Remind me at 3 PM")
+
+        self.assertEqual(response.answer, "Set a reminder for 3 PM.")
+        self.assertEqual(response.rows, [])
+
     def test_supplier_country_detection_defaults_unknown_without_address(self) -> None:
         self.assertEqual(detect_supplier_country("New catalogue attached. Best prices this month."), "Unknown")
 
@@ -773,6 +835,44 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         )
 
         self.assertEqual(item.raw_payload["certificate_pdfs"][0]["name"], "Ashwagandha-Certi.pdf")
+
+    def test_document_classifier_separates_catalogue_certificate_and_other(self) -> None:
+        catalogue = classify_document(
+            "August price list.pdf",
+            ".pdf",
+            "Ingredient | Specification | Price | MOQ\nVitamin C | USP 99% | USD 5/kg | 25 KG",
+        )
+        certificate = classify_document(
+            "Vitamin-C-COA.pdf",
+            ".pdf",
+            "Certificate of Analysis - Vitamin C USP 99%\nBatch No: A123\nAssay: 99.4%",
+        )
+        other = classify_document("brochure.pdf", ".pdf", "Company profile and office address")
+
+        self.assertEqual(catalogue.category, CATALOGUE)
+        self.assertEqual(certificate.category, CERTIFICATE)
+        self.assertEqual(certificate.material_hint, "Vitamin C USP 99%")
+        self.assertEqual(other.category, OTHER)
+
+    def test_certificate_matching_does_not_attach_to_unrelated_catalogue_rows(self) -> None:
+        service = object.__new__(EmailIngestionService)
+        vitamin_c = SimpleNamespace(
+            ingredient_name="Vitamin C",
+            raw_payload={"specification": "USP 99%"},
+        )
+        citric_acid = SimpleNamespace(
+            ingredient_name="Citric Acid",
+            raw_payload={"specification": "Food Grade"},
+        )
+        ref = {
+            "name": "Vitamin-C-COA.pdf",
+            "type": "COA",
+            "material_hint": "Vitamin C USP 99%",
+            "match_text": "Certificate of Analysis - Vitamin C USP 99%",
+        }
+
+        self.assertTrue(service._certificate_matches_item(ref, vitamin_c))
+        self.assertFalse(service._certificate_matches_item(ref, citric_acid))
 
 
 if __name__ == "__main__":

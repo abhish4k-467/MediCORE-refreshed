@@ -5,6 +5,7 @@ import re
 from datetime import UTC, datetime
 
 from backend.app.schemas import ExtractedCatalogItem, clean_optional_text
+from backend.app.services.country_detection import UNKNOWN_COUNTRY, normalize_country
 
 CATALOG_TABLE_PARSER_VERSION = "2026-07-27.specification-alignment-v1"
 logger = logging.getLogger(__name__)
@@ -565,6 +566,13 @@ def is_valid_ingredient_name(name: object) -> bool:
     if _number_from_text(value) is not None and not re.search(r"[A-Za-z]", value):
         return False
     if lowered in {"product", "product name", "ingredient", "ingredient name", "specification", "description", "quantity", "qty", "price", "moq", "unit"}:
+        return False
+    # Addresses are commonly present beside product tables in email and PDF
+    # extraction.  A standalone country is never a catalogue ingredient, so
+    # reject it before it can be written to catalog_items.
+    if normalize_country(value) != UNKNOWN_COUNTRY:
+        return False
+    if lowered in {"address", "country", "origin", "telephone", "phone", "email", "website", "contact", "postal code", "postcode"}:
         return False
     if len(value) < 3:
         return False

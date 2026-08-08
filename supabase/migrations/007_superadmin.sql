@@ -17,7 +17,7 @@ BEGIN
     -- If it's an employee registering, look up their invitation details
     IF v_role = 'employee' THEN
         SELECT tenant_id INTO v_tenant_id FROM public.employee_invitations 
-        WHERE email = new.email AND status = 'Pending Activation' LIMIT 1;
+        WHERE LOWER(email) = LOWER(new.email) AND status = 'Pending Activation' LIMIT 1;
         
         -- Get organization from the inviting admin's profile
         IF v_tenant_id IS NOT NULL THEN
@@ -28,7 +28,7 @@ BEGIN
     -- If not found, they are registering a new workspace as an Admin
     IF v_tenant_id IS NULL THEN
         -- Check if it's the specific fixed superadmin email
-        IF new.email = 'prisik.da45@gmail.com' THEN
+        IF LOWER(new.email) = 'prisik.da45@gmail.com' THEN
             v_tenant_id := new.id;
             v_role := 'superadmin';
             v_status := 'Active';
@@ -57,7 +57,7 @@ BEGIN
     IF v_role = 'employee' THEN
         UPDATE public.employee_invitations 
         SET status = 'Active' 
-        WHERE email = new.email;
+        WHERE LOWER(email) = LOWER(new.email);
     END IF;
 
     RETURN new;

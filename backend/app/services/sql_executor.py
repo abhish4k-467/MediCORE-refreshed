@@ -67,8 +67,17 @@ def execute_readonly_sql(
     params: dict[str, Any] = {}
     if tenant_id:
         tenant_str = str(tenant_id)
-        if ":tenant_id" in validated_sql:
-            params["tenant_id"] = tenant_str
+        # Raw model-generated SQL cannot be safely scoped after the fact.
+        # Require an explicit bound tenant parameter before execution.
+        tenant_predicate = re.search(
+            r"\b(?:[a-z_][a-z0-9_]*\.)?tenant_id\b\s*=\s*:tenant_id\b|:tenant_id\b\s*=\s*\b(?:[a-z_][a-z0-9_]*\.)?tenant_id\b",
+            validated_sql,
+            flags=re.IGNORECASE,
+        )
+        if not tenant_predicate:
+            logger.warning("Rejected unscoped SQL for tenant %s", tenant_str)
+            return []
+        params["tenant_id"] = tenant_str
 
     try:
         result = db.execute(text(validated_sql), params)

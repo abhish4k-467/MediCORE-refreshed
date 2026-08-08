@@ -141,6 +141,20 @@ def detect_supplier_country(*texts: str | None) -> str:
 
 
 def detect_supplier_country_with_confidence(*texts: str | None) -> CountryDetection:
+    # Supplier letterheads often contain a customer's/shipping country near
+    # the beginning.  The registered office in the footer is the stronger
+    # supplier signal, so resolve a footer address before considering other
+    # occurrences in the document.
+    for text in texts:
+        footer = _footer_address_window(text)
+        if not footer:
+            continue
+        footer_matches = _countries_in_window(footer)
+        if footer_matches:
+            country, confidence = max(footer_matches, key=lambda item: item[1])
+            if confidence >= 70:
+                return CountryDetection(country, confidence + 30)
+
     candidates: dict[str, int] = {}
     for text in texts:
         if not text:
@@ -157,6 +171,30 @@ def detect_supplier_country_with_confidence(*texts: str | None) -> CountryDetect
     if confidence < 55:
         return CountryDetection(UNKNOWN_COUNTRY, confidence)
     return CountryDetection(country, confidence)
+
+
+def _footer_address_window(text: str | None) -> str:
+    if not text:
+        return ""
+    lines = [" ".join(line.strip().split()) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    footer_lines = lines[-12:]
+    # Start at the final address/contact cue. This avoids treating a shipping
+    # destination earlier in the footer as the supplier's registered office.
+    address_indexes = [
+        index
+        for index, line in enumerate(footer_lines)
+        if any(cue in line.lower() for cue in ("address", "office", "warehouse", "factory", "plant", "registered", "headquarter"))
+        or _looks_like_address_line(line)
+    ]
+    if address_indexes:
+        footer_lines = footer_lines[address_indexes[-1] :]
+    footer = "\n".join(footer_lines)
+    if any(cue in footer.lower() for cue in ADDRESS_CUES) or any(_looks_like_address_line(line) for line in footer_lines):
+        return footer
+    return ""
 
 
 def _address_windows(text: str) -> list[str]:

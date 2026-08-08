@@ -1,4 +1,4 @@
-from backend.app.services.llm import OpenRouterClient
+from backend.app.services.llm import ModelProviderConfig, OpenRouterClient
 
 
 def test_salvages_items_from_malformed_openrouter_json() -> None:
@@ -23,3 +23,60 @@ def test_repairs_trailing_commas_in_openrouter_json() -> None:
     payload = client._parse_json_response(content)
 
     assert payload["items"][0]["price_per_unit"] == 3.88
+
+
+def test_model_router_uses_groq_before_openrouter() -> None:
+    client = object.__new__(OpenRouterClient)
+    client.providers = [
+        ModelProviderConfig("groq", "groq-key", "groq-model", "https://groq.test"),
+        ModelProviderConfig("openrouter", "openrouter-key", "openrouter-model", "https://openrouter.test"),
+    ]
+    called = []
+
+    def fake_chat_with_provider(provider, messages, *, temperature=0, json_mode=False):
+        called.append(provider.name)
+        return "primary response"
+
+    client._chat_with_provider = fake_chat_with_provider
+
+    assert client._chat([{"role": "user", "content": "hello"}]) == "primary response"
+    assert called == ["groq"]
+
+
+def test_model_router_falls_back_to_openrouter_after_groq_failure() -> None:
+    client = object.__new__(OpenRouterClient)
+    client.providers = [
+        ModelProviderConfig("groq", "groq-key", "groq-model", "https://groq.test"),
+        ModelProviderConfig("openrouter", "openrouter-key", "openrouter-model", "https://openrouter.test"),
+    ]
+    called = []
+
+    def fake_chat_with_provider(provider, messages, *, temperature=0, json_mode=False):
+        called.append(provider.name)
+        if provider.name == "groq":
+            raise RuntimeError("primary unavailable")
+        return "secondary response"
+
+    client._chat_with_provider = fake_chat_with_provider
+
+    assert client._chat([{"role": "user", "content": "hello"}]) == "secondary response"
+    assert called == ["groq", "openrouter"]
+
+
+def test_json_chat_falls_back_when_primary_returns_invalid_json() -> None:
+    client = object.__new__(OpenRouterClient)
+    client.providers = [
+        ModelProviderConfig("groq", "groq-key", "groq-model", "https://groq.test"),
+        ModelProviderConfig("openrouter", "openrouter-key", "openrouter-model", "https://openrouter.test"),
+    ]
+
+    def fake_chat_with_provider(provider, messages, *, temperature=0, json_mode=False):
+        if provider.name == "groq":
+            return "not json"
+        return '{"items":[{"ingredient_name":"Citric Acid"}]}'
+
+    client._chat_with_provider = fake_chat_with_provider
+
+    payload = client._json_chat("Return JSON", "catalogue text")
+
+    assert payload["items"][0]["ingredient_name"] == "Citric Acid"

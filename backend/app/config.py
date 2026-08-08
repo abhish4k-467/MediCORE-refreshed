@@ -32,11 +32,22 @@ class Settings(BaseSettings):
     valkey_url: str = ""
     redis_url: str = "redis://localhost:6379/0"
 
+    groq_api_key: str = Field(default="", repr=False)
+    groq_model: str = "llama-3.3-70b-versatile"
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+
     openrouter_api_key: str = Field(default="", repr=False)
     openrouter_model: str = "openai/gpt-4o-mini"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_site_url: str = ""
     openrouter_app_name: str = "MediCORE"
+
+    paddleocr_lang: str = "en"
+    paddleocr_cpu_threads: int = 4
+    paddleocr_det_model: str = "PP-OCRv5_mobile_det"
+    paddleocr_rec_model: str = "PP-OCRv5_mobile_rec"
+    paddleocr_rec_batch_size: int = 6
+    paddleocr_det_limit_side_len: int = 1920
 
     email_mode: str = "imap"
     imap_host: str = "imap.gmail.com"
@@ -80,6 +91,8 @@ class Settings(BaseSettings):
         missing: list[str] = []
         if self.supabase_service_role_key in {"", "replace-me"}:
             missing.append("SUPABASE_SERVICE_ROLE_KEY")
+        if self.groq_api_key in {"", "replace-me"}:
+            missing.append("GROQ_API_KEY")
         if self.openrouter_api_key in {"", "replace-me"}:
             missing.append("OPENROUTER_API_KEY")
         if not self.gmail_webhook_token:

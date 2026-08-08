@@ -33,12 +33,14 @@ async def chat_socket(websocket: WebSocket, db: Session = Depends(get_db)) -> No
             if response and response.user:
                 user_uuid = UUID(response.user.id)
                 user_id = user_uuid
-                # Load profile to fetch shared tenant_id
+                # A profile's tenant_id links an employee to an organisation;
+                # chat/catalogue data remains private to the employee account.
                 profile = db.query(Profile).filter(Profile.id == user_uuid).first()
-                if profile and profile.tenant_id:
-                    tenant_id = profile.tenant_id
-                else:
-                    tenant_id = user_uuid
+                if not profile:
+                    await websocket.send_json({"type": "error", "message": "Authentication failed. Missing profile identity. Connection closed."})
+                    await websocket.close()
+                    return
+                tenant_id = user_uuid
         except Exception:
             logger.exception("WebSocket authentication failed with exception")
             await websocket.send_json({"type": "error", "message": "Authentication failed. Connection closed."})

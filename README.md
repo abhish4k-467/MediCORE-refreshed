@@ -6,7 +6,7 @@ Ingest supplier emails, extract attached PDF catalogs, normalize item data, rank
 
 - Backend: Python 3.12, FastAPI, uv
 - Workers: Celery with Valkey broker
-- LLM: OpenRouter chat completions
+- LLM: routed chat completions with Groq primary and OpenRouter fallback
 - PDF extraction: PyMuPDF with pdfplumber fallback
 - Database: Supabase Postgres
 - Storage: Supabase Storage for source PDFs
@@ -145,11 +145,15 @@ VALKEY_URL=redis://:generate-a-long-random-secret@valkey:6379/0
 
 If Valkey runs outside Docker, replace `valkey` with the Valkey host name or private IP. The Docker Compose file binds Valkey to `127.0.0.1:6379` for local terminal workers; do not bind it to `0.0.0.0` or expose port `6379` publicly.
 
-### OpenRouter Configuration
+### LLM Router Configuration
 
-MediCORE uses OpenRouter for extraction, supplier-email classification, query planning, and ProcuraAI answers.
+MediCORE uses Groq as the primary LLM provider and OpenRouter as the secondary fallback for extraction, supplier-email classification, query planning, and ProcuraAI answers.
 
 ```env
+GROQ_API_KEY=your-groq-api-key
+GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_BASE_URL=https://api.groq.com/openai/v1
+
 OPENROUTER_API_KEY=your-openrouter-api-key
 OPENROUTER_MODEL=openai/gpt-4o-mini
 OPENROUTER_SITE_URL=https://your-frontend-domain.com

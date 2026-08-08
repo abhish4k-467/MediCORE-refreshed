@@ -1,8 +1,18 @@
 from types import SimpleNamespace
+from uuid import uuid4
 
 from sqlalchemy import URL
 
 from backend.app import db
+from backend.app.auth import data_tenant_id_for_user
+
+
+def test_employee_catalogue_data_does_not_use_organisation_tenant():
+    employee_id = uuid4()
+    organisation_id = uuid4()
+    profile = SimpleNamespace(tenant_id=organisation_id)
+
+    assert data_tenant_id_for_user(employee_id, profile) == employee_id
 
 
 def make_settings(**overrides):

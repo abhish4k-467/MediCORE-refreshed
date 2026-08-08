@@ -32,6 +32,7 @@ from backend.app.services.catalog_table_parser import (
     parse_catalog_table_text,
 )
 from backend.app.services.country_detection import UNKNOWN_COUNTRY, detect_supplier_country
+from backend.app.services.document_classifier import CATALOGUE, CERTIFICATE, OTHER, classify_document
 from backend.app.services.gmail_api import GmailApiClient
 from backend.app.services.llm import OpenRouterClient
 from backend.app.services.normalizer import normalize_item
@@ -419,7 +420,17 @@ class EmailIngestionService:
                     if text:
                         country_contexts.append(text)
                         extracted_text_parts.append(text)
-                    if self._is_certificate_pdf(target_name, ext, text):
+                    classification = self._classify_document(target_name, ext, text)
+                    logger.info(
+                        "Classified document %s as %s confidence=%.2f",
+                        target_name,
+                        classification.category,
+                        classification.confidence,
+                    )
+
+                    if classification.category == CERTIFICATE:
+                        if not catalog_email.pdf_url and count == 0:
+                            catalog_email.pdf_url = uploaded_url
                         certificate_refs.append(
                             {
                                 "name": target_name,
@@ -427,9 +438,15 @@ class EmailIngestionService:
                                 "storage_path": object_path,
                                 "type": self._certificate_type(target_name, text),
                                 "match_text": text[:10000],
+                                "material_hint": classification.material_hint or "",
                             }
                         )
                         logger.info("Stored certificate PDF %s for email id=%s", target_name, raw_email_id)
+                        continue
+
+                    if classification.category == OTHER:
+                        uploaded_object_paths.append(object_path)
+                        logger.info("Skipping non-catalogue document %s after classification", target_name)
                         continue
 
                     uploaded_object_paths.append(object_path)
@@ -468,7 +485,12 @@ class EmailIngestionService:
             self._touch_supplier_last_email(supplier, catalog_email.received_at)
             self._delete_uploaded_files(uploaded_object_paths)
             catalog_email.pdf_url = None
+        elif certificate_refs and not processing_errors:
+            catalog_email.processing_status = "certificate"
+            self._touch_supplier_last_email(supplier, catalog_email.received_at)
+            self._delete_uploaded_files(uploaded_object_paths)
         else:
+            self._delete_uploaded_files(uploaded_object_paths)
             if processing_errors:
                 catalog_email.processing_status = "failed"
             else:
@@ -525,6 +547,15 @@ class EmailIngestionService:
 
                 text = self._extract_text_from_file(file_path, ext)
                 logger.info("Extracted %s characters while reprocessing email id=%s", len(text), catalog_email.raw_email_id)
+                classification = self._classify_document(file_path.name, ext, text)
+                if classification.category != CATALOGUE:
+                    catalog_email.processing_status = classification.category
+                    logger.info(
+                        "Skipping reprocess catalogue extraction for %s because document classified as %s",
+                        catalog_email.raw_email_id,
+                        classification.category,
+                    )
+                    continue
                 extracted = self._extract_items_from_text(
                     text,
                     str(catalog_email.id),
@@ -557,12 +588,12 @@ class EmailIngestionService:
             for item in parse_catalog_table_text(
                 parser_text,
                 reference_date=reference_date,
-                dedupe="[EXCEL TABLE]" not in text and "[CSV TABLE]" not in text,
+                # Exact repeated rows are duplicates even in spreadsheets and CSVs.
+                # The row identity retains commercial fields, so price tiers remain.
+                dedupe=True,
             )
         ]
-        preserves_table_duplicates = "[EXCEL TABLE]" in text or "[CSV TABLE]" in text
-        if not preserves_table_duplicates:
-            parsed = self._dedupe_extracted_items(parsed)
+        parsed = self._dedupe_extracted_items(parsed)
         source_lower = source_name.lower()
         conversational_source = source_lower.endswith(".txt") or "email_body" in source_lower
         logger.info("Deterministic table parser extracted %s catalogue row(s) from %s", len(parsed), source_name)
@@ -588,7 +619,7 @@ class EmailIngestionService:
 
         try:
             llm_items = [normalize_item(item) for item in self.llm.extract_catalog_items(text, reference_date=reference_date)]
-            extracted = [*parsed, *llm_items] if preserves_table_duplicates else self._dedupe_extracted_items([*parsed, *llm_items])
+            extracted = self._dedupe_extracted_items([*parsed, *llm_items])
             logger.info("LLM fallback extracted %s catalogue row(s) from %s", len(extracted), source_name)
             return extracted
         except Exception:
@@ -596,11 +627,14 @@ class EmailIngestionService:
             return parsed
 
     def _preferred_parser_text(self, text: str) -> str:
-        marker = "[GRID CELL TABLE OCR]\n"
-        if marker not in text:
-            return text
-        grid_text = text.split(marker, 1)[1].split("\n\n", 1)[0].strip()
-        return grid_text or text
+        table_blocks: list[str] = []
+        for marker in ("[PADDLE TABLE OCR]\n", "[GRID CELL TABLE OCR]\n", "[PDF NATIVE TABLE]\n"):
+            if marker in text:
+                for part in text.split(marker)[1:]:
+                    block = part.split("\n\n", 1)[0].strip()
+                    if block:
+                        table_blocks.append(block)
+        return "\n\n".join(dict.fromkeys(table_blocks)) or text
 
     def _dedupe_extracted_items(self, items) -> list:
         deduped = []
@@ -750,24 +784,9 @@ class EmailIngestionService:
                     joined_notes = f"{notes}; source='{safe_line}'" if notes else f"source='{safe_line}'"
                     return item.model_copy(update={"notes": joined_notes})
 
-        # Fallback: if ingredient partially matches or any line contains price/qty
-        for line in text.splitlines():
-            normalized_line = " ".join(line.split())
-            if not normalized_line:
-                continue
-            line_lower = normalized_line.lower()
-            if ingredient and any(w in line_lower for w in ingredient.split() if len(w) > 3):
-                safe_line = normalized_line[:500].replace("'", "")
-                joined_notes = f"{notes}; source='{safe_line}'" if notes else f"source='{safe_line}'"
-                return item.model_copy(update={"notes": joined_notes})
-
-        # Ultimate fallback for valid items: tag with source line 1 if available
-        first_line = next((l.strip() for l in text.splitlines() if l.strip()), "")
-        if first_line:
-            safe_line = first_line[:500].replace("'", "")
-            joined_notes = f"{notes}; source='{safe_line}'" if notes else f"source='{safe_line}'"
-            return item.model_copy(update={"notes": joined_notes})
-
+        # Do not attach an unrelated address, header, or first line as
+        # provenance.  Rows without an exact source line are intentionally
+        # rejected during storage instead of being guessed into Supabase.
         return item
 
     def _price_appears_in_line(self, value: Any, line: str) -> bool:
@@ -792,8 +811,10 @@ class EmailIngestionService:
         if item.available_qty is not None and float(item.available_qty) < 0:
             return False
         notes = (item.notes or "").lower()
-        grounded_markers = ("source=", "source:", "original_price=", "original_quantity=", "lead_time=")
-        return any(marker in notes for marker in grounded_markers)
+        # Every stored item must be traceable to an exact line in the source
+        # email/attachment.  Commercial fields alone are not evidence: an LLM
+        # may infer them from an address or a table heading.
+        return "source=" in notes or "source:" in notes
 
     def _has_valid_ingredient_name(self, item) -> bool:
         return is_valid_ingredient_name(getattr(item, "ingredient_name", None))
@@ -1066,15 +1087,18 @@ class EmailIngestionService:
         if not clean_optional_text(getattr(supplier, "country", None)):
             supplier.country = UNKNOWN_COUNTRY
 
+    def _classify_document(self, filename: str, ext: str, text: str | None):
+        if ext.lower() in {".xlsx", ".xls", ".xlsm", ".xltx", ".xltm", ".csv"}:
+            classification = classify_document(filename, ext, text)
+            if classification.category == CERTIFICATE:
+                return classification
+            return classify_document(filename, ext, f"{text or ''}\nproduct quantity price quotation")
+        return classify_document(filename, ext, text)
+
     def _is_certificate_pdf(self, filename: str, ext: str, text: str | None = None) -> bool:
         if ext.lower() != ".pdf":
             return False
-        haystack = f"{filename}\n{text or ''}".lower()
-        if not any(term in haystack for term in CERTIFICATE_PDF_TERMS):
-            return False
-        catalogue_terms = ("catalog", "catalogue", "price list", "inventory list", "stock list", "quotation")
-        filename_lower = filename.lower()
-        return not any(term in filename_lower for term in catalogue_terms)
+        return self._classify_document(filename, ext, text).category == CERTIFICATE
 
     def _certificate_type(self, filename: str, text: str | None = None) -> str:
         haystack = f"{filename}\n{text or ''}".lower()
@@ -1106,7 +1130,7 @@ class EmailIngestionService:
         if not unique_refs:
             return
 
-        items = (
+        same_email_items = (
             self.db.query(CatalogItem)
             .filter(
                 CatalogItem.catalog_email_id == catalog_email.id,
@@ -1115,6 +1139,22 @@ class EmailIngestionService:
             )
             .all()
         )
+        supplier_items = (
+            self.db.query(CatalogItem)
+            .filter(
+                CatalogItem.supplier_id == supplier.id,
+                CatalogItem.tenant_id == catalog_email.tenant_id,
+            )
+            .all()
+        )
+        items = []
+        seen_items: set[str] = set()
+        for item in [*same_email_items, *supplier_items]:
+            key = str(getattr(item, "id", None) or id(item))
+            if key in seen_items:
+                continue
+            seen_items.add(key)
+            items.append(item)
         if not items:
             return
 
@@ -1128,28 +1168,35 @@ class EmailIngestionService:
         if matched_any:
             return
 
-        # If a certificate was attached to the same supplier email but we cannot map
-        # it confidently to one product name, keep it visible on the catalogue rows.
-        # This avoids losing valid certificate PDFs because suppliers use short file
-        # names or certificate text that does not exactly match catalogue item names.
-        if unique_refs:
-            for item in items:
-                self._merge_item_certificate_refs(item, unique_refs)
+        logger.info(
+            "No catalogue item match found for %s certificate ref(s) supplier=%s tenant=%s; retaining storage object without attaching to unrelated rows",
+            len(unique_refs),
+            getattr(supplier, "email_domain", getattr(supplier, "id", "unknown")),
+            catalog_email.tenant_id,
+        )
 
     def _certificate_matches_item(self, certificate_ref: dict[str, str], item: CatalogItem) -> bool:
         cert_text = self._canonical_match_text(
-            f"{certificate_ref.get('name', '')} {certificate_ref.get('type', '')} {certificate_ref.get('match_text', '')}"
+            f"{certificate_ref.get('name', '')} {certificate_ref.get('type', '')} "
+            f"{certificate_ref.get('material_hint', '')} {certificate_ref.get('match_text', '')}"
         )
-        item_text = self._canonical_match_text(item.ingredient_name)
+        item_text = self._canonical_match_text(
+            f"{item.ingredient_name} {(item.raw_payload or {}).get('specification', '')}"
+        )
         item_tokens = [
             token
             for token in item_text.split()
-            if len(token) >= 3 and token not in {"extract", "powder", "liquid", "grade", "hplc", "oil"}
+            if len(token) >= 3 and token not in {"extract", "powder", "liquid", "grade", "hplc", "oil", "usp", "food"}
         ]
         if not item_tokens:
             return False
         matched = sum(1 for token in item_tokens if token in cert_text)
-        return matched >= min(2, len(item_tokens))
+        if matched >= min(2, len(item_tokens)):
+            return True
+        if any(len(token) >= 6 and token in cert_text for token in item_tokens):
+            return True
+        material_hint = self._canonical_match_text(certificate_ref.get("material_hint", ""))
+        return bool(material_hint and (material_hint in item_text or item_text in material_hint))
 
     def _merge_item_certificate_refs(self, item: CatalogItem, refs: list[dict[str, str]]) -> None:
         raw_payload = dict(item.raw_payload or {})
@@ -1185,6 +1232,8 @@ class EmailIngestionService:
                     "url": url,
                     "type": clean_optional_text(ref.get("type")) or "Certificate",
                     **({"storage_path": ref["storage_path"]} if clean_optional_text(ref.get("storage_path")) else {}),
+                    **({"match_text": ref["match_text"]} if clean_optional_text(ref.get("match_text")) else {}),
+                    **({"material_hint": ref["material_hint"]} if clean_optional_text(ref.get("material_hint")) else {}),
                 }
             )
         return deduped
@@ -1450,14 +1499,15 @@ class EmailIngestionService:
             logger.warning("Unable to restore IMAP message uid=%s to unread", msg_uid, exc_info=True)
 
     def _upsert_supplier(self, sender: str, display_name: str | None = None, tenant_id: Any | None = None) -> Supplier:
+        if tenant_id is None:
+            # Looking up by domain without a tenant can attach one employee's
+            # import to another employee's supplier record.
+            raise ValueError("A tenant_id is required when creating or finding a supplier.")
         domain = get_supplier_domain(sender)
-        if tenant_id:
-            supplier = self.db.query(Supplier).filter(
-                Supplier.email_domain == domain,
-                Supplier.tenant_id == tenant_id
-            ).first()
-        else:
-            supplier = self.db.query(Supplier).filter(Supplier.email_domain == domain).first()
+        supplier = self.db.query(Supplier).filter(
+            Supplier.email_domain == domain,
+            Supplier.tenant_id == tenant_id,
+        ).first()
 
         cleaned_display_name = display_name.strip() if display_name else None
 
@@ -1474,7 +1524,7 @@ class EmailIngestionService:
 
         supplier = Supplier(
             id=uuid4(),
-            tenant_id=tenant_id or uuid4(),
+            tenant_id=tenant_id,
             name=supplier_name,
             email_domain=domain,
             country=UNKNOWN_COUNTRY,
@@ -1587,11 +1637,21 @@ class EmailIngestionService:
         if xml_text:
             text_parts.append(xml_text)
 
-        image_text = self._extract_docx_embedded_image_text(file_path)
-        if image_text:
-            text_parts.append(image_text)
+        native_text = "\n\n".join(dict.fromkeys(part.strip() for part in text_parts if part.strip()))
+        if not self._native_document_text_sufficient(native_text):
+            image_text = self._extract_docx_embedded_image_text(file_path)
+            if image_text:
+                text_parts.append(image_text)
 
         return "\n\n".join(dict.fromkeys(part.strip() for part in text_parts if part.strip()))
+
+    def _native_document_text_sufficient(self, text: str | None) -> bool:
+        cleaned = " ".join((text or "").split())
+        if not cleaned:
+            return False
+        word_count = len(re.findall(r"[A-Za-z0-9]{2,}", cleaned))
+        table_signals = cleaned.count("|") + len(re.findall(r"\b(?:price|qty|quantity|specification|MOQ|USD|INR|kg|certificate|COA)\b", cleaned, re.IGNORECASE))
+        return word_count >= 60 and table_signals >= 2
 
     def _extract_docx_xml_text(self, file_path: Path) -> str:
         import zipfile
@@ -2048,15 +2108,7 @@ class EmailIngestionService:
             return ""
 
     def _extract_image_text(self, file_path: Path) -> str:
-        from PIL import Image, ImageEnhance, ImageFilter, ImageOps
-        try:
-            import pytesseract
-        except ImportError:
-            pytesseract = None
-
-        if pytesseract is None:
-            logger.warning("pytesseract is not installed; skipping image OCR for %s", file_path.name)
-            return ""
+        from PIL import Image
 
         try:
             grid_table_text = ""
@@ -2064,45 +2116,24 @@ class EmailIngestionService:
                 from backend.app.services.image_grid_extractor import extract_grid_table_from_image
                 grid_result = extract_grid_table_from_image(file_path)
                 if grid_result:
-                    grid_table_text = "[GRID CELL TABLE OCR]\n" + grid_result.table_text
+                    grid_table_text = "[PADDLE TABLE OCR]\n" + grid_result.table_text
             except Exception:
-                logger.debug("Grid-cell OCR failed for %s; continuing with regular OCR", file_path.name, exc_info=True)
+                logger.debug("PaddleOCR table extraction failed for %s; continuing with regular OCR", file_path.name, exc_info=True)
 
             image = Image.open(file_path)
-            image = ImageOps.exif_transpose(image)
-            if image.mode not in ("RGB", "L"):
-                image = image.convert("RGB")
-
-            variants = []
-            base = image.convert("L")
-            variants.append(("gray", base))
-            scale = 2 if max(base.size) < 2400 else 1
-            if scale > 1:
-                variants.append(("gray_2x", base.resize((base.width * scale, base.height * scale))))
-
-            enhanced = ImageOps.autocontrast(base)
-            enhanced = ImageEnhance.Contrast(enhanced).enhance(1.8)
-            enhanced = enhanced.filter(ImageFilter.SHARPEN)
-            variants.append(("enhanced", enhanced))
-            variants.append(("threshold", enhanced.point(lambda px: 255 if px > 170 else 0)))
+            from backend.app.services.ocr import recognize_image_to_text
+            page_text = recognize_image_to_text(image, file_path.name)
 
             texts: list[str] = []
-            for name, variant in variants:
-                for config in ("--oem 3 --psm 6", "--oem 3 --psm 11"):
-                    try:
-                        page_text = pytesseract.image_to_string(variant, config=config)
-                        if page_text.strip():
-                            texts.append(f"[OCR {name} {config}]\n{page_text.strip()}")
-                    except Exception:
-                        logger.debug("OCR variant failed for %s using %s", name, config, exc_info=True)
-
             if grid_table_text:
                 texts.insert(0, grid_table_text)
+            if page_text.strip():
+                texts.append("[PADDLE OCR]\n" + page_text.strip())
             text = "\n\n".join(dict.fromkeys(texts))
-            logger.info("OCR extracted %s characters from image %s", len(text), file_path.name)
+            logger.info("PaddleOCR extracted %s characters from image %s", len(text), file_path.name)
             return text
         except Exception as e:
-            logger.exception("Error doing OCR on image %s: %s", file_path.name, e)
+            logger.exception("Error doing PaddleOCR on image %s: %s", file_path.name, e)
             return ""
 
     def _extract_text_from_file(self, file_path: Path, ext: str) -> str:
@@ -2262,6 +2293,86 @@ class EmailIngestionService:
                 "error": str(e),
             }
 
+    def _migrate_legacy_account_data(self, account_id: UUID, user_id: UUID) -> int:
+        """Move only this mailbox's legacy shared records into its owner namespace.
+
+        Older releases stored employee imports under the inviting admin's
+        tenant. The raw email ID includes the immutable EmailAccount ID, which
+        gives us a reliable ownership key without guessing from sender data.
+        """
+        account_prefix = f"{account_id}:"
+        legacy_emails = (
+            self.db.query(CatalogEmail)
+            .filter(
+                CatalogEmail.raw_email_id.like(f"{account_prefix}%"),
+                CatalogEmail.tenant_id != user_id,
+            )
+            .all()
+        )
+        if not legacy_emails:
+            return 0
+
+        supplier_by_legacy_id: dict[Any, Supplier] = {}
+        moved = 0
+        try:
+            for catalog_email in legacy_emails:
+                # A supplier may also be used by another employee in the old
+                # shared tenant. Clone/reuse it in the new namespace instead
+                # of changing its tenant and moving someone else's records.
+                target_supplier = supplier_by_legacy_id.get(catalog_email.supplier_id)
+                if target_supplier is None:
+                    legacy_supplier = self.db.query(Supplier).filter(Supplier.id == catalog_email.supplier_id).first()
+                    if not legacy_supplier:
+                        logger.warning("Skipping legacy email %s because supplier %s is missing", catalog_email.id, catalog_email.supplier_id)
+                        continue
+                    target_supplier = (
+                        self.db.query(Supplier)
+                        .filter(Supplier.tenant_id == user_id, Supplier.email_domain == legacy_supplier.email_domain)
+                        .first()
+                    )
+                    if target_supplier is None:
+                        target_supplier = Supplier(
+                            id=uuid4(),
+                            tenant_id=user_id,
+                            name=legacy_supplier.name,
+                            email_domain=legacy_supplier.email_domain,
+                            country=legacy_supplier.country or UNKNOWN_COUNTRY,
+                            last_email_date=legacy_supplier.last_email_date,
+                            certifications=legacy_supplier.certifications,
+                        )
+                        self.db.add(target_supplier)
+                        self.db.flush()
+                    supplier_by_legacy_id[catalog_email.supplier_id] = target_supplier
+
+                duplicate = (
+                    self.db.query(CatalogEmail.id)
+                    .filter(
+                        CatalogEmail.tenant_id == user_id,
+                        CatalogEmail.raw_email_id == catalog_email.raw_email_id,
+                    )
+                    .first()
+                )
+                if duplicate:
+                    logger.warning("Skipping legacy email %s because it already exists in user namespace", catalog_email.raw_email_id)
+                    continue
+
+                self.db.query(CatalogItem).filter(CatalogItem.catalog_email_id == catalog_email.id).update(
+                    {CatalogItem.tenant_id: user_id, CatalogItem.supplier_id: target_supplier.id},
+                    synchronize_session=False,
+                )
+                catalog_email.tenant_id = user_id
+                catalog_email.supplier_id = target_supplier.id
+                moved += 1
+
+            if moved:
+                self.db.commit()
+                logger.info("Migrated %s legacy catalogue email(s) for account %s into user %s", moved, account_id, user_id)
+            return moved
+        except Exception:
+            self.db.rollback()
+            logger.exception("Failed to migrate legacy catalogue data for account %s", account_id)
+            return 0
+
     def poll_account_inbox(self, account_id: UUID, force_retry_failed: bool = False) -> int:
         from backend.app.models import EmailAccount, EmailFilter
         from backend.app.auth import decrypt_password
@@ -2272,15 +2383,15 @@ class EmailIngestionService:
             return 0
 
         account_user_id = account.user_id
+        self._migrate_legacy_account_data(account_id, account_user_id)
         account_email_address = account.email_address
         account_imap_host = account.imap_host
         account_imap_port = account.imap_port
         account_encrypted_password = account.encrypted_password
 
-        # Resolve active tenant_id from profiles
-        from backend.app.models import Profile
-        profile = self.db.query(Profile).filter(Profile.id == account_user_id).first()
-        active_tenant_id = profile.tenant_id if (profile and profile.tenant_id) else account_user_id
+        # Each connected mailbox is its own data boundary. Profile.tenant_id
+        # only groups employees for administrative management.
+        active_tenant_id = account_user_id
 
         if force_retry_failed:
             from backend.app.models import CatalogEmail

@@ -19,6 +19,15 @@ security = HTTPBearer()
 logger = logging.getLogger(__name__)
 
 
+def data_tenant_id_for_user(user_id: UUID, profile: Profile | None = None) -> UUID:
+    """Return the private catalogue-data namespace for a signed-in account.
+
+    ``profiles.tenant_id`` is an organisation/invitation relationship used by
+    the admin portal. It is not a data-sharing boundary for employee inboxes.
+    """
+    return user_id
+
+
 def supabase_url_summary() -> str:
     return urlparse(str(settings.supabase_url).strip()).netloc or "<invalid-supabase-url>"
 
@@ -77,12 +86,12 @@ def get_current_user(
             )
         
         custom_role = "employee"
-        tenant_id = response.user.id
+        tenant_id = str(data_tenant_id_for_user(user_uuid))
         status_str = "Active"
         
         if profile:
             custom_role = profile.role or "employee"
-            tenant_id = str(profile.tenant_id) if profile.tenant_id else response.user.id
+            tenant_id = str(data_tenant_id_for_user(user_uuid, profile))
             status_str = profile.status or "Active"
             
             # Check the associated admin's status

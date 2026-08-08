@@ -38,11 +38,15 @@ def get_dashboard_stats(db: Session = Depends(get_db), current_user: dict = Depe
     tenant_uuid = UUID(current_user["tenant_id"])
     
     # Total employees in their organisation
-    total_employees = db.query(Profile).filter(Profile.tenant_id == tenant_uuid, Profile.role == "employee").count()
+    employees = db.query(Profile).filter(Profile.tenant_id == tenant_uuid, Profile.role == "employee").all()
+    total_employees = len(employees)
     
-    # Total supplier emails processed for their tenant
+    # Organization user scope: Admin ID + all employee IDs under this tenant
+    org_user_ids = [tenant_uuid] + [emp.id for emp in employees]
+    
+    # Total supplier emails processed for their workspace (admin + employees)
     total_emails = db.query(CatalogEmail).filter(
-        CatalogEmail.tenant_id == tenant_uuid,
+        CatalogEmail.tenant_id.in_(org_user_ids),
         CatalogEmail.processing_status == "completed",
         exists().where(CatalogItem.catalog_email_id == CatalogEmail.id),
     ).count()
@@ -50,7 +54,7 @@ def get_dashboard_stats(db: Session = Depends(get_db), current_user: dict = Depe
     # AI queries today (within last 24h)
     twenty_four_hours_ago = datetime.now(UTC) - timedelta(days=1)
     queries_today = db.query(AIQueryLog).filter(
-        AIQueryLog.tenant_id == tenant_uuid,
+        AIQueryLog.tenant_id.in_(org_user_ids),
         AIQueryLog.created_at >= twenty_four_hours_ago
     ).count()
     
@@ -65,8 +69,11 @@ def get_dashboard_stats(db: Session = Depends(get_db), current_user: dict = Depe
 def get_database_stats(db: Session = Depends(get_db), current_user: dict = Depends(get_current_admin)):
     tenant_uuid = UUID(current_user["tenant_id"])
     
-    total_suppliers = db.query(Supplier).filter(Supplier.tenant_id == tenant_uuid).distinct().count()
-    total_ingredients = db.query(CatalogItem.ingredient_name).filter(CatalogItem.tenant_id == tenant_uuid).distinct().count()
+    employees = db.query(Profile).filter(Profile.tenant_id == tenant_uuid, Profile.role == "employee").all()
+    org_user_ids = [tenant_uuid] + [emp.id for emp in employees]
+    
+    total_suppliers = db.query(Supplier).filter(Supplier.tenant_id.in_(org_user_ids)).distinct().count()
+    total_ingredients = db.query(CatalogItem.ingredient_name).filter(CatalogItem.tenant_id.in_(org_user_ids)).distinct().count()
     
     # simple PgDatabase size fallback if not in postgres
     db_size_mb = 0.0
@@ -81,12 +88,12 @@ def get_database_stats(db: Session = Depends(get_db), current_user: dict = Depen
     one_month_ago = datetime.now(UTC) - timedelta(days=30)
     
     searches_day = db.query(AIQueryLog).filter(
-        AIQueryLog.tenant_id == tenant_uuid,
+        AIQueryLog.tenant_id.in_(org_user_ids),
         AIQueryLog.created_at >= one_day_ago
     ).count()
     
     searches_month = db.query(AIQueryLog).filter(
-        AIQueryLog.tenant_id == tenant_uuid,
+        AIQueryLog.tenant_id.in_(org_user_ids),
         AIQueryLog.created_at >= one_month_ago
     ).count()
     
@@ -274,6 +281,7 @@ def list_employees(db: Session = Depends(get_db), current_user: dict = Depends(g
     
     profiles = db.query(Profile).filter(Profile.tenant_id == tenant_uuid, Profile.role == "employee").all()
     profile_ids = [p.id for p in profiles]
+    
     account_by_user = {
         account.user_id: account
         for account in (
@@ -284,10 +292,21 @@ def list_employees(db: Session = Depends(get_db), current_user: dict = Depends(g
             else []
         )
     }
-    invitations = db.query(EmployeeInvitation).filter(
-        EmployeeInvitation.tenant_id == tenant_uuid,
-        EmployeeInvitation.status == "Pending Activation"
-    ).all()
+
+    # Query registered email addresses from auth.users
+    user_emails = {}
+    if profile_ids:
+        try:
+            rows = db.execute(text("SELECT id, email FROM auth.users WHERE id = ANY(:ids)"), {"ids": profile_ids}).fetchall()
+            user_emails = {row.id: row.email for row in rows}
+        except Exception as e:
+            logger.warning("Could not query auth.users directly for employee emails: %s", e)
+
+    # Fallback lookup from EmployeeInvitation for any missing email
+    invitations_by_tenant = db.query(EmployeeInvitation).filter(EmployeeInvitation.tenant_id == tenant_uuid).all()
+    inv_emails = {inv.email: inv for inv in invitations_by_tenant}
+    
+    invitations = [inv for inv in invitations_by_tenant if inv.status == "Pending Activation"]
     
     employees_list = []
     
@@ -296,12 +315,14 @@ def list_employees(db: Session = Depends(get_db), current_user: dict = Depends(g
         # Fetch email account last sync details
         email_account = account_by_user.get(p.id)
         last_sync = "Never"
-        connected_email = "Not connected"
+        
+        # Primary email resolution: auth.users email, email_account email, or "Not connected"
+        resolved_email = user_emails.get(p.id) or (email_account.email_address if email_account else "Not connected")
+        
         if str(p.id) == current_user["id"]:
-            connected_email = current_user["email"]
+            resolved_email = current_user["email"]
             last_sync = "N/A (Admin)"
         elif email_account:
-            connected_email = email_account.email_address
             if email_account.sync_status == "error":
                 last_sync = "Sync error"
             elif email_account.last_synced_at:
@@ -318,11 +339,10 @@ def list_employees(db: Session = Depends(get_db), current_user: dict = Depends(g
                 else:
                     last_sync = "Just now"
 
-        # Skip admin user from listing as employee if they want purely employees list, but let's include all profiles for database overview
         employees_list.append({
             "id": str(p.id),
             "name": p.full_name,
-            "email": connected_email,
+            "email": resolved_email,
             "status": p.status,
             "role": p.role,
             "last_sync": last_sync

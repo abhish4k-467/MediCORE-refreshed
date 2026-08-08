@@ -63,10 +63,24 @@ class SQLExecutorMCPTest(unittest.TestCase):
                 return FakeResult()
 
         db = FakeDB()
-        res = get_structured_query_results_tool(db, "SELECT ingredient_name, price_per_unit FROM catalog_items", tenant_id=tenant_id)
+        res = get_structured_query_results_tool(
+            db,
+            "SELECT ingredient_name, price_per_unit FROM catalog_items WHERE tenant_id = :tenant_id",
+            tenant_id=tenant_id,
+        )
         self.assertEqual(res["count"], 1)
         self.assertEqual(res["rows"][0]["ingredient_name"], "Citric Acid")
         self.assertEqual(res["rows"][0]["price_per_unit"], 12.5)
+
+    def test_tenant_query_rejects_parameter_without_tenant_predicate(self) -> None:
+        class FakeDB:
+            def execute(self, statement, params=None):
+                raise AssertionError("Unscoped SQL must not run")
+
+        self.assertEqual(
+            execute_readonly_sql(FakeDB(), "SELECT :tenant_id AS tenant", tenant_id=uuid4()),
+            [],
+        )
 
 
 if __name__ == "__main__":

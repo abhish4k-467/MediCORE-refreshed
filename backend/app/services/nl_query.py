@@ -69,10 +69,7 @@ class NaturalLanguageQueryEngine:
 
             if understanding.operation == "unrelated":
                 self._log_query(question, tenant_id=tenant_id, user_id=user_id, operation_type="unrelated")
-                return ChatResponse(
-                    answer="I'm sorry, but I can only answer questions related to the MediCORE procurement intelligence system, such as suppliers, catalogue items, prices, stock, MOQ, lead time, country, certificates, and procurement decisions.",
-                    rows=[]
-                )
+                return ChatResponse(answer=self._personal_assistant_answer(question), rows=[])
 
             if not understanding.needs_database:
                 self._log_query(question, tenant_id=tenant_id, user_id=user_id, operation_type=understanding.intent)
@@ -136,10 +133,7 @@ class NaturalLanguageQueryEngine:
 
             if plan.operation == "unrelated":
                 self._log_query(question, tenant_id=tenant_id, user_id=user_id, operation_type=plan.operation)
-                return ChatResponse(
-                    answer="I'm sorry, but I can only answer questions related to the MediCORE procurement intelligence system (such as supplier catalogues, ingredients/chemicals, prices, inventory, and procurement settings).",
-                    rows=[]
-                )
+                return ChatResponse(answer=self._personal_assistant_answer(question), rows=[])
 
             try:
                 validate_operation(plan.operation)
@@ -176,7 +170,7 @@ class NaturalLanguageQueryEngine:
                 if generated_sql:
                     sql_rows = execute_readonly_sql(self.db, generated_sql, tenant_id=tenant_id)
                     if sql_rows:
-                        rows = self._normalize_sql_rows(sql_rows)
+                        rows = self._normalize_sql_rows(sql_rows, tenant_id=tenant_id)
             except Exception as exc:
                 logger.warning("AI SQL generation/execution failed; falling back to structured plan: %s", exc)
                 rows = []
@@ -225,7 +219,7 @@ class NaturalLanguageQueryEngine:
                 rows=[]
             )
 
-    def _normalize_sql_rows(self, sql_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _normalize_sql_rows(self, sql_rows: list[dict[str, Any]], tenant_id: Any | None = None) -> list[dict[str, Any]]:
         normalized_list = []
         for row in sql_rows:
             norm = dict(row)
@@ -264,9 +258,9 @@ class NaturalLanguageQueryEngine:
                 norm["certificate_pdfs"] = self._certificate_pdfs(norm.get("raw_payload"))
 
             normalized_list.append(norm)
-        self._hydrate_missing_received_at(normalized_list)
-        self._hydrate_missing_certificate_pdfs(normalized_list)
-        self._hydrate_missing_supplier_email(normalized_list)
+        self._hydrate_missing_received_at(normalized_list, tenant_id=tenant_id)
+        self._hydrate_missing_certificate_pdfs(normalized_list, tenant_id=tenant_id)
+        self._hydrate_missing_supplier_email(normalized_list, tenant_id=tenant_id)
         return normalized_list
 
     def _normalize_received_at(self, row: dict[str, Any]) -> None:
@@ -287,7 +281,7 @@ class NaturalLanguageQueryEngine:
         if hasattr(value, "isoformat"):
             row["received_at"] = value.isoformat()
 
-    def _hydrate_missing_received_at(self, rows: list[dict[str, Any]]) -> None:
+    def _hydrate_missing_received_at(self, rows: list[dict[str, Any]], tenant_id: Any | None = None) -> None:
         missing_rows = [row for row in rows if not row.get("received_at")]
         if not missing_rows:
             return
@@ -305,7 +299,7 @@ class NaturalLanguageQueryEngine:
         try:
             if email_ids:
                 for email_id, received_at in self.db.execute(
-                    select(CatalogEmail.id, CatalogEmail.received_at).where(CatalogEmail.id.in_(email_ids))
+                    select(CatalogEmail.id, CatalogEmail.received_at).where(CatalogEmail.id.in_(email_ids), CatalogEmail.tenant_id == tenant_id)
                 ):
                     received_by_email_id[email_id] = received_at
 
@@ -313,7 +307,7 @@ class NaturalLanguageQueryEngine:
                 for item_id, received_at in self.db.execute(
                     select(CatalogItem.id, CatalogEmail.received_at)
                     .join(CatalogEmail, CatalogEmail.id == CatalogItem.catalog_email_id)
-                    .where(CatalogItem.id.in_(item_ids))
+                    .where(CatalogItem.id.in_(item_ids), CatalogItem.tenant_id == tenant_id)
                 ):
                     received_by_item_id[item_id] = received_at
         except Exception:
@@ -342,7 +336,7 @@ class NaturalLanguageQueryEngine:
         except (TypeError, ValueError):
             return None
 
-    def _hydrate_missing_certificate_pdfs(self, rows: list[dict[str, Any]]) -> None:
+    def _hydrate_missing_certificate_pdfs(self, rows: list[dict[str, Any]], tenant_id: Any | None = None) -> None:
         missing_rows = [row for row in rows if not row.get("certificate_pdfs")]
         item_ids = {
             self._coerce_uuid(row.get("id") or row.get("item_id") or row.get("catalog_item_id"))
@@ -355,7 +349,7 @@ class NaturalLanguageQueryEngine:
         payload_by_item_id: dict[Any, dict] = {}
         try:
             for item_id, raw_payload in self.db.execute(
-                select(CatalogItem.id, CatalogItem.raw_payload).where(CatalogItem.id.in_(item_ids))
+                select(CatalogItem.id, CatalogItem.raw_payload).where(CatalogItem.id.in_(item_ids), CatalogItem.tenant_id == tenant_id)
             ):
                 payload_by_item_id[item_id] = raw_payload or {}
         except Exception:
@@ -366,7 +360,7 @@ class NaturalLanguageQueryEngine:
             raw_payload = payload_by_item_id.get(item_id) if item_id else None
             row["certificate_pdfs"] = self._certificate_pdfs(raw_payload)
 
-    def _hydrate_missing_supplier_email(self, rows: list[dict[str, Any]]) -> None:
+    def _hydrate_missing_supplier_email(self, rows: list[dict[str, Any]], tenant_id: Any | None = None) -> None:
         missing_rows = [row for row in rows if not row.get("email_domain") or not row.get("country") or row.get("country") == "Unknown"]
         item_ids = {
             self._coerce_uuid(row.get("id") or row.get("item_id") or row.get("catalog_item_id"))
@@ -381,7 +375,7 @@ class NaturalLanguageQueryEngine:
             for item_id, email_domain, country in self.db.execute(
                 select(CatalogItem.id, Supplier.email_domain, Supplier.country)
                 .join(Supplier, Supplier.id == CatalogItem.supplier_id)
-                .where(CatalogItem.id.in_(item_ids))
+                .where(CatalogItem.id.in_(item_ids), CatalogItem.tenant_id == tenant_id)
             ):
                 info_by_item_id[item_id] = (email_domain, country or "Unknown")
         except Exception:
@@ -521,6 +515,16 @@ class NaturalLanguageQueryEngine:
         if "negotiate" in lowered or "rfq" in lowered:
             return "For supplier negotiation, ask for price breaks by quantity, confirm MOQ, lead time, payment terms, certificate availability, and validity date. Share the ingredient name when you want me to compare actual supplier offers."
         return "I can help with supplier discovery, price comparison, availability, MOQ, lead time, certificates, country/origin, and procurement recommendations. Please name an ingredient or supplier constraint if you want me to check MediCORE data."
+
+    def _personal_assistant_answer(self, question: str) -> str:
+        """Keep general chat useful while never querying or exposing tenant data."""
+        try:
+            answer = self.llm.personal_assistant_answer(question)
+            if answer:
+                return answer
+        except Exception:
+            logger.info("General assistant response unavailable", exc_info=True)
+        return "I can help with that. Please try again when the assistant service is available."
 
     def _extract_query_filters(self, question: str) -> dict[str, Any]:
         lowered = question.lower()
@@ -814,6 +818,31 @@ class NaturalLanguageQueryEngine:
 
         canonical_query = self._canonical_ingredient_text(extracted_phrase)
         expanded_query = self._canonical_ingredient_text(" ".join(sorted(query_tokens)))
+
+        # Resolve an exact catalogue name before considering partial or fuzzy
+        # matching.  This makes a request such as "Citric Acid" select only
+        # the database rows for Citric Acid, rather than also returning items
+        # that merely contain one of those words.  Canonical comparison keeps
+        # matching tolerant of casing, whitespace, and punctuation differences
+        # while the query itself remains a deterministic database lookup.
+        exact_names = list(
+            dict.fromkeys(
+                str(ingredient_name)
+                for ingredient_name in candidates
+                if ingredient_name
+                and self._canonical_ingredient_text(ingredient_name) == canonical_query
+            )
+        )
+        if exact_names:
+            return IngredientMatchResult(
+                extracted_phrase=extracted_phrase,
+                search_phrase=exact_names[0],
+                matched_names=exact_names,
+                best_match=exact_names[0],
+                confidence=1.0,
+                suggestions=None,
+            )
+
         scored: list[tuple[float, str, str | None]] = []
 
         for ingredient_name in dict.fromkeys(name for name in candidates if name):
