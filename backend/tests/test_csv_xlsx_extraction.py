@@ -1,6 +1,8 @@
 import unittest
 import tempfile
+import zipfile
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 from backend.app.services.catalog_table_parser import (
     parse_catalog_table_text,
@@ -132,10 +134,9 @@ Paracetamol 500mg,10000 kg
             service = object.__new__(EmailIngestionService)
             text = service._extract_csv_tables_text(csv_path)
 
-        self.assertIn("[CSV TABLE]", text)
-        self.assertIn("Delimiter: ';'", text)
+        self.assertIn("| Product Name | Stock | Unit | Notes |", text)
         self.assertIn("Vitamin Blend Premium Grade", text)
-        self.assertIn('Supplier said ""In Stock""', text)
+        self.assertIn('Supplier said "In Stock"', text)
 
         items = parse_catalog_table_text(text, dedupe=False)
         names = [item.ingredient_name for item in items]
@@ -159,47 +160,154 @@ Paracetamol 500mg,10000 kg
             service = object.__new__(EmailIngestionService)
             text = service._extract_csv_tables_text(csv_path)
 
-        self.assertIn("Delimiter: '|'", text)
+        self.assertIn("| Product | Stock | Unit | Price |", text)
         items = parse_catalog_table_text(text, dedupe=False)
         self.assertEqual(len(items), 2)
         self.assertEqual(items[0].ingredient_name, "Aspirin 100mg")
         self.assertEqual(items[1].ingredient_name, "Paracetamol 500mg")
         self.assertIsNone(items[1].price_per_unit)
 
-    def test_xlsx_extraction_detects_side_by_side_and_stacked_tables(self):
-        from openpyxl import Workbook
-
-        workbook = Workbook()
-        sheet = workbook.active
-        sheet.title = "Inventory"
-        sheet["A1"] = "ABC Pharma Inventory July"
-
-        tables = [
-            ("A3", [("Product", "Stock", "Unit"), ("Aspirin 100mg", 5000, "kg")]),
-            ("E3", [("Product", "Stock", "Unit"), ("Paracetamol 500mg", 10000, "kg")]),
-            ("A8", [("Product", "Price", "Unit"), ("Vitamin D3 Powder (Lichen) 100,000 IU/g", 25.5, "kg")]),
-            ("E8", [("Product", "Stock", "Unit"), ("Ibuprofen 400mg", 2500, "kg")]),
-        ]
-        for start_cell, rows in tables:
-            start = sheet[start_cell]
-            for row_offset, row in enumerate(rows):
-                for col_offset, value in enumerate(row):
-                    sheet.cell(start.row + row_offset, start.column + col_offset, value=value)
-
+    def test_docx_anydoc_table_keeps_multiclause_specification_in_same_row(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            workbook_path = Path(tmp_dir) / "multi-table.xlsx"
-            workbook.save(workbook_path)
+            docx_path = Path(tmp_dir) / "catalogue.docx"
+            self._write_docx_table(
+                docx_path,
+                [
+                    ["Jinrui Product Code", "Product Name", "Product Specification Description", "FOB($/kg)"],
+                    [
+                        "JRG1289-A321",
+                        "Zinc Carnosine (Polaprezinc)",
+                        "Carnosine content: 76.0 ~ 80.0%, Zinc content: 21.5 ~ 23.0%",
+                        "172",
+                    ],
+                    [
+                        "JRG1104-F397",
+                        "Zinc Citrate",
+                        "Zinc (dry basis): >=31.3%, Complies with GB 1903.49-2020",
+                        "5",
+                    ],
+                ],
+            )
 
             service = object.__new__(EmailIngestionService)
-            text = service._extract_xlsx_tables_text(workbook_path)
+            text = service._extract_docx_text(docx_path)
 
-        self.assertEqual(text.count("[EXCEL TABLE]"), 4)
+        self.assertIn("| Zinc Carnosine (Polaprezinc) |", text)
+        self.assertIn("Zinc content: 21.5 ~ 23.0%", text)
         items = parse_catalog_table_text(text)
-        names = [item.ingredient_name for item in items]
-        self.assertIn("Aspirin 100mg", names)
-        self.assertIn("Paracetamol 500mg", names)
-        self.assertIn("Ibuprofen 400mg", names)
-        self.assertIn("Vitamin D3 Powder (Lichen) 100,000 IU/g", names)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].ingredient_name, "Zinc Carnosine (Polaprezinc)")
+        self.assertIn("Zinc content: 21.5 ~ 23.0%", items[0].specification or "")
+        self.assertEqual(items[0].price_per_unit, 172)
+        self.assertNotIn("Zinc content: 21.5 ~ 23.0%", [item.ingredient_name for item in items])
+
+    def test_product_code_column_is_skipped_without_dropping_row(self):
+        markdown = """| Product code | Product Name | Product Specification Description | FOB($/kg) |
+| --- | --- | --- | --- |
+| JRG1287-A319 | 3,3'-Diindolylmethane | Assay: >=99.0% | 30 |
+| JRG1291-A322 | 5-Amino-1-methylquinolinium Chloride | Purity: >=98.0% | 1477 |
+"""
+        items = parse_catalog_table_text(markdown)
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].ingredient_name, "3,3'-Diindolylmethane")
+        self.assertEqual(items[0].supplier_sku, "JRG1287-A319")
+        self.assertEqual(items[0].price_per_unit, 30)
+        self.assertEqual(items[1].ingredient_name, "5-Amino-1-methylquinolinium Chloride")
+        self.assertEqual(items[1].supplier_sku, "JRG1291-A322")
+
+    def test_specification_text_is_not_stored_as_price_when_columns_shift(self):
+        markdown = """| Product code | Product Name | Price(USD/kg) |
+| --- | --- | --- |
+| JRG1287-A319 | 3,3'-Diindolylmethane | Assay: >=99.0% |
+| JRG1291-A322 | 5-Amino-1-methylquinolinium Chloride | Purity: >=98.0% |
+"""
+        items = parse_catalog_table_text(markdown)
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].ingredient_name, "3,3'-Diindolylmethane")
+        self.assertEqual(items[0].specification, "Assay: >=99.0%")
+        self.assertIsNone(items[0].price_per_unit)
+        self.assertNotIn("original_price", items[0].notes or "")
+        self.assertEqual(items[1].specification, "Purity: >=98.0%")
+        self.assertIsNone(items[1].price_per_unit)
+
+    def test_textual_price_values_are_preserved_when_price_column_is_non_numeric(self):
+        markdown = """| Product | Specification | Price |
+| --- | --- | --- |
+| Citric Acid | Food Grade | On request |
+| Sodium Citrate | USP | Negotiable |
+"""
+        items = parse_catalog_table_text(markdown)
+
+        self.assertEqual(len(items), 2)
+        self.assertIsNone(items[0].price_per_unit)
+        self.assertIn("original_price=INR On request", items[0].notes or "")
+        self.assertIn("original_price=INR Negotiable", items[1].notes or "")
+
+    def test_structured_markdown_table_does_not_call_llm_fallback(self):
+        class FailingLlm:
+            def extract_catalog_items(self, *args, **kwargs):
+                raise AssertionError("LLM fallback should not run for parsed structured tables")
+
+        markdown = """| Product code | Product Name | Product Specification Description | FOB($/kg) |
+| --- | --- | --- | --- |
+| JRG1287-A319 | 3,3'-Diindolylmethane | Assay: >=99.0% | 30 |
+"""
+        service = object.__new__(EmailIngestionService)
+        service.llm = FailingLlm()
+
+        items = service._extract_items_from_text(markdown, "sample2.docx")
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].ingredient_name, "3,3'-Diindolylmethane")
+
+    def test_parser_rejects_specification_fragments_as_ingredient_names(self):
+        markdown = """| Product Name | Product Specification Description | FOB($/kg) |
+| --- | --- | --- |
+| Zinc content: 21.5 ~ 23.0% | Carnosine content: 76.0 ~ 80.0% | |
+| Zinc Glycinate | Content (dry basis): >=98.0%, Complies with GB 1903.2-2015 | 7 |
+"""
+        items = parse_catalog_table_text(markdown, dedupe=False)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].ingredient_name, "Zinc Glycinate")
+
+    def _write_docx_table(self, path: Path, rows: list[list[str]]) -> None:
+        def cell(text: str) -> str:
+            return f"<w:tc><w:p><w:r><w:t>{escape(text)}</w:t></w:r></w:p></w:tc>"
+
+        def row(values: list[str]) -> str:
+            return "<w:tr>" + "".join(cell(value) for value in values) + "</w:tr>"
+
+        document = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            "<w:body><w:tbl>"
+            + "".join(row(values) for values in rows)
+            + "</w:tbl></w:body></w:document>"
+        )
+        content_types = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/word/document.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+            "</Types>"
+        )
+        rels = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+            'Target="word/document.xml"/>'
+            "</Relationships>"
+        )
+        with zipfile.ZipFile(path, "w") as docx:
+            docx.writestr("[Content_Types].xml", content_types)
+            docx.writestr("_rels/.rels", rels)
+            docx.writestr("word/document.xml", document)
 
 
 if __name__ == "__main__":

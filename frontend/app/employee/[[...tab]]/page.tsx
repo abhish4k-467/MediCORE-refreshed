@@ -81,6 +81,7 @@ type SupplierApiRow = {
   country?: string | null;
   last_email_date: string | null;
   certifications: string | null;
+  item_count?: number;
 };
 
 type CatalogEmailRow = {
@@ -1198,10 +1199,6 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   }, [supplierRows]);
 
   const dashboardData = useMemo(() => {
-    const suppliers = new Set([
-      ...supplierRows.map((row) => supplierKey(row.supplier_name, row.email_domain)),
-      ...catalogEmails.map((email) => supplierKey(email.supplier_name, email.email_domain)),
-    ]);
     const completedCatalogs = catalogEmails.filter((email) => email.processing_status === "completed").length;
 
     const itemGroups = new Map<string, SupplierTableRow[]>();
@@ -1232,11 +1229,11 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     return {
       emailsReceived: catalogEmails.length,
       completedCatalogs,
-      activeSuppliers: suppliers.size,
+      activeSuppliers: supplierMetaRows.length,
       deals: deals.slice(0, 3),
       activities,
     };
-  }, [catalogEmails, inboxThreads, supplierRows, latestSupplierRows]);
+  }, [catalogEmails, inboxThreads, supplierMetaRows, latestSupplierRows]);
 
   const topDashboardDeal = dashboardData.deals[0];
 
@@ -1278,14 +1275,14 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         ? items.filter((item) => item.catalog_email_id === latestEmail.id)
         : items;
       const sortedLatestByPrice = [...latestItems].sort((left, right) => safePrice(left.price_per_unit, left.currency) - safePrice(right.price_per_unit, right.currency));
-      const totalQty = latestItems.reduce((total, item) => total + safeQty(item.available_qty), 0);
+      const totalQty = items.reduce((total, item) => total + safeQty(item.available_qty), 0);
 
       return {
         supplier_key: key,
         supplier_name: supplierName,
         email_domain: emailDomain ?? meta?.email_domain ?? "-",
         country,
-        item_count: Number(latestEmail?.item_count || 0) || latestItems.length,
+        item_count: Number(meta?.item_count || 0) || items.length,
         best_item: sortedLatestByPrice[0],
         total_qty: totalQty,
         last_catalog_at: latestEmail?.received_at ?? items[0]?.valid_until ?? meta?.last_email_date ?? null,
@@ -1388,19 +1385,19 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
 
   const supplierEmails = useMemo(() => {
     if (!selectedCatalogSupplier) return [];
-    return catalogEmails.filter((email) => supplierKey(email.supplier_name, email.email_domain) === selectedCatalogSupplier)
+    return catalogEmails.filter((email) => supplierKey(email.supplier_name, email.email_domain) === selectedCatalogSupplier && isProcurementCatalogEmail(email))
       .sort((left, right) => new Date(right.received_at).getTime() - new Date(left.received_at).getTime());
   }, [catalogEmails, selectedCatalogSupplier]);
 
   const activeCatalogEmail = useMemo(() => {
-    return supplierEmails.find((e) => e.id === selectedCatalogEmailId) ?? supplierEmails[0] ?? null;
+    return selectedCatalogEmailId ? supplierEmails.find((e) => e.id === selectedCatalogEmailId) ?? null : null;
   }, [supplierEmails, selectedCatalogEmailId]);
 
   useEffect(() => {
-    if (supplierEmails.length > 0) {
+    if (supplierEmails.length > 0 && selectedCatalogEmailId) {
       const exists = supplierEmails.some((e) => e.id === selectedCatalogEmailId);
       if (!exists) {
-        setSelectedCatalogEmailId(supplierEmails[0].id);
+        setSelectedCatalogEmailId(null);
       }
     } else {
       setSelectedCatalogEmailId(null);
@@ -1763,7 +1760,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       try {
         const [suppliersRes, itemsRes, emailsRes] = await Promise.all([
           authFetch(`${apiBaseUrl}/api/suppliers`),
-          authFetch(`${apiBaseUrl}/api/catalogs/items?limit=10000&latest_only=true`),
+          authFetch(`${apiBaseUrl}/api/catalogs/items?limit=10000&latest_only=false`),
           authFetch(`${apiBaseUrl}/api/catalogs/emails?limit=100`),
         ]);
 
@@ -3306,6 +3303,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                             outline: "none",
                           }}
                         >
+                          <option value="">All catalogues</option>
                           {supplierEmails.map((email) => (
                             <option key={email.id} value={email.id}>
                               {formatDDMMYY(email.received_at)}
@@ -4724,7 +4722,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                         <td>
                           <button className="table-action-button" type="button" onClick={() => {
                             setSelectedCatalogSupplier(supplier.supplier_key);
-                            setSelectedCatalogEmailId(supplier.latest_email_id);
+                            setSelectedCatalogEmailId(null);
                             setActiveTab("catalogs");
                           }}>View catalogue</button>
                         </td>

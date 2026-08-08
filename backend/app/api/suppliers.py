@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends
-from sqlalchemy import exists, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from uuid import UUID
@@ -23,6 +23,7 @@ def mock_suppliers() -> list[dict]:
             "country": row.country or "Unknown",
             "last_email_date": row.last_email_date,
             "certifications": row.certifications,
+            "item_count": 0,
         }
         for row in sorted(suppliers, key=lambda supplier: supplier.last_email_date, reverse=True)
     ]
@@ -37,29 +38,43 @@ def list_suppliers(
     try:
         user_uuid = UUID(current_user["tenant_id"])
         stmt = (
-            select(Supplier)
+            select(
+                Supplier,
+                func.count(CatalogItem.id).label("item_count"),
+                func.max(CatalogEmail.received_at).label("last_catalog_at"),
+            )
             .join(CatalogEmail, CatalogEmail.supplier_id == Supplier.id)
+            .join(CatalogItem, CatalogItem.catalog_email_id == CatalogEmail.id)
             .where(
                 Supplier.tenant_id == user_uuid,
-                CatalogEmail.processing_status == "completed",
-                exists().where(CatalogItem.catalog_email_id == CatalogEmail.id),
+                CatalogEmail.processing_status.in_(["completed", "partial", "partially_processed"]),
+                CatalogItem.tenant_id == user_uuid,
             )
-            .distinct()
+            .group_by(
+                Supplier.id,
+                Supplier.tenant_id,
+                Supplier.name,
+                Supplier.email_domain,
+                Supplier.country,
+                Supplier.last_email_date,
+                Supplier.certifications,
+            )
         )
         if not settings.mock_data_enabled:
             stmt = stmt.where(Supplier.email_domain.not_like("%.example"))
             stmt = stmt.where(CatalogEmail.raw_email_id.not_like("core-mock-catalog-%"))
-        rows = db.execute(stmt.order_by(Supplier.last_email_date.desc().nullslast())).scalars()
+        rows = db.execute(stmt.order_by(func.max(CatalogEmail.received_at).desc().nullslast()))
         return [
             {
                 "id": str(row.id),
                 "name": row.name,
                 "email_domain": row.email_domain,
                 "country": row.country or "Unknown",
-                "last_email_date": row.last_email_date,
+                "last_email_date": last_catalog_at or row.last_email_date,
                 "certifications": row.certifications,
+                "item_count": int(item_count or 0),
             }
-            for row in rows
+            for row, item_count, last_catalog_at in rows
         ]
     except SQLAlchemyError:
         if not settings.mock_data_enabled:

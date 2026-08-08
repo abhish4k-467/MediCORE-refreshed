@@ -1,15 +1,14 @@
 import email
 import email.utils
-import csv
 from collections import defaultdict
 from email.header import decode_header
 from html.parser import HTMLParser
-import io
 import imaplib
 import json
 import logging
 import re
 import tempfile
+import zipfile
 
 import httpx
 from datetime import UTC, datetime
@@ -26,7 +25,6 @@ from backend.app.db import get_supabase
 from backend.app.models import CatalogEmail, CatalogItem, Supplier
 from backend.app.services.catalog_table_parser import (
     CATALOG_TABLE_PARSER_VERSION,
-    _header_map,
     extract_pack_size,
     is_valid_ingredient_name,
     parse_catalog_table_text,
@@ -624,7 +622,10 @@ class EmailIngestionService:
             )
             return parsed
 
-        if ("[EXCEL TABLE]" in text or "[CSV TABLE]" in text) and parsed:
+        if (
+            ("[EXCEL TABLE]" in text or "[CSV TABLE]" in text)
+            or (not conversational_source and self._looks_like_structured_table_text(parser_text))
+        ) and parsed:
             logger.info(
                 "Using %s deterministic structured table parser row(s) for catalogue %s; skipping LLM fallback",
                 len(parsed),
@@ -653,6 +654,28 @@ class EmailIngestionService:
                     if block:
                         table_blocks.append(block)
         return "\n\n".join(dict.fromkeys(table_blocks)) or text
+
+    def _looks_like_structured_table_text(self, text: str) -> bool:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        table_rows = 0
+        separator_rows = 0
+        header_rows = 0
+        for line in lines[:200]:
+            if "|" not in line:
+                continue
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if len(cells) < 3:
+                continue
+            if all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells if cell):
+                separator_rows += 1
+                continue
+            table_rows += 1
+            header = " ".join(cells).lower()
+            if any(term in header for term in ("product", "ingredient", "material", "price", "fob", "qty", "quantity")):
+                header_rows += 1
+        if separator_rows >= 1:
+            return table_rows >= 2
+        return table_rows >= 3 and header_rows >= 1 and table_rows / max(len(lines), 1) >= 0.8
 
     def _dedupe_extracted_items(self, items) -> list:
         deduped = []
@@ -1695,27 +1718,14 @@ class EmailIngestionService:
         return "\n".join(lines).strip()
 
     def _extract_docx_text(self, file_path: Path) -> str:
-        text_parts: list[str] = []
-        markitdown_text = self._extract_with_markitdown(file_path)
-        if markitdown_text:
-            text_parts.append(markitdown_text)
+        text = self._extract_with_anydoc(file_path, fallback_format=file_path.suffix.lower().lstrip("."))
+        text_parts = [text] if text else []
 
-        try:
-            import mammoth
-            with file_path.open("rb") as docx_file:
-                result = mammoth.extract_raw_text(docx_file)
-            if result.value.strip():
-                text_parts.append(result.value.strip())
-        except Exception:
-            logger.info("Mammoth DOCX extraction failed for %s; falling back to XML", file_path.name)
-
-        xml_text = self._extract_docx_xml_text(file_path)
-        if xml_text:
-            text_parts.append(xml_text)
-
-        native_text = "\n\n".join(dict.fromkeys(part.strip() for part in text_parts if part.strip()))
-        if not self._native_document_text_sufficient(native_text):
-            image_text = self._extract_docx_embedded_image_text(file_path)
+        if not self._native_document_text_sufficient(text):
+            image_text = self._extract_office_embedded_image_text(
+                file_path,
+                fallback_format=file_path.suffix.lower().lstrip("."),
+            )
             if image_text:
                 text_parts.append(image_text)
 
@@ -1729,44 +1739,77 @@ class EmailIngestionService:
         table_signals = cleaned.count("|") + len(re.findall(r"\b(?:price|qty|quantity|specification|MOQ|USD|INR|kg|certificate|COA)\b", cleaned, re.IGNORECASE))
         return word_count >= 60 and table_signals >= 2
 
-    def _extract_docx_xml_text(self, file_path: Path) -> str:
-        import zipfile
-        import xml.etree.ElementTree as ET
+    def _extract_word_text(self, file_path: Path, ext: str) -> str:
+        text = self._extract_with_anydoc(file_path, fallback_format=ext.lstrip("."))
+        text_parts = [text] if text else []
+
+        if not self._native_document_text_sufficient(text):
+            image_text = self._extract_office_embedded_image_text(file_path, fallback_format=ext.lstrip("."))
+            if image_text:
+                text_parts.append(image_text)
+
+        return "\n\n".join(dict.fromkeys(part.strip() for part in text_parts if part.strip()))
+
+    def _extract_office_embedded_image_text(self, file_path: Path, fallback_format: str | None = None) -> str:
+        texts = self._extract_anydoc_embedded_image_text(file_path, fallback_format=fallback_format)
+        if texts:
+            return texts
+        if file_path.suffix.lower() == ".docx":
+            return self._extract_docx_zip_embedded_image_text(file_path)
+        return ""
+
+    def _extract_anydoc_embedded_image_text(self, file_path: Path, fallback_format: str | None = None) -> str:
         try:
-            with zipfile.ZipFile(file_path) as docx:
-                xml_parts = [
-                    name
-                    for name in docx.namelist()
-                    if name.startswith("word/") and name.endswith(".xml") and not name.startswith("word/_rels/")
-                ]
-                extracted: list[str] = []
-                ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
-                for xml_name in xml_parts:
-                    try:
-                        root = ET.fromstring(docx.read(xml_name))
-                    except Exception:
-                        continue
-                    rows = root.findall(".//w:tr", ns)
-                    for row in rows:
-                        cells = []
-                        for cell in row.findall(".//w:tc", ns):
-                            cell_text = " ".join(node.text for node in cell.findall(".//w:t", ns) if node.text)
-                            if cell_text.strip():
-                                cells.append(" ".join(cell_text.split()))
-                        if cells:
-                            extracted.append(" | ".join(cells))
-                    text_nodes = root.findall('.//w:t', ns)
-                    plain_text = "\n".join(node.text for node in text_nodes if node.text)
-                    if plain_text.strip():
-                        extracted.append(plain_text)
-                return "\n".join(dict.fromkeys(part for part in extracted if part.strip()))
-        except Exception as e:
-            logger.exception("Error extracting text from docx file %s: %s", file_path.name, e)
+            import anydoc
+
+            document = anydoc.to_document(file_path.read_bytes(), fallback_format)
+        except Exception:
+            logger.debug("Anydoc embedded asset extraction failed for %s", file_path.name, exc_info=True)
             return ""
 
-    def _extract_docx_embedded_image_text(self, file_path: Path) -> str:
-        import zipfile
+        image_assets = [
+            asset
+            for asset in getattr(document, "assets", []) or []
+            if str(getattr(asset, "media_type", "") or "").lower().startswith("image/")
+            and getattr(asset, "data", None)
+        ]
+        if not image_assets:
+            return ""
 
+        texts: list[str] = []
+        suffix_by_type = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/webp": ".webp",
+            "image/bmp": ".bmp",
+            "image/tiff": ".tiff",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            for index, asset in enumerate(image_assets, start=1):
+                media_type = str(getattr(asset, "media_type", "") or "").lower()
+                origin_part = str(getattr(asset, "origin_part", "") or "")
+                suffix = Path(origin_part).suffix.lower() or suffix_by_type.get(media_type, ".png")
+                image_path = tmp_path / f"office-image-{index}{suffix}"
+                try:
+                    image_path.write_bytes(bytes(getattr(asset, "data")))
+                    image_text = self._extract_image_text(image_path)
+                except Exception:
+                    logger.debug(
+                        "OCR failed for embedded office image %s in %s",
+                        origin_part or index,
+                        file_path.name,
+                        exc_info=True,
+                    )
+                    continue
+                if image_text.strip():
+                    texts.append(f"[OFFICE EMBEDDED IMAGE OCR] {origin_part or image_path.name}\n{image_text.strip()}")
+        if texts:
+            logger.info("OCR extracted embedded image text from %s image(s) in %s", len(texts), file_path.name)
+        return "\n\n".join(dict.fromkeys(texts))
+
+    def _extract_docx_zip_embedded_image_text(self, file_path: Path) -> str:
         image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
         texts: list[str] = []
         try:
@@ -1791,397 +1834,53 @@ class EmailIngestionService:
         return "\n\n".join(dict.fromkeys(texts))
 
     def _extract_spreadsheet_text(self, file_path: Path, ext: str) -> str:
-        if ext == ".csv":
-            csv_text = self._extract_csv_tables_text(file_path)
-            if csv_text:
-                return csv_text
-
-        if ext in (".xlsx", ".xlsm", ".xltx", ".xltm"):
-            excel_text = self._extract_xlsx_tables_text(file_path)
-            if excel_text:
-                return excel_text
-
-        markitdown_text = self._extract_with_markitdown(file_path)
-        if markitdown_text:
-            return markitdown_text
-
-        try:
-            import pandas as pd
-            frames = pd.read_excel(file_path, sheet_name=None)
-
-            lines: list[str] = []
-            for sheet_name, frame in frames.items():
-                lines.append(f"Sheet: {sheet_name}")
-                frame = frame.dropna(how="all").dropna(axis=1, how="all")
-                if frame.empty:
-                    continue
-                lines.append(frame.to_csv(index=False))
-            return "\n".join(lines).strip()
-        except Exception as e:
-            logger.exception("Error extracting tabular text from %s: %s", file_path.name, e)
-            return ""
+        return self._extract_with_anydoc(file_path, fallback_format=ext.lstrip("."))
 
     def _extract_csv_tables_text(self, file_path: Path) -> str:
-        encoding = self._detect_csv_encoding(file_path)
-        delimiter = self._detect_csv_delimiter(file_path, encoding)
-        header: list[str] | None = None
-        data_rows: list[list[str]] = []
-        header_line_number = 0
-
-        try:
-            with file_path.open("r", encoding=encoding, errors="replace", newline="") as csv_file:
-                reader = csv.reader(csv_file, delimiter=delimiter, quotechar='"', doublequote=True)
-                for row_number, raw_row in enumerate(reader, start=1):
-                    try:
-                        row = self._clean_csv_row(raw_row)
-                        if self._is_empty_csv_row(row):
-                            continue
-                        if header is None:
-                            if self._is_csv_header(row):
-                                header = row
-                                header_line_number = row_number
-                            continue
-                        if self._is_csv_header(row) and self._normalized_header(row) == self._normalized_header(header):
-                            continue
-                        recovered = self._recover_csv_row(row, len(header), file_path.name, row_number)
-                        if recovered and not self._looks_like_csv_non_data_row(recovered):
-                            data_rows.append(recovered)
-                    except Exception as exc:
-                        logger.warning("Failed parsing CSV row file=%s row=%s: %s", file_path.name, row_number, exc)
-                        continue
-        except csv.Error as exc:
-            logger.warning("CSV reader failed for %s using delimiter %r: %s", file_path.name, delimiter, exc)
-            return self._extract_csv_tables_text_fallback(file_path, encoding)
-        except Exception:
-            logger.exception("Could not read CSV file %s", file_path.name)
-            return ""
-
-        if not header or not data_rows:
-            return self._extract_csv_tables_text_fallback(file_path, encoding)
-
-        return self._format_csv_table(file_path.name, encoding, delimiter, header_line_number, header, data_rows)
-
-    def _extract_csv_tables_text_fallback(self, file_path: Path, encoding: str) -> str:
-        try:
-            lines = file_path.read_text(encoding=encoding, errors="replace").splitlines()
-        except Exception:
-            return ""
-
-        best_text = ""
-        best_score = 0
-        for delimiter in (",", ";", "|", "\t"):
-            header: list[str] | None = None
-            header_line_number = 0
-            rows: list[list[str]] = []
-            for row_number, line in enumerate(lines, start=1):
-                if not line.strip():
-                    continue
-                row = self._clean_csv_row(line.split(delimiter))
-                if self._is_empty_csv_row(row):
-                    continue
-                if header is None:
-                    if self._is_csv_header(row):
-                        header = row
-                        header_line_number = row_number
-                    continue
-                recovered = self._recover_csv_row(row, len(header), file_path.name, row_number)
-                if recovered and not self._looks_like_csv_non_data_row(recovered):
-                    rows.append(recovered)
-            score = len(rows) * len(header or [])
-            if header and rows and score > best_score:
-                best_score = score
-                best_text = self._format_csv_table(file_path.name, encoding, delimiter, header_line_number, header, rows, fallback=True)
-        return best_text
-
-    def _format_csv_table(
-        self,
-        file_name: str,
-        encoding: str,
-        delimiter: str,
-        header_line_number: int,
-        header: list[str],
-        rows: list[list[str]],
-        fallback: bool = False,
-    ) -> str:
-        output = io.StringIO()
-        writer = csv.writer(output, lineterminator="\n")
-        fallback_text = " Fallback: true" if fallback else ""
-        output.write(
-            f"[CSV TABLE] File: {file_name} Encoding: {encoding} "
-            f"Delimiter: {repr(delimiter)} HeaderRow: {header_line_number}{fallback_text}\n"
-        )
-        writer.writerow(header)
-        writer.writerows(rows)
-        return output.getvalue().strip()
-
-    def _detect_csv_encoding(self, file_path: Path) -> str:
-        sample = file_path.read_bytes()[:65536]
-        if sample.startswith(b"\xff\xfe") or sample.startswith(b"\xfe\xff"):
-            return "utf-16"
-        if sample.startswith(b"\xef\xbb\xbf"):
-            return "utf-8-sig"
-        for encoding in ("utf-8-sig", "utf-8", "cp1252", "iso-8859-1"):
-            try:
-                sample.decode(encoding)
-                return encoding
-            except UnicodeDecodeError:
-                continue
-        return "utf-8"
-
-    def _detect_csv_delimiter(self, file_path: Path, encoding: str) -> str:
-        sample = file_path.read_text(encoding=encoding, errors="replace")[:65536]
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=",;|\t")
-            if dialect.delimiter in {",", ";", "|", "\t"}:
-                return dialect.delimiter
-        except Exception:
-            pass
-
-        best_delimiter = ","
-        best_score = -1
-        lines = [line for line in sample.splitlines() if line.strip()][:100]
-        for delimiter in (",", ";", "|", "\t"):
-            counts = []
-            header_hits = 0
-            for line in lines:
-                try:
-                    row = next(csv.reader([line], delimiter=delimiter), [])
-                except Exception:
-                    row = line.split(delimiter)
-                counts.append(len(row))
-                if self._is_csv_header(self._clean_csv_row(row)):
-                    header_hits += 1
-            useful_counts = [count for count in counts if count >= 2]
-            if not useful_counts:
-                continue
-            common_count = max(set(useful_counts), key=useful_counts.count)
-            score = useful_counts.count(common_count) * 10 + header_hits * 25 + common_count
-            if score > best_score:
-                best_score = score
-                best_delimiter = delimiter
-        return best_delimiter
-
-    def _clean_csv_row(self, row: list[Any]) -> list[str]:
-        return [" ".join(str(cell).replace("\ufeff", "").split()).strip() for cell in row]
-
-    def _is_empty_csv_row(self, row: list[str]) -> bool:
-        return not any(clean_optional_text(cell) for cell in row)
-
-    def _is_csv_header(self, row: list[str]) -> bool:
-        cleaned = [cell for cell in row if clean_optional_text(cell)]
-        if len(cleaned) < 2 or self._looks_like_csv_metadata(cleaned):
-            return False
-        header = _header_map(cleaned)
-        return "name" in header and any(
-            key in header
-            for key in ("price", "qty", "unit", "specification", "currency", "moq", "lead_time", "pack")
-        )
-
-    def _normalized_header(self, row: list[str]) -> tuple[str, ...]:
-        return tuple(re.sub(r"[^a-z0-9]+", " ", cell.lower()).strip() for cell in row)
-
-    def _recover_csv_row(self, row: list[str], expected_columns: int, file_name: str, row_number: int) -> list[str] | None:
-        if expected_columns <= 0:
-            return None
-        if len(row) == expected_columns:
-            return row
-        if len(row) < expected_columns:
-            logger.warning("CSV %s row %s has %s columns; padding to %s", file_name, row_number, len(row), expected_columns)
-            return row + [""] * (expected_columns - len(row))
-        logger.warning(
-            "CSV %s row %s has %s columns; trimming extras after expected %s columns",
-            file_name,
-            row_number,
-            len(row),
-            expected_columns,
-        )
-        return row[: expected_columns - 1] + [", ".join(cell for cell in row[expected_columns - 1:] if cell)]
-
-    def _looks_like_csv_metadata(self, row: list[str]) -> bool:
-        text = " ".join(cell for cell in row if cell).strip().lower()
-        if not text:
-            return True
-        metadata_patterns = (
-            r"\b(?:tel|phone|mobile|email|e-mail|address|www\.|http|generated|date|note|terms|contact)\b",
-            r"^[\w.+-]+@[\w.-]+\.[a-z]{2,}$",
-            r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$",
-        )
-        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in metadata_patterns)
-
-    def _looks_like_csv_non_data_row(self, row: list[str]) -> bool:
-        if self._is_empty_csv_row(row):
-            return True
-        first_cell = next((cell for cell in row if clean_optional_text(cell)), "")
-        if not first_cell:
-            return True
-        return self._looks_like_csv_metadata([first_cell]) and sum(1 for cell in row if clean_optional_text(cell)) <= 2
+        return self._extract_with_anydoc(file_path, fallback_format="csv")
 
     def _extract_xlsx_tables_text(self, file_path: Path) -> str:
-        try:
-            from openpyxl import load_workbook
-        except ImportError:
-            logger.warning("openpyxl is not installed; falling back for Excel extraction")
-            return ""
+        return self._extract_with_anydoc(file_path, fallback_format=file_path.suffix.lower().lstrip("."))
 
+    def _extract_with_anydoc(self, file_path: Path, fallback_format: str | None = None) -> str:
         try:
-            workbook = load_workbook(file_path, read_only=True, data_only=True)
+            import anydoc
+
+            try:
+                text = anydoc.to_markdown(str(file_path))
+            except Exception:
+                if not fallback_format:
+                    raise
+                text = anydoc.to_markdown_bytes(file_path.read_bytes(), fallback_format)
+            text = self._clean_anydoc_markdown(text)
+            logger.info("Anydoc extracted %s characters from %s", len(text), file_path.name)
+            return text
         except Exception:
-            logger.exception("Could not open Excel workbook %s", file_path.name)
+            logger.exception("Anydoc extraction failed for %s", file_path.name)
             return ""
 
-        sections: list[str] = []
-        try:
-            for worksheet in workbook.worksheets:
-                try:
-                    sections.extend(self._extract_worksheet_tables(worksheet))
-                except Exception:
-                    logger.exception("Failed extracting tables from worksheet %s", worksheet.title)
-                    continue
-        finally:
-            workbook.close()
-
-        return "\n\n".join(sections).strip()
-
-    def _extract_worksheet_tables(self, worksheet: Any) -> list[str]:
-        rows_by_index: dict[int, dict[int, str]] = {}
-        populated_columns: set[int] = set()
-
-        for row_index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
-            row_values: dict[int, str] = {}
-            for column_index, value in enumerate(row, start=1):
-                text = self._spreadsheet_cell_text(value)
-                if text:
-                    row_values[column_index] = text
-                    populated_columns.add(column_index)
-            if row_values:
-                rows_by_index[row_index] = row_values
-
-        if not rows_by_index or not populated_columns:
-            return []
-
-        column_bands = self._contiguous_bands(sorted(populated_columns), max_gap=1)
-        sections: list[str] = []
-        table_number = 0
-
-        min_row = min(rows_by_index)
-        max_row = max(rows_by_index)
-        for column_band in column_bands:
-            row_index = min_row
-            while row_index <= max_row:
-                header_cells = rows_by_index.get(row_index, {})
-                header_columns = [column for column in column_band if column in header_cells]
-                header_values = [header_cells.get(column, "") for column in header_columns]
-
-                if not self._is_spreadsheet_header(header_values):
-                    row_index += 1
-                    continue
-
-                table_columns = list(range(min(header_columns), max(header_columns) + 1))
-                data_rows: list[list[str]] = []
-                empty_streak = 0
-                cursor = row_index + 1
-
-                while cursor <= max_row:
-                    cells = rows_by_index.get(cursor, {})
-                    row_values = [cells.get(column, "") for column in table_columns]
-                    non_empty_count = sum(1 for value in row_values if value)
-
-                    if data_rows and self._is_spreadsheet_header(
-                        [cells.get(column, "") for column in column_band if column in cells]
-                    ):
-                        break
-
-                    if non_empty_count:
-                        data_rows.append(row_values)
-                        empty_streak = 0
-                    else:
-                        empty_streak += 1
-                        if empty_streak >= 2 and data_rows:
-                            break
-                    cursor += 1
-
-                valid_data_rows = [row for row in data_rows if sum(1 for value in row if value) >= 1]
-                if valid_data_rows:
-                    table_number += 1
-                    try:
-                        sections.append(
-                            self._format_spreadsheet_table(
-                                worksheet.title,
-                                table_number,
-                                [header_cells.get(column, "") for column in table_columns],
-                                valid_data_rows,
-                                row_index,
-                                table_columns[0],
-                            )
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Failed formatting worksheet=%s table=%s",
-                            worksheet.title,
-                            table_number,
-                        )
-
-                row_index = max(cursor, row_index + 1)
-
-        return sections
-
-    def _spreadsheet_cell_text(self, value: Any) -> str:
-        if value is None:
+    def _clean_anydoc_markdown(self, text: str | None) -> str:
+        if not text:
             return ""
-        if isinstance(value, datetime):
-            return value.date().isoformat()
-        return " ".join(str(value).split()).strip()
-
-    def _is_spreadsheet_header(self, values: list[str]) -> bool:
-        cleaned = [value for value in values if value]
-        if len(cleaned) < 2:
-            return False
-        header = _header_map(cleaned)
-        return "name" in header and any(
-            key in header
-            for key in ("price", "qty", "unit", "specification", "currency", "moq", "lead_time", "pack")
-        )
-
-    def _contiguous_bands(self, values: list[int], max_gap: int) -> list[list[int]]:
-        if not values:
-            return []
-        bands: list[list[int]] = [[values[0]]]
-        for value in values[1:]:
-            if value - bands[-1][-1] <= max_gap:
-                bands[-1].append(value)
-            else:
-                bands.append([value])
-        return bands
-
-    def _format_spreadsheet_table(
-        self,
-        sheet_name: str,
-        table_number: int,
-        header: list[str],
-        rows: list[list[str]],
-        start_row: int,
-        start_column: int,
-    ) -> str:
-        output = io.StringIO()
-        writer = csv.writer(output, lineterminator="\n")
-        output.write(
-            f"[EXCEL TABLE] Sheet: {sheet_name} Table: {table_number} "
-            f"Start: R{start_row}C{start_column}\n"
-        )
-        writer.writerow(header)
-        for row in rows:
-            writer.writerow(row)
-        return output.getvalue().strip()
-
-    def _extract_with_markitdown(self, file_path: Path) -> str:
-        try:
-            from markitdown import MarkItDown
-
-            result = MarkItDown().convert(str(file_path))
-            return (getattr(result, "markdown", "") or "").strip()
-        except Exception:
-            logger.debug("MarkItDown extraction failed for %s", file_path.name, exc_info=True)
-            return ""
+        lines: list[str] = []
+        previous_blank = False
+        for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").splitlines():
+            line = raw_line.rstrip()
+            stripped = line.strip()
+            if not stripped:
+                if not previous_blank and lines:
+                    lines.append("")
+                previous_blank = True
+                continue
+            if re.match(r"^\s*!\[[^\]]*\]\([^)]+\)\s*$", stripped):
+                previous_blank = False
+                continue
+            if re.match(r"^\s*\[[^\]]*\]:\s*\S+\s*$", stripped):
+                previous_blank = False
+                continue
+            lines.append(line)
+            previous_blank = False
+        return "\n".join(lines).strip()
 
     def _extract_image_text(self, file_path: Path) -> str:
         from PIL import Image
@@ -2228,7 +1927,7 @@ class EmailIngestionService:
             return self._extract_docx_text(file_path)
 
         elif ext == ".doc":
-            return self._extract_with_markitdown(file_path)
+            return self._extract_word_text(file_path, ext)
 
         elif ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"):
             return self._extract_image_text(file_path)

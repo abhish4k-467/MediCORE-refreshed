@@ -453,6 +453,8 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
         parts = _split_table_line(line)
         if len(parts) < 2:
             continue
+        if _is_markdown_table_separator(parts):
+            continue
 
         has_numeric_data = any(_number_from_text(p) is not None for p in parts[1:])
         possible_map = _header_map(parts)
@@ -476,18 +478,20 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
             parts = parts + [""] * (len(header) - len(parts))
         parts = _trim_post_table_text_from_row(parts, len(header))
 
-        name = _cell(parts, header_map.get("name"))
+        name, name_index = _resolved_name_cell(parts, header, header_map)
         if not name or _looks_like_header(name):
             continue
+        supplier_sku = _supplier_sku_from_row(parts, header)
 
-        raw_price_cell = _cell(parts, header_map.get("price"))
-        price = _number_from_text(raw_price_cell)
         price_header_text = header[header_map["price"]] if header and "price" in header_map else ""
         price_header_meta = header_meta.get(header_map["price"], {}) if "price" in header_map else {}
+        raw_price_cell = _cell(parts, header_map.get("price"))
+        price_cell_is_price = _is_price_value(raw_price_cell, price_header_text)
+        price = _number_from_text(raw_price_cell) if price_cell_is_price else None
         price_unit = (
             _normalize_unit(str(price_header_meta.get("unit") or ""))
             or _unit_from_text(price_header_text)
-            or _unit_from_text(raw_price_cell)
+            or (_unit_from_text(raw_price_cell) if price_cell_is_price else None)
         )
 
         raw_qty = _cell(parts, header_map.get("qty"))
@@ -536,8 +540,11 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
         if pack:
             notes_parts.append(f"packaging={pack}")
         raw_price = clean_optional_text(raw_price_cell)
-        if raw_price:
+        if raw_price and price_cell_is_price:
             notes_parts.append(f"original_price={_display_price_with_header_currency(raw_price, currency, price_unit, price_header_text)}")
+        elif raw_price and not specification and _looks_like_specification_value(raw_price):
+            specification = raw_price
+            notes_parts.append(f"specification={raw_price.replace(';', ',')}")
         raw_qty_note = clean_optional_text(raw_qty)
         if raw_qty_note:
             original_quantity = raw_qty_note
@@ -561,6 +568,7 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
                 lead_time_days=lead_time_days,
                 lead_time_text=lead_time_text,
                 moq=moq,
+                supplier_sku=supplier_sku if name_index != _product_code_column_index(header) else None,
                 notes="; ".join(notes_parts) if notes_parts else None,
             )
         )
@@ -586,6 +594,71 @@ def _split_table_line(line: str) -> list[str]:
         except Exception:
             pass
     return [part.strip() for part in re.split(r"\s{2,}", stripped) if part.strip()]
+
+
+def _is_markdown_table_separator(parts: list[str]) -> bool:
+    return bool(parts) and all(
+        re.fullmatch(r":?-{3,}:?", part.strip()) for part in parts if part.strip()
+    )
+
+
+def _resolved_name_cell(
+    parts: list[str],
+    header: list[str] | None,
+    header_map: dict[str, int],
+) -> tuple[str, int | None]:
+    mapped_index = header_map.get("name")
+    mapped_name = _cell(parts, mapped_index)
+    if is_valid_ingredient_name(mapped_name):
+        return mapped_name, mapped_index
+
+    # Converted/OCR tables sometimes let a product-code column win the generic
+    # "product" alias. Recover by scanning non-code columns for a valid product
+    # name instead of discarding the whole row.
+    candidate_indexes: list[int] = []
+    if header:
+        for index, header_text in enumerate(header):
+            if _is_product_code_header(header_text):
+                continue
+            if _header_cell_metadata(header_text).get("field") == "name":
+                candidate_indexes.append(index)
+    candidate_indexes.extend(index for index in range(len(parts)) if index not in candidate_indexes)
+
+    blocked_indexes = {
+        index
+        for key, index in header_map.items()
+        if key in {"price", "qty", "unit", "currency", "moq", "lead_time", "pack", "specification"}
+    }
+    for index in candidate_indexes:
+        if index in blocked_indexes:
+            continue
+        cell = _cell(parts, index)
+        if PRODUCT_CODE_PATTERN.match(cell):
+            continue
+        if is_valid_ingredient_name(cell):
+            return cell, index
+    return mapped_name, mapped_index
+
+
+def _supplier_sku_from_row(parts: list[str], header: list[str] | None) -> str | None:
+    code_index = _product_code_column_index(header)
+    if code_index is None:
+        return None
+    value = clean_optional_text(_cell(parts, code_index))
+    return value if value and PRODUCT_CODE_PATTERN.match(value) else None
+
+
+def _product_code_column_index(header: list[str] | None) -> int | None:
+    if not header:
+        return None
+    for index, header_text in enumerate(header):
+        if _is_product_code_header(header_text):
+            return index
+    return None
+
+
+def _is_product_code_header(header: str | None) -> bool:
+    return bool(PRODUCT_CODE_HEADER_PATTERN.search(str(header or "").lower()))
 
 
 def _trim_post_table_text_from_row(parts: list[str], expected_columns: int) -> list[str]:
@@ -615,7 +688,7 @@ def _header_map(parts: list[str]) -> dict[str, int]:
     mapped: dict[str, int] = {}
     for index, part in enumerate(parts):
         lowered = part.lower().strip()
-        if PRODUCT_CODE_HEADER_PATTERN.search(lowered):
+        if _is_product_code_header(lowered):
             continue
         inferred = _header_cell_metadata(part).get("field")
         if inferred and inferred not in mapped:
@@ -706,6 +779,12 @@ def is_valid_ingredient_name(name: object) -> bool:
     value = value.strip()
     lowered = value.lower()
     if _looks_like_header(value):
+        return False
+    if re.search(
+        r"\b(?:assay|purity|content|grade|standard|specification|description)\s*:",
+        value,
+        flags=re.IGNORECASE,
+    ):
         return False
     if PRODUCT_CODE_PATTERN.match(value):
         return False
@@ -811,6 +890,74 @@ def _number_from_text(raw: str | None) -> float | None:
         return None
     match = re.search(r"\d[\d,]*(?:\.\d+)?", raw)
     return _number(match.group(0)) if match else None
+
+
+def _is_price_value(value: str | None, header: str | None = None) -> bool:
+    cleaned = clean_optional_text(value)
+    if not cleaned:
+        return False
+    lowered = cleaned.lower()
+    if lowered in {"na", "n/a", "not available", "no quote", "no offer", "tbd", "to be confirmed"}:
+        return True
+    if _looks_like_specification_value(cleaned):
+        return False
+    if _looks_like_lead_time_value(cleaned) or _looks_like_moq_value(cleaned):
+        return False
+    if _currency_from_text(cleaned):
+        return _number_from_text(cleaned) is not None or _looks_like_text_price(cleaned)
+    if re.search(r"\b(?:fob|cif|exw|cnf|c&f|ddp|dap|price|rate|quote|offer)\b", cleaned, flags=re.IGNORECASE):
+        return _number_from_text(cleaned) is not None or _looks_like_text_price(cleaned)
+    if re.search(r"\b(?:on request|upon request|ask|negotiable|market price|current price|quote)\b", lowered):
+        return True
+    if re.search(r"\d[\d,]*(?:\.\d+)?\s*/\s*(?:kg|g|mg|ml|l|unit|pack|bag|drum|mt|ton)\b", cleaned, flags=re.IGNORECASE):
+        return True
+    if _number_from_text(cleaned) is None:
+        return False
+    # A numeric-only cell under a price/rate/commercial header is a valid price,
+    # including headers such as FOB($/kg) where currency/unit live in the header.
+    return bool(
+        re.search(
+            r"\b(?:price|rate|quote|cost|fob|cif|exw|cnf|c&f|ddp|dap)\b|[$]\s*/|/\s*(?:kg|g|mg|ml|l|unit|pack|bag|drum|mt|ton)",
+            header or "",
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _looks_like_text_price(value: str) -> bool:
+    return bool(re.search(r"\b(?:on request|upon request|ask|negotiable|market price|quote)\b", value, flags=re.IGNORECASE))
+
+
+def _looks_like_specification_value(value: str | None) -> bool:
+    cleaned = clean_optional_text(value)
+    if not cleaned:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:assay|purity|content|grade|spec(?:ification)?|standard|complies?|mesh|appearance|moisture|ash|"
+            r"acid value|enzyme activity|dry basis|usp|ep|bp|ip|food grade)\b\s*:?",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _looks_like_lead_time_value(value: str | None) -> bool:
+    cleaned = clean_optional_text(value)
+    if not cleaned:
+        return False
+    return bool(
+        re.search(r"\b(?:lead|delivery|dispatch|ship|ready)\b", cleaned, flags=re.IGNORECASE)
+        or re.fullmatch(r"\d+\s*(?:-|to|~)\s*\d+\s*days?", cleaned, flags=re.IGNORECASE)
+        or re.fullmatch(r"\d+\s*(?:days?|weeks?|months?)", cleaned, flags=re.IGNORECASE)
+    )
+
+
+def _looks_like_moq_value(value: str | None) -> bool:
+    cleaned = clean_optional_text(value)
+    if not cleaned:
+        return False
+    return bool(re.search(r"\b(?:moq|m\.?\s*o\.?\s*q\.?|minimum\s+order|min(?:imum)?\s+qty)\b", cleaned, flags=re.IGNORECASE))
 
 
 def _unit_from_text(raw: str | None) -> str | None:

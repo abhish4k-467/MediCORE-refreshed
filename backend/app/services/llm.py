@@ -12,7 +12,8 @@ from backend.app.schemas import ExtractedCatalogItem, QueryPlan
 
 logger = logging.getLogger(__name__)
 
-EXTRACTION_CHUNK_CHARS = 50000
+MAX_EXTRACTION_CONTEXT_CHARS = 50000
+EXTRACTION_CHUNK_CHARS = 12000
 EXTRACTION_CHUNK_OVERLAP_LINES = 4
 
 
