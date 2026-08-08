@@ -598,7 +598,7 @@ class EmailIngestionService:
         conversational_source = source_lower.endswith(".txt") or "email_body" in source_lower
         logger.info("Deterministic table parser extracted %s catalogue row(s) from %s", len(parsed), source_name)
 
-        if len(parsed) >= (3 if conversational_source else 20):
+        if len(parsed) >= (1 if conversational_source else 20):
             logger.info(
                 "Using %s deterministic parser row(s) for catalogue %s; skipping LLM fallback",
                 len(parsed),
@@ -628,7 +628,7 @@ class EmailIngestionService:
 
     def _preferred_parser_text(self, text: str) -> str:
         table_blocks: list[str] = []
-        for marker in ("[PADDLE TABLE OCR]\n", "[GRID CELL TABLE OCR]\n", "[PDF NATIVE TABLE]\n"):
+        for marker in ("[TESSERACT TABLE OCR]\n", "[GRID CELL TABLE OCR]\n", "[PDF INSPECTOR MARKDOWN]\n", "[PDF NATIVE TABLE]\n"):
             if marker in text:
                 for part in text.split(marker)[1:]:
                     block = part.split("\n\n", 1)[0].strip()
@@ -2116,9 +2116,9 @@ class EmailIngestionService:
                 from backend.app.services.image_grid_extractor import extract_grid_table_from_image
                 grid_result = extract_grid_table_from_image(file_path)
                 if grid_result:
-                    grid_table_text = "[PADDLE TABLE OCR]\n" + grid_result.table_text
+                    grid_table_text = "[TESSERACT TABLE OCR]\n" + grid_result.table_text
             except Exception:
-                logger.debug("PaddleOCR table extraction failed for %s; continuing with regular OCR", file_path.name, exc_info=True)
+                logger.debug("Tesseract table extraction failed for %s; continuing with regular OCR", file_path.name, exc_info=True)
 
             image = Image.open(file_path)
             from backend.app.services.ocr import recognize_image_to_text
@@ -2126,14 +2126,15 @@ class EmailIngestionService:
 
             texts: list[str] = []
             if grid_table_text:
-                texts.insert(0, grid_table_text)
+                logger.info("Tesseract table OCR extracted %s characters from image %s", len(grid_table_text), file_path.name)
+                return grid_table_text
             if page_text.strip():
-                texts.append("[PADDLE OCR]\n" + page_text.strip())
+                texts.append("[TESSERACT OCR]\n" + page_text.strip())
             text = "\n\n".join(dict.fromkeys(texts))
-            logger.info("PaddleOCR extracted %s characters from image %s", len(text), file_path.name)
+            logger.info("Tesseract OCR extracted %s characters from image %s", len(text), file_path.name)
             return text
         except Exception as e:
-            logger.exception("Error doing PaddleOCR on image %s: %s", file_path.name, e)
+            logger.exception("Error doing Tesseract OCR on image %s: %s", file_path.name, e)
             return ""
 
     def _extract_text_from_file(self, file_path: Path, ext: str) -> str:

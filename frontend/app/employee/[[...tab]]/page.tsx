@@ -1097,7 +1097,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       const sortedItems = [...items].sort((left, right) => displayItemName(left).localeCompare(displayItemName(right)));
       const meta = supplierMeta.get(supplierKey(email.supplier_name, email.email_domain));
       const bestItem = sortedItems[0];
-      const itemCount = sortedItems.length || Number(email.item_count || 0);
+      const itemCount = Number(email.item_count || 0) || sortedItems.length;
       const statusTone = inboxStatusTone(email.processing_status, itemCount);
       const statusLabel = inboxStatusLabel(email.processing_status, itemCount);
 
@@ -1282,7 +1282,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         supplier_name: supplierName,
         email_domain: emailDomain ?? meta?.email_domain ?? "-",
         country,
-        item_count: latestItems.length,
+        item_count: Number(latestEmail?.item_count || 0) || latestItems.length,
         best_item: sortedLatestByPrice[0],
         total_qty: totalQty,
         last_catalog_at: latestEmail?.received_at ?? items[0]?.valid_until ?? meta?.last_email_date ?? null,
@@ -1407,8 +1407,9 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const selectedCatalogItems = useMemo(() => {
     if (!selectedCatalog) return [];
     const search = catalogSearch.trim();
+    const selectedEmailItems = selectedCatalogEmailId ? inboxItemsByEmail[selectedCatalogEmailId] : undefined;
     const filteredByEmail = selectedCatalogEmailId
-      ? selectedCatalog.items.filter((item) => item.catalog_email_id === selectedCatalogEmailId)
+      ? selectedEmailItems ?? selectedCatalog.items.filter((item) => item.catalog_email_id === selectedCatalogEmailId)
       : selectedCatalog.items;
 
     if (filteredByEmail.length === 0) return [];
@@ -1426,14 +1427,16 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         ? searchRelevance(right, search) - searchRelevance(left, search)
         : displayItemName(left).localeCompare(displayItemName(right))
     ));
-  }, [catalogFilter, catalogSearch, selectedCatalog, selectedCatalogEmailId]);
+  }, [catalogFilter, catalogSearch, inboxItemsByEmail, selectedCatalog, selectedCatalogEmailId]);
 
   const emailItemsCount = useMemo(() => {
     if (!selectedCatalog) return 0;
-    return selectedCatalogEmailId
-      ? selectedCatalog.items.filter((item) => item.catalog_email_id === selectedCatalogEmailId).length
-      : selectedCatalog.items.length;
-  }, [selectedCatalog, selectedCatalogEmailId]);
+    if (selectedCatalogEmailId) {
+      const activeEmailCount = Number(activeCatalogEmail?.item_count || 0);
+      return activeEmailCount || inboxItemsByEmail[selectedCatalogEmailId]?.length || selectedCatalog.items.filter((item) => item.catalog_email_id === selectedCatalogEmailId).length;
+    }
+    return selectedCatalog.item_count || selectedCatalog.items.length;
+  }, [activeCatalogEmail, inboxItemsByEmail, selectedCatalog, selectedCatalogEmailId]);
 
   const availableIngredients = useMemo(() => {
     return Array.from(new Set(latestSupplierRows.map((row) => row.ingredient_name)))
@@ -1684,22 +1687,23 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   }, [inboxThreads, selectedInboxThreadId]);
 
   useEffect(() => {
+    const selectedEmailId = activeTab === "catalogs" ? selectedCatalogEmailId : selectedInboxThreadId;
     if (
       !authUser
-      || activeTab !== "inbox"
-      || !selectedInboxThreadId
-      || inboxItemsByEmail[selectedInboxThreadId]
+      || !["inbox", "catalogs"].includes(activeTab)
+      || !selectedEmailId
+      || inboxItemsByEmail[selectedEmailId]
     ) {
       return;
     }
 
     let cancelled = false;
-    const emailId = selectedInboxThreadId;
+    const emailId = selectedEmailId;
     setInboxItemsLoadingId(emailId);
     setInboxItemsErrorId(null);
 
     authFetch(
-      `${apiBaseUrl}/api/catalogs/items?limit=100&latest_only=false&catalog_email_id=${encodeURIComponent(emailId)}`
+      `${apiBaseUrl}/api/catalogs/items?limit=10000&latest_only=false&catalog_email_id=${encodeURIComponent(emailId)}`
     )
       .then(async (response) => {
         if (!response.ok) {
@@ -1725,7 +1729,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     return () => {
       cancelled = true;
     };
-  }, [activeTab, apiBaseUrl, authUser, inboxItemsByEmail, selectedInboxThreadId]);
+  }, [activeTab, apiBaseUrl, authUser, inboxItemsByEmail, selectedCatalogEmailId, selectedInboxThreadId]);
 
   useEffect(() => {
     if (sidebarCollapsed) {
@@ -1756,7 +1760,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       try {
         const [suppliersRes, itemsRes, emailsRes] = await Promise.all([
           authFetch(`${apiBaseUrl}/api/suppliers`),
-          authFetch(`${apiBaseUrl}/api/catalogs/items?limit=100&latest_only=true`),
+          authFetch(`${apiBaseUrl}/api/catalogs/items?limit=10000&latest_only=true`),
           authFetch(`${apiBaseUrl}/api/catalogs/emails?limit=100`),
         ]);
 

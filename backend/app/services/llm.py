@@ -12,7 +12,7 @@ from backend.app.schemas import ExtractedCatalogItem, QueryPlan
 
 logger = logging.getLogger(__name__)
 
-EXTRACTION_CHUNK_CHARS = 50000
+EXTRACTION_CHUNK_CHARS = 12000
 EXTRACTION_CHUNK_OVERLAP_LINES = 4
 
 
@@ -23,6 +23,7 @@ class ModelProviderConfig:
     model: str
     base_url: str
     max_tokens_field: str = "max_tokens"
+    max_output_tokens: int = 4000
     site_url: str = ""
     app_name: str = ""
 
@@ -37,6 +38,7 @@ class ModelRouterClient:
                 model=settings.groq_model,
                 base_url=settings.groq_base_url.rstrip("/"),
                 max_tokens_field="max_completion_tokens",
+                max_output_tokens=4000,
             ),
             ModelProviderConfig(
                 name="openrouter",
@@ -44,6 +46,7 @@ class ModelRouterClient:
                 model=settings.openrouter_model,
                 base_url=settings.openrouter_base_url.rstrip("/"),
                 max_tokens_field="max_tokens",
+                max_output_tokens=8000,
                 site_url=settings.openrouter_site_url or settings.frontend_origin,
                 app_name=settings.openrouter_app_name or settings.app_name,
             ),
@@ -75,7 +78,7 @@ class ModelRouterClient:
             "model": provider.model,
             "messages": messages,
             "temperature": temperature,
-            provider.max_tokens_field: 12000,
+            provider.max_tokens_field: provider.max_output_tokens,
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}

@@ -53,6 +53,15 @@ COMMERCIAL_TERMS = (
     "delivery",
 )
 
+PRICE_UPDATE_SENTENCE_PATTERN = re.compile(
+    r"\b(?:price|rate)\s+(?:of|for)\s+"
+    r"(?P<material>[A-Za-z0-9][A-Za-z0-9 %().,+/'-]{2,120}?)\s+"
+    r"(?:is\s+)?(?:updated|revised|changed|set|now|increased|decreased)\s+"
+    r"(?:to|at|as)?\s*(?:US\$|\$|USD|INR|Rs\.?|₹|EUR|€|GBP|£)?\s*"
+    r"\d[\d,]*(?:\.\d+)?\s*/\s*[A-Za-z]+",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class DocumentClassification:
@@ -75,6 +84,9 @@ def classify_document(filename: str, ext: str, text: str | None) -> DocumentClas
         ]
     )
     if table_like_rows >= 2:
+        catalogue_score += 3
+
+    if PRICE_UPDATE_SENTENCE_PATTERN.search(text or ""):
         catalogue_score += 3
 
     if _is_certificate_filename(filename_lower):

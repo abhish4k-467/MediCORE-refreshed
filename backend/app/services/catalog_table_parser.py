@@ -56,10 +56,30 @@ QUOTE_ROW_PATTERN = re.compile(
     re.IGNORECASE,
 )
 HEADER_CURRENCY_PATTERN = re.compile(r"price\s*\(\s*(?P<currency>[A-Z$₹€]+)\s*\)", re.IGNORECASE)
+PRICE_UPDATE_SENTENCE_PATTERNS = (
+    re.compile(
+        r"\b(?:price|rate)\s+(?:of|for)\s+"
+        r"(?P<product>[A-Za-z0-9][A-Za-z0-9 %().,+/'-]{2,120}?)\s+"
+        r"(?:is\s+)?(?:updated|revised|changed|set|now|increased|decreased)\s+"
+        r"(?:to|at|as)?\s*"
+        r"(?:(?P<currency>US\$|\$|USD|INR|Rs\.?|₹|EUR|€|GBP|£)\s*)?"
+        r"(?P<price>\d[\d,]*(?:\.\d+)?)\s*/\s*(?P<price_unit>[A-Za-z]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?P<product>[A-Za-z0-9][A-Za-z0-9 %().,+/'-]{2,120}?)\s+"
+        r"(?:price|rate)\s+(?:is\s+)?(?:updated|revised|changed|set|now|increased|decreased)\s+"
+        r"(?:to|at|as)?\s*"
+        r"(?:(?P<currency>US\$|\$|USD|INR|Rs\.?|₹|EUR|€|GBP|£)\s*)?"
+        r"(?P<price>\d[\d,]*(?:\.\d+)?)\s*/\s*(?P<price_unit>[A-Za-z]+)",
+        re.IGNORECASE,
+    ),
+)
 HEADER_UNIT_PATTERN = re.compile(r"(?:quantity|qty|stock|available)\s*(?:\(\s*|\bin\s+)?(?P<unit>[A-Za-z]+)\s*\)?", re.IGNORECASE)
 HEADER_CURRENCY_PATTERN = re.compile(r"(?:price|rate|quote|cost|unit price)\s*\(\s*(?P<currency>[A-Z$â‚¹â‚¬]+)\s*\)", re.IGNORECASE)
 HEADER_MOQ_UNIT_PATTERN = re.compile(r"(?:MOQ|M\.?O\.?Q\.?|minimum order|min qty|minimum quantity)\s*(?:\(\s*|\bin\s+)?(?P<unit>[A-Za-z]+)\s*\)?", re.IGNORECASE)
 HEADER_LEAD_TIME_UNIT_PATTERN = re.compile(r"(?:lead\s*time|lead|delivery|dispatch|delivery\s*time)\s*(?:\(\s*|\bin\s+)?(?P<unit>days?|weeks?|months?)\s*\)?", re.IGNORECASE)
+HEADER_CURRENCY_PATTERN = re.compile(r"(?:price|rate|quote|cost|unit price|fob|cif|exw|cnf|c&f|ddp|dap)?\s*\(\s*(?P<currency>US\$|USD|INR|Rs\.?|\$|â‚¹|EUR|â‚¬|GBP|Â£|CAD|AUD|SGD|CHF|AED|CNY|JPY)(?:\s*/\s*(?P<unit>[A-Za-z]+))?\s*\)", re.IGNORECASE)
 MOQ_PATTERN = re.compile(
     r"\b(?:MOQ|M\.?O\.?Q\.?)\s*:?\s*(?P<moq>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>kg|g|mg|ml|l|units?|packs?)\b",
     re.IGNORECASE,
@@ -81,6 +101,11 @@ FOOTER_OR_HEADER_PATTERN = re.compile(
 )
 NUMBERED_SPEC_QTY_PATTERN = re.compile(
     r"^\s*\d{1,4}\s+(?P<body>.+?)\s+(?P<qty>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>kg|kgs|g|mg|ml|l|units?|packs?)\s*$",
+    re.IGNORECASE,
+)
+POST_TABLE_BOUNDARY_PATTERN = re.compile(
+    r"\s+\b(?:Statement|Disclaimer)\s*:\s+|"
+    r"\s+\bThis\s+quotation\s+is\s+provided\s+for\s+informational\b",
     re.IGNORECASE,
 )
 
@@ -141,6 +166,12 @@ def parse_catalog_table_text(
         if quote_item and (not dedupe or _item_key(quote_item) not in seen):
             seen.add(_item_key(quote_item))
             items.append(quote_item)
+            continue
+
+        update_item = _parse_price_update_sentence(cleaned, context)
+        if update_item and (not dedupe or _item_key(update_item) not in seen):
+            seen.add(_item_key(update_item))
+            items.append(update_item)
     return _valid_catalog_items(items)
 
 
@@ -383,11 +414,40 @@ def _parse_quotation_row(line: str, context: dict[str, str | None]) -> Extracted
     )
 
 
+def _parse_price_update_sentence(line: str, context: dict[str, str | None]) -> ExtractedCatalogItem | None:
+    for pattern in PRICE_UPDATE_SENTENCE_PATTERNS:
+        match = pattern.search(line)
+        if not match:
+            continue
+
+        product = _clean_price_update_product(match.group("product"))
+        if not product or _looks_like_header(product):
+            continue
+
+        price = _number(match.group("price"))
+        if price is None:
+            continue
+
+        price_unit = _normalize_unit(match.group("price_unit"))
+        currency = _currency_code(match.group("currency") or context.get("currency") or "USD")
+        original_price = _display_price_with_header_currency(match.group("price"), currency, price_unit)
+        return ExtractedCatalogItem(
+            ingredient_name=product,
+            price_per_unit=price,
+            currency=currency,
+            available_qty=None,
+            unit=price_unit,
+            notes=_notes(original_price=original_price, source=line[:500].replace(";", ",")),
+        )
+    return None
+
+
 def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[ExtractedCatalogItem]:
     rows: list[ExtractedCatalogItem] = []
     lines = [_clean_line(line) for line in text.splitlines() if _clean_line(line)]
     header: list[str] | None = None
     header_map: dict[str, int] = {}
+    header_meta: dict[int, dict[str, str | None]] = {}
 
     for line in lines:
         parts = _split_table_line(line)
@@ -406,6 +466,7 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
             if is_header_candidate:
                 header = parts
                 header_map = possible_map
+                header_meta = {index: _header_cell_metadata(part) for index, part in enumerate(header)}
                 continue
 
         if not header or not header_map:
@@ -413,6 +474,7 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
 
         if len(parts) < len(header):
             parts = parts + [""] * (len(header) - len(parts))
+        parts = _trim_post_table_text_from_row(parts, len(header))
 
         name = _cell(parts, header_map.get("name"))
         if not name or _looks_like_header(name):
@@ -420,12 +482,19 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
 
         raw_price_cell = _cell(parts, header_map.get("price"))
         price = _number_from_text(raw_price_cell)
+        price_header_text = header[header_map["price"]] if header and "price" in header_map else ""
+        price_header_meta = header_meta.get(header_map["price"], {}) if "price" in header_map else {}
+        price_unit = (
+            _normalize_unit(str(price_header_meta.get("unit") or ""))
+            or _unit_from_text(price_header_text)
+            or _unit_from_text(raw_price_cell)
+        )
 
         raw_qty = _cell(parts, header_map.get("qty"))
         qty = _number_from_text(raw_qty) if "qty" in header_map else None
         header_qty_text = header[header_map["qty"]] if header and "qty" in header_map else ""
-        header_unit_match = HEADER_UNIT_PATTERN.search(header_qty_text) if header_qty_text else None
-        header_unit = header_unit_match.group("unit") if header_unit_match else None
+        qty_header_meta = header_meta.get(header_map["qty"], {}) if "qty" in header_map else {}
+        header_unit = qty_header_meta.get("unit") or _header_unit_from_text(header_qty_text)
 
         unit = _normalize_unit(
             _cell(parts, header_map.get("unit"))
@@ -437,20 +506,26 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
         )
         if qty is not None and not unit:
             unit = "unit"
+        if not unit and price_unit:
+            unit = price_unit
 
         currency = _currency_code(
             _cell(parts, header_map.get("currency"))
             or _currency_from_text(raw_price_cell)
+            or str(price_header_meta.get("currency") or "")
+            or _currency_from_text(price_header_text)
             or context.get("currency")
-            or "INR"
+            or ("USD" if price_unit else "INR")
         )
         raw_moq = _cell(parts, header_map.get("moq"))
         moq = _number_from_text(raw_moq) if "moq" in header_map else None
         moq_header_text = header[header_map["moq"]] if header and "moq" in header_map else ""
-        moq_unit = _header_moq_unit(moq_header_text) or _unit_from_text(raw_moq) or unit
+        moq_header_meta = header_meta.get(header_map["moq"], {}) if "moq" in header_map else {}
+        moq_unit = str(moq_header_meta.get("unit") or "") or _header_moq_unit(moq_header_text) or _unit_from_text(raw_moq) or unit
         raw_lead_time = clean_optional_text(_cell(parts, header_map.get("lead_time")))
         lead_time_header_text = header[header_map["lead_time"]] if header and "lead_time" in header_map else ""
-        lead_time_unit = _header_lead_time_unit(lead_time_header_text)
+        lead_header_meta = header_meta.get(header_map["lead_time"], {}) if "lead_time" in header_map else {}
+        lead_time_unit = str(lead_header_meta.get("unit") or "") or _header_lead_time_unit(lead_time_header_text)
         lead_time_text = _display_with_header_unit(raw_lead_time, lead_time_unit)
         lead_time_days = _lead_time_days(lead_time_text or raw_lead_time)
         specification = clean_optional_text(_cell(parts, header_map.get("specification")))
@@ -462,7 +537,7 @@ def _parse_generic_table(text: str, context: dict[str, str | None]) -> list[Extr
             notes_parts.append(f"packaging={pack}")
         raw_price = clean_optional_text(raw_price_cell)
         if raw_price:
-            notes_parts.append(f"original_price={_display_price_with_header_currency(raw_price, currency)}")
+            notes_parts.append(f"original_price={_display_price_with_header_currency(raw_price, currency, price_unit, price_header_text)}")
         raw_qty_note = clean_optional_text(raw_qty)
         if raw_qty_note:
             original_quantity = raw_qty_note
@@ -513,22 +588,38 @@ def _split_table_line(line: str) -> list[str]:
     return [part.strip() for part in re.split(r"\s{2,}", stripped) if part.strip()]
 
 
+def _trim_post_table_text_from_row(parts: list[str], expected_columns: int) -> list[str]:
+    trimmed = list(parts[:expected_columns])
+    for index, cell in enumerate(trimmed):
+        match = POST_TABLE_BOUNDARY_PATTERN.search(cell)
+        if match:
+            trimmed[index] = cell[: match.start()].strip()
+            for trailing_index in range(index + 1, len(trimmed)):
+                trimmed[trailing_index] = ""
+            break
+    return trimmed
+
+
 def _header_map(parts: list[str]) -> dict[str, int]:
     aliases = [
-        ("price", ("price", "rate", "quote", "cost", "unit price", "price/unit", "rate/unit")),
-        ("name", ("product", "item", "ingredient", "chemical", "material", "medicine", "api", "name", "particulars", "details", "title", "drug", "compound", "article")),
-        ("qty", ("qty", "quantity", "quantities", "stock", "available", "availability", "balance", "volume", "qnty", "q'ty", "count", "batch size", "lot size", "offer qty", "supplied qty", "order qty", "total qty", "stock qty", "avail qty")),
+        ("price", ("price", "rate", "quote", "cost", "unit price", "price/unit", "rate/unit", "fob", "cif", "exw", "cnf", "c&f", "ddp", "dap", "$/kg", "/kg", "$/g")),
+        ("name", ("product name", "item name", "ingredient name", "material name", "chemical name", "product", "item", "ingredient", "chemical", "material", "medicine", "api", "name", "particulars", "details", "title", "drug", "compound", "article")),
+        ("qty", ("qty", "quantity", "quantities", "stock", "available", "availability", "balance", "volume", "qnty", "q'ty", "count", "batch size", "lot size", "offer qty", "supplied qty", "order qty", "total qty", "stock qty", "avail qty", "qty avail")),
         ("unit", ("unit of measure", "pack unit", "pkg unit", "uom", "unit")),
-        ("specification", ("specification", "spec", "description", "assay", "purity", "grade", "content", "quality", "standard")),
+        ("specification", ("product specification description", "specification description", "specification", "spec", "description", "assay", "purity", "grade", "content", "quality", "standard")),
         ("currency", ("currency", "curr")),
-        ("moq", ("moq", "minimum order", "min qty", "minimum quantity", "moq (kg)")),
-        ("lead_time", ("lead", "delivery", "dispatch", "lead time", "delivery time")),
+        ("moq", ("moq", "m.o.q", "minimum order", "min order", "min qty", "minimum quantity", "minimum order quantity", "moq (kg)")),
+        ("lead_time", ("lead", "delivery", "dispatch", "lead time", "delivery time", "dispatch time", "ship time", "shipping time", "turnaround")),
         ("pack", ("pack", "packing", "packaging", "package", "pack size")),
     ]
     mapped: dict[str, int] = {}
     for index, part in enumerate(parts):
         lowered = part.lower().strip()
         if PRODUCT_CODE_HEADER_PATTERN.search(lowered):
+            continue
+        inferred = _header_cell_metadata(part).get("field")
+        if inferred and inferred not in mapped:
+            mapped[inferred] = index
             continue
         if lowered in {"rate/unit", "price/unit", "price/kg", "rate/kg", "price (usd)", "price (inr)"}:
             if "price" not in mapped:
@@ -547,6 +638,65 @@ def _header_map(parts: list[str]) -> dict[str, int]:
                 break
 
     return mapped
+
+
+def _header_cell_metadata(header: str | None) -> dict[str, str | None]:
+    cleaned = _clean_header_text(header)
+    lowered = cleaned.lower()
+    currency = _currency_from_text(cleaned)
+    unit = _unit_from_price_header(cleaned) or _header_unit_from_text(cleaned)
+    field: str | None = None
+
+    if re.search(r"\b(?:fob|cif|exw|cnf|c&f|ddp|dap|price|rate|quote|cost)\b|[$â‚¹â‚¬Â£]\s*/|(?:usd|inr|eur|gbp|cad|aud|sgd|chf|aed|cny|jpy)\s*/", lowered, re.IGNORECASE):
+        field = "price"
+    elif re.search(r"\b(?:moq|m\.?\s*o\.?\s*q\.?|minimum\s+order|minimum\s+quantity|min\s+qty|min\s+order)\b", lowered):
+        field = "moq"
+    elif re.search(r"\b(?:lead|delivery|dispatch|shipping|ship\s*time|turnaround)\b", lowered):
+        field = "lead_time"
+    elif re.search(r"\b(?:qty|quantity|stock|available|availability|balance|volume|offer\s*qty|total\s*qty)\b", lowered):
+        field = "qty"
+    elif re.search(r"\b(?:specification|spec|description|assay|purity|grade|content|quality|standard)\b", lowered):
+        field = "specification"
+    elif re.search(r"\b(?:currency|curr)\b", lowered):
+        field = "currency"
+    elif re.search(r"\b(?:unit|uom)\b", lowered):
+        field = "unit"
+    elif re.search(r"\b(?:product|item|ingredient|chemical|material|medicine|api|name|particulars|details|title|drug|compound|article)\b", lowered):
+        field = "name"
+
+    return {"field": field, "currency": _currency_code(currency) if currency else None, "unit": unit}
+
+
+def _clean_header_text(header: str | None) -> str:
+    text = str(header or "")
+    replacements = {
+        "（": "(",
+        "）": ")",
+        "／": "/",
+        "Â£": "GBP",
+        "â‚¹": "INR",
+        "â‚¬": "EUR",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _unit_from_price_header(header: str | None) -> str | None:
+    match = re.search(r"/\s*(kg|kgs|kilogram|kilograms|g|grams|mg|ml|l|litre|liter|units?|packs?|bags?|drums?|mt|tons?)\b", header or "", flags=re.IGNORECASE)
+    return _normalize_unit(match.group(1)) if match else None
+
+
+def _header_unit_from_text(header: str | None) -> str | None:
+    if not header:
+        return None
+    paren_match = re.search(r"\(\s*(?:in\s+)?(?:[A-Z]{2,4}|US\$|Rs\.?|\$|INR|USD|EUR|GBP|CAD|AUD|SGD|CHF|AED|CNY|JPY)?\s*/?\s*(kg|kgs|kilogram|kilograms|g|grams|mg|ml|l|litre|liter|days?|weeks?|months?|units?|packs?|bags?|drums?|mt|tons?)\s*\)", header, flags=re.IGNORECASE)
+    if paren_match:
+        return _normalize_unit(paren_match.group(1))
+    in_match = re.search(r"\bin\s+(kg|kgs|kilogram|kilograms|g|grams|mg|ml|l|litre|liter|days?|weeks?|months?|units?|packs?|bags?|drums?|mt|tons?)\b", header, flags=re.IGNORECASE)
+    if in_match:
+        return _normalize_unit(in_match.group(1))
+    return None
 
 
 def is_valid_ingredient_name(name: object) -> bool:
@@ -702,11 +852,22 @@ def _display_with_header_unit(value: str | None, unit: str | None) -> str | None
     return f"{cleaned} {unit}"
 
 
-def _display_price_with_header_currency(value: str, currency: str) -> str:
+def _display_price_with_header_currency(value: str, currency: str, unit: str | None = None, header: str | None = None) -> str:
     cleaned = value.strip()
-    if _currency_from_text(cleaned):
-        return cleaned
-    return f"{currency} {cleaned}".strip()
+    display = cleaned
+    if not _currency_from_text(cleaned):
+        if currency == "USD":
+            display = f"${cleaned}"
+        elif currency == "INR":
+            display = f"INR {cleaned}"
+        elif currency == "EUR":
+            display = f"EUR {cleaned}"
+        else:
+            display = f"{currency} {cleaned}".strip()
+    price_unit = unit or _unit_from_price_header(header)
+    if price_unit and "/" not in display:
+        display = f"{display}/{price_unit}"
+    return display.strip()
 
 
 def _extract_moq(text: str) -> tuple[float | None, str | None]:
@@ -743,6 +904,13 @@ def _strip_leading_date_customer(product: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     ).strip()
+
+
+def _clean_price_update_product(product: str) -> str:
+    cleaned = _strip_leading_date_customer(product)
+    cleaned = re.sub(r"^\s*(?:the|for|item|product|material|ingredient)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.split(r"\s+(?:is|has been|was)\s*$", cleaned, flags=re.IGNORECASE)[0]
+    return cleaned.strip(" -_:.,")
 
 
 def _looks_like_header(product: str) -> bool:

@@ -203,6 +203,71 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         self.assertEqual(rows[0].specification, "Assay: >=99.0%")
         self.assertIn("original_price=$30/kg", rows[0].notes or "")
 
+    def test_pdf_table_header_fob_usd_per_kg_maps_numeric_column_to_price(self) -> None:
+        rows = parse_catalog_table_text(
+            "Jinrui Product Code | Product Name | Product Specification Description | FOB($/kg)\n"
+            "JRG1287-A319 | 3,3'-Diindolylmethane | Assay: ≥99.0% | 30\n"
+            "JRG1291-A322 | 5-Amino-1-methylquinolinium Chloride | Purity: ≥98.0% | 1477\n"
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].ingredient_name, "3,3'-Diindolylmethane")
+        self.assertEqual(rows[0].specification, "Assay: ≥99.0%")
+        self.assertEqual(rows[0].price_per_unit, 30.0)
+        self.assertEqual(rows[0].currency, "USD")
+        self.assertEqual(rows[0].unit, "kg")
+        self.assertIn("original_price=$30/kg", rows[0].notes or "")
+        self.assertEqual(rows[1].price_per_unit, 1477.0)
+        self.assertIn("original_price=$1477/kg", rows[1].notes or "")
+
+    def test_adaptive_headers_extract_qty_moq_and_lead_time_units(self) -> None:
+        rows = parse_catalog_table_text(
+            "Material | Grade / Assay | Offer Qty (KG) | Min Order (KG) | Dispatch Time (Days) | CIF USD/kg\n"
+            "Vitamin C | USP 99% | 8400 | 25 | 14 | 5\n"
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].ingredient_name, "Vitamin C")
+        self.assertEqual(rows[0].specification, "USP 99%")
+        self.assertEqual(rows[0].available_qty, 8400.0)
+        self.assertEqual(rows[0].unit, "kg")
+        self.assertEqual(rows[0].moq, 25.0)
+        self.assertEqual(rows[0].lead_time_days, 14)
+        self.assertEqual(rows[0].lead_time_text, "14 days")
+        self.assertEqual(rows[0].price_per_unit, 5.0)
+        self.assertEqual(rows[0].currency, "USD")
+        self.assertIn("original_price=$5/kg", rows[0].notes or "")
+
+    def test_post_table_statement_is_not_appended_to_last_price_cell(self) -> None:
+        rows = parse_catalog_table_text(
+            "Jinrui Product Code | Product Name | Product Specification Description | FOB($/kg)\n"
+            "JRG0771-F146 | β-Carotene | β-Carotene: ≥10.0%, Complies with USP standards | "
+            "43 Statement: This quotation is provided for informational and reference purposes only.\n"
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].ingredient_name, "β-Carotene")
+        self.assertEqual(rows[0].specification, "β-Carotene: ≥10.0%, Complies with USP standards")
+        self.assertEqual(rows[0].price_per_unit, 43.0)
+        self.assertEqual(rows[0].currency, "USD")
+        self.assertEqual(rows[0].unit, "kg")
+        self.assertIn("original_price=$43/kg", rows[0].notes or "")
+        self.assertNotIn("Statement", rows[0].notes or "")
+
+    def test_email_body_price_update_sentence_extracts_catalogue_item(self) -> None:
+        rows = parse_catalog_table_text(
+            "hi abhishek,\n\n"
+            "the price of Zinc Sulfate is updated to $6/kg.\n\n"
+            "thanks,\nPrince\n"
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].ingredient_name, "Zinc Sulfate")
+        self.assertEqual(rows[0].price_per_unit, 6.0)
+        self.assertEqual(rows[0].currency, "USD")
+        self.assertEqual(rows[0].unit, "kg")
+        self.assertIn("original_price=$6/kg", rows[0].notes or "")
+
     def test_product_code_column_is_not_mapped_as_ingredient_name(self) -> None:
         rows = parse_catalog_table_text(
             "Product Code | Product Name | Specification | Price\n"
@@ -853,6 +918,15 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         self.assertEqual(certificate.category, CERTIFICATE)
         self.assertEqual(certificate.material_hint, "Vitamin C USP 99%")
         self.assertEqual(other.category, OTHER)
+
+    def test_document_classifier_treats_body_price_update_as_catalogue(self) -> None:
+        result = classify_document(
+            "email_body.txt",
+            ".txt",
+            "hi abhishek,\n\nthe price of Zinc Sulfate is updated to $6/kg.\n\nthanks,\nPrince",
+        )
+
+        self.assertEqual(result.category, CATALOGUE)
 
     def test_certificate_matching_does_not_attach_to_unrelated_catalogue_rows(self) -> None:
         service = object.__new__(EmailIngestionService)

@@ -42,12 +42,11 @@ class Settings(BaseSettings):
     openrouter_site_url: str = ""
     openrouter_app_name: str = "MediCORE"
 
-    paddleocr_lang: str = "en"
-    paddleocr_cpu_threads: int = 4
-    paddleocr_det_model: str = "PP-OCRv5_mobile_det"
-    paddleocr_rec_model: str = "PP-OCRv5_mobile_rec"
-    paddleocr_rec_batch_size: int = 6
-    paddleocr_det_limit_side_len: int = 1920
+    tesseract_cmd: str = ""
+    tesseract_lang: str = "eng"
+    tesseract_osd_lang: str = "osd"
+    tesseract_psm: int = 6
+    tesseract_enable_osd: bool = True
 
     email_mode: str = "imap"
     imap_host: str = "imap.gmail.com"

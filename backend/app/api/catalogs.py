@@ -219,7 +219,7 @@ def list_catalog_emails(
 def list_catalog_items(
     db: Session = Depends(get_db),
     q: str | None = None,
-    limit: int = Query(100, ge=1, le=100),
+    limit: int = Query(100, ge=1, le=10000),
     latest_only: bool = Query(True),
     catalog_email_id: UUID | None = Query(None),
     current_user: dict = Depends(get_current_user)
