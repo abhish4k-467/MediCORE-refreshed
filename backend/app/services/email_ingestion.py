@@ -164,8 +164,23 @@ class _HTMLTextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag.lower() in {"script", "style", "head", "meta", "title", "noscript"}:
+            self._skip_depth += 1
+        if tag.lower() in {"br", "p", "div", "li", "tr"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"script", "style", "head", "meta", "title", "noscript"} and self._skip_depth:
+            self._skip_depth -= 1
+        if tag.lower() in {"p", "div", "li", "tr"}:
+            self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
         cleaned = " ".join(data.split())
         if cleaned:
             self.parts.append(cleaned)
@@ -371,6 +386,7 @@ class EmailIngestionService:
             catalog_email.subject = subject
             catalog_email.received_at = email_date
             catalog_email.body_preview = self._body_preview(body_preview_text)
+            catalog_email.duplicate_count = 0
         else:
             catalog_email = CatalogEmail(
                 id=uuid4(),
@@ -382,6 +398,7 @@ class EmailIngestionService:
                 body_preview=self._body_preview(body_preview_text),
                 received_at=email_date,
                 processing_status="processing",
+                duplicate_count=0,
             )
             self.db.add(catalog_email)
         self.db.flush()
@@ -540,6 +557,7 @@ class EmailIngestionService:
                     continue
                 file_path.write_bytes(response.content)
                 catalog_email.processing_status = "processing"
+                catalog_email.duplicate_count = 0
                 if force:
                     self.db.query(CatalogItem).filter(
                         CatalogItem.catalog_email_id == catalog_email.id
@@ -666,8 +684,10 @@ class EmailIngestionService:
         source_name: str | None = None,
     ) -> int:
         count = 0
+        duplicate_count = 0
         active_tenant_id = tenant_id or supplier.tenant_id
         prepared_items = []
+        seen_in_document: set[tuple] = set()
         for item in items:
             item = self._with_source_note(item, text)
             if not self._has_valid_ingredient_name(item):
@@ -682,6 +702,20 @@ class EmailIngestionService:
                     item.model_dump(mode="json"),
                 )
                 continue
+            identity_key = self._item_identity_key(item)
+            value_key = (
+                identity_key,
+                str(item.price_per_unit),
+                (item.currency or "").upper(),
+                str(item.available_qty) if item.available_qty is not None else None,
+                (item.unit or "").strip().lower(),
+                item.lead_time_text or item.lead_time_days,
+                str(item.moq) if item.moq is not None else None,
+            )
+            if value_key in seen_in_document:
+                duplicate_count += 1
+                continue
+            seen_in_document.add(value_key)
             prepared_items.append(item)
 
         existing_by_identity = self._existing_supplier_items_by_identity(
@@ -699,6 +733,7 @@ class EmailIngestionService:
                 has_changed = self._catalog_item_values_changed(existing_candidates[0], item)
 
             if not has_changed:
+                duplicate_count += 1
                 logger.info(
                     "Skipping unchanged catalogue item supplier=%s item=%s",
                     supplier.email_domain,
@@ -764,6 +799,7 @@ class EmailIngestionService:
                     )
                 )
             count += 1
+        catalog_email.duplicate_count = int(catalog_email.duplicate_count or 0) + duplicate_count
         return count
 
     def _with_source_note(self, item, text: str):
@@ -1604,10 +1640,12 @@ class EmailIngestionService:
                     html_parts.append(self._html_to_text(decoded))
                 else:
                     plain_parts.append(decoded)
-        return "\n".join(part.strip() for part in [*plain_parts, *html_parts] if part.strip()).strip()
+        preferred_parts = plain_parts if any(part.strip() for part in plain_parts) else html_parts
+        return self._clean_email_body("\n\n".join(part for part in preferred_parts if part.strip()))
 
     def _body_preview(self, body_text: str | None) -> str | None:
-        cleaned = re.sub(r"\s+", " ", body_text or "").strip()
+        cleaned = self._clean_email_body(body_text)
+        cleaned = re.sub(r"\s+", " ", cleaned or "").strip()
         return cleaned[:12000] if cleaned else None
 
     def _html_to_text(self, html: str) -> str:
@@ -1617,6 +1655,44 @@ class EmailIngestionService:
             return parser.text()
         except Exception:
             return ""
+
+    def _clean_email_body(self, body_text: str | None) -> str:
+        text = str(body_text or "")
+        if not text.strip():
+            return ""
+        text = re.sub(r"(?is)<(script|style|head|meta|title|noscript)\b.*?</\1>", " ", text)
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"https?://\S+", " ", text)
+        text = re.sub(r"\bwww\.\S+", " ", text)
+        text = re.sub(r"\S+@\S+\.\S+", " ", text)
+        text = re.sub(r"(?im)^\s*(from|sent|to|cc|bcc|subject)\s*:.*$", " ", text)
+        text = re.split(
+            r"(?im)^\s*(?:On .+ wrote:|From:.+|-----Original Message-----|_{5,}|-{5,}|Forwarded message)\s*$",
+            text,
+            maxsplit=1,
+        )[0]
+        text = re.split(
+            r"(?im)^\s*(?:thanks|thank you|regards|best regards|kind regards|warm regards|sent from my)\b.*$",
+            text,
+            maxsplit=1,
+        )[0]
+        lines: list[str] = []
+        seen: set[str] = set()
+        for raw_line in text.splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip(" \t|-_")
+            if not line:
+                continue
+            if re.search(r"(?i)\b(unsubscribe|view in browser|privacy policy|manage preferences|read more)\b", line):
+                continue
+            if len(line) > 240 and not re.search(r"(?i)\b(price|quote|quotation|catalog|catalogue|ingredient|product|quantity|moq|lead time)\b", line):
+                line = line[:240].rstrip() + "..."
+            key = re.sub(r"\W+", "", line.lower())
+            if key and key in seen:
+                continue
+            seen.add(key)
+            lines.append(line)
+        return "\n".join(lines).strip()
 
     def _extract_docx_text(self, file_path: Path) -> str:
         text_parts: list[str] = []

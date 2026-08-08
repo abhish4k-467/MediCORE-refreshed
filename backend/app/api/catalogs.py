@@ -132,6 +132,8 @@ def mock_catalog_emails(limit: int) -> list[dict]:
             "subject": email.subject,
             "pdf_url": email.pdf_url,
             "processing_status": email.processing_status,
+            "item_count": 0,
+            "duplicate_count": 0,
         }
         for email in sorted(emails, key=lambda row: row.received_at, reverse=True)[:limit]
     ]
@@ -206,6 +208,7 @@ def list_catalog_emails(
                 "body_preview": email.body_preview,
                 "processing_status": email.processing_status,
                 "item_count": int(item_count or 0),
+                "duplicate_count": int(getattr(email, "duplicate_count", 0) or 0),
             }
             for email, supplier_name, email_domain, item_count in db.execute(stmt)
         ]

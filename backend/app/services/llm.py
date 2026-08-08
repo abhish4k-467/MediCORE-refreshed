@@ -12,8 +12,26 @@ from backend.app.schemas import ExtractedCatalogItem, QueryPlan
 
 logger = logging.getLogger(__name__)
 
-EXTRACTION_CHUNK_CHARS = 12000
+EXTRACTION_CHUNK_CHARS = 50000
 EXTRACTION_CHUNK_OVERLAP_LINES = 4
+
+
+class TokenLimitReachedError(RuntimeError):
+    pass
+
+
+def is_token_limit_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    return (
+        status_code == 429
+        or "rate limit" in message
+        or "quota" in message
+        or "insufficient_quota" in message
+        or "token limit" in message
+        or "context length" in message
+        or "maximum context" in message
+    )
 
 
 @dataclass(frozen=True)
@@ -106,6 +124,7 @@ class ModelRouterClient:
             raise ValueError("GROQ_API_KEY or OPENROUTER_API_KEY is required for LLM processing.")
 
         last_error: Exception | None = None
+        token_limit_seen = False
         for provider in providers:
             try:
                 content = self._chat_with_provider(
@@ -121,9 +140,12 @@ class ModelRouterClient:
                 return content
             except Exception as exc:
                 last_error = exc
+                token_limit_seen = token_limit_seen or is_token_limit_error(exc)
                 logger.warning("LLM provider %s failed; trying next provider if available: %s", provider.name, exc)
 
         assert last_error is not None
+        if token_limit_seen:
+            raise TokenLimitReachedError("Token Limit Reached") from last_error
         raise last_error
 
     def _json_chat(self, system: str, user: str) -> dict[str, Any]:
@@ -353,8 +375,8 @@ class ModelRouterClient:
 
         lines = normalized.splitlines()
         header_lines: list[str] = []
-        for line in lines[:5]:
-            if line.startswith("Sheet:") or "," in line or "|" in line or "\t" in line:
+        for line in lines[:20]:
+            if line.startswith(("Sheet:", "[EXCEL TABLE]", "[CSV TABLE]", "[PDF INSPECTOR MARKDOWN]", "[TESSERACT TABLE OCR]")) or "," in line or "|" in line or "\t" in line:
                 header_lines.append(line)
                 if len(header_lines) >= 2:
                     break
@@ -366,10 +388,19 @@ class ModelRouterClient:
         current_len = 0
         for line in lines:
             line_len = len(line) + 1
+            if line_len > EXTRACTION_CHUNK_CHARS:
+                if current:
+                    chunks.append("\n".join(current))
+                    current = []
+                    current_len = 0
+                for start in range(0, len(line), EXTRACTION_CHUNK_CHARS):
+                    part = line[start : start + EXTRACTION_CHUNK_CHARS]
+                    chunks.append(part)
+                continue
             if current and current_len + line_len > EXTRACTION_CHUNK_CHARS:
                 chunk_str = "\n".join(current)
                 if chunks and header_prefix and not chunk_str.startswith(header_lines[0]):
-                    chunk_str = header_prefix + chunk_str
+                    chunk_str = (header_prefix + chunk_str)[:EXTRACTION_CHUNK_CHARS]
                 chunks.append(chunk_str)
                 current = current[-EXTRACTION_CHUNK_OVERLAP_LINES:]
                 current_len = sum(len(row) + 1 for row in current)
@@ -378,7 +409,7 @@ class ModelRouterClient:
         if current:
             chunk_str = "\n".join(current)
             if chunks and header_prefix and not chunk_str.startswith(header_lines[0]):
-                chunk_str = header_prefix + chunk_str
+                chunk_str = (header_prefix + chunk_str)[:EXTRACTION_CHUNK_CHARS]
             chunks.append(chunk_str)
         return chunks
 

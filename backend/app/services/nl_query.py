@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.models import CatalogEmail, CatalogItem, Supplier
 from backend.app.schemas import ChatResponse
-from backend.app.services.llm import OpenRouterClient
+from backend.app.services.llm import OpenRouterClient, TokenLimitReachedError, is_token_limit_error
 from backend.app.services.query_whitelist import validate_operation
 from backend.app.services.ranking import SupplierRanker
 from backend.app.services.sql_executor import execute_readonly_sql
@@ -114,7 +114,11 @@ class NaturalLanguageQueryEngine:
 
             try:
                 plan = self.llm.plan_query(question)
-            except Exception:
+            except TokenLimitReachedError:
+                raise
+            except Exception as exc:
+                if is_token_limit_error(exc):
+                    raise TokenLimitReachedError("Token Limit Reached") from exc
                 plan = self._fallback_plan(question)
 
             detected_operation = understanding.operation
@@ -171,7 +175,11 @@ class NaturalLanguageQueryEngine:
                     sql_rows = execute_readonly_sql(self.db, generated_sql, tenant_id=tenant_id)
                     if sql_rows:
                         rows = self._normalize_sql_rows(sql_rows, tenant_id=tenant_id)
+            except TokenLimitReachedError:
+                raise
             except Exception as exc:
+                if is_token_limit_error(exc):
+                    raise TokenLimitReachedError("Token Limit Reached") from exc
                 logger.warning("AI SQL generation/execution failed; falling back to structured plan: %s", exc)
                 rows = []
 
@@ -201,7 +209,11 @@ class NaturalLanguageQueryEngine:
 
             try:
                 answer = self.llm.summarize_answer(question, rows)
-            except Exception:
+            except TokenLimitReachedError:
+                raise
+            except Exception as exc:
+                if is_token_limit_error(exc):
+                    raise TokenLimitReachedError("Token Limit Reached") from exc
                 logger.exception("LLM answer summarization failed; using fallback summary")
                 answer = self._fallback_summary(question, rows)
 
@@ -212,7 +224,11 @@ class NaturalLanguageQueryEngine:
             self._update_conversation_state(question, understanding, plan, match_result, rows)
             self._cache_set(cache_key, response.model_dump_json())
             return response
-        except Exception:
+        except TokenLimitReachedError:
+            return ChatResponse(answer="Token Limit Reached", rows=[])
+        except Exception as exc:
+            if is_token_limit_error(exc):
+                return ChatResponse(answer="Token Limit Reached", rows=[])
             logger.exception("Natural language query failed unexpectedly")
             return ChatResponse(
                 answer=self._fallback_summary(question, []),

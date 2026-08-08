@@ -93,6 +93,7 @@ type CatalogEmailRow = {
   body_preview?: string | null;
   processing_status: string;
   item_count?: number;
+  duplicate_count?: number;
 };
 
 type SupplierTableRow = SupplierItem & {
@@ -113,6 +114,7 @@ type InboxThread = {
   email_domain: string;
   country?: string | null;
   item_count: number;
+  duplicate_count: number;
   latest_item: string;
   received_at: string | null;
   latest_price: number;
@@ -1107,6 +1109,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         email_domain: items[0]?.email_domain ?? meta?.email_domain ?? "-",
         country: meta?.country ?? (items[0] as any)?.country ?? "Unknown",
         item_count: itemCount,
+        duplicate_count: Number(email.duplicate_count || 0),
         latest_item: email.subject || bestItem?.ingredient_name || "Email stored, extraction pending",
         received_at: email.received_at,
         latest_price: bestItem?.price_per_unit ?? 0,
@@ -3142,13 +3145,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                           <strong>{selectedInboxThread.item_count}</strong>
                         </article>
                         <article className="summary-card">
-                          <span>Price drops vs last</span>
-                          <strong>{(() => {
-                            const priced = selectedInboxThread.items.filter((row) => row.price_per_unit != null);
-                            if (!priced.length) return 0;
-                            const avg = priced.reduce((total, row) => total + Number(row.price_per_unit), 0) / priced.length;
-                            return priced.filter((item) => Number(item.price_per_unit) < avg).length;
-                          })()}</strong>
+                          <span>Duplicates found</span>
+                          <strong>{selectedInboxThread.duplicate_count}</strong>
                         </article>
                         <article className="summary-card">
                           <span>Best deals found</span>
@@ -3166,7 +3164,10 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
                             <h2>Email preview</h2>
                           </div>
                           <div className="skipped-email-reason">{selectedInboxThread.status_label}</div>
-                          <div className="skipped-email-body">
+                          <div
+                            className="skipped-email-body"
+                            style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", lineHeight: 1.55 }}
+                          >
                             {selectedInboxThread.body_preview || "No readable email body was available for this skipped email."}
                           </div>
                         </div>

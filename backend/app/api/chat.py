@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from backend.app.config import get_settings
 from backend.app.db import get_db
 from backend.app.services.nl_query import NaturalLanguageQueryEngine
+from backend.app.services.llm import is_token_limit_error
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -73,7 +74,7 @@ async def chat_socket(websocket: WebSocket, db: Session = Depends(get_db)) -> No
                 await websocket.send_json(
                     {
                         "type": "error",
-                        "message": "MediCORE could not complete that query.",
+                        "message": "Token Limit Reached" if is_token_limit_error(exc) else "MediCORE could not complete that query.",
                     }
                 )
     except WebSocketDisconnect:

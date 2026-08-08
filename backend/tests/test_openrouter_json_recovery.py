@@ -1,4 +1,4 @@
-from backend.app.services.llm import EXTRACTION_CHUNK_CHARS, ModelProviderConfig, OpenRouterClient
+from backend.app.services.llm import EXTRACTION_CHUNK_CHARS, ModelProviderConfig, OpenRouterClient, TokenLimitReachedError
 
 
 def test_salvages_items_from_malformed_openrouter_json() -> None:
@@ -65,13 +65,33 @@ def test_model_router_falls_back_to_openrouter_after_groq_failure() -> None:
 
 def test_extraction_chunks_are_sized_for_primary_groq_route() -> None:
     client = object.__new__(OpenRouterClient)
-    text = "\n".join(f"Vitamin C row {index} USD 5/kg" for index in range(2000))
+    text = "\n".join(f"Vitamin C row {index} USD 5/kg" for index in range(5000))
 
     chunks = client._chunk_text(text)
 
-    assert EXTRACTION_CHUNK_CHARS == 12000
+    assert EXTRACTION_CHUNK_CHARS == 50000
     assert len(chunks) > 1
     assert all(len(chunk) <= EXTRACTION_CHUNK_CHARS + 1000 for chunk in chunks)
+
+
+def test_model_router_raises_token_limit_for_rate_limit_exhaustion() -> None:
+    client = object.__new__(OpenRouterClient)
+    client.providers = [
+        ModelProviderConfig("groq", "groq-key", "groq-model", "https://groq.test"),
+        ModelProviderConfig("openrouter", "openrouter-key", "openrouter-model", "https://openrouter.test"),
+    ]
+
+    def fake_chat_with_provider(provider, messages, *, temperature=0, json_mode=False):
+        raise RuntimeError("429 rate limit quota exhausted")
+
+    client._chat_with_provider = fake_chat_with_provider
+
+    try:
+        client._chat([{"role": "user", "content": "hello"}])
+    except TokenLimitReachedError as exc:
+        assert str(exc) == "Token Limit Reached"
+    else:
+        raise AssertionError("TokenLimitReachedError was not raised")
 
 
 def test_json_chat_falls_back_when_primary_returns_invalid_json() -> None:

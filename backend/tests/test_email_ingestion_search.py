@@ -1,4 +1,5 @@
 import unittest
+from email.message import EmailMessage
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from backend.app.services.email_ingestion import (
     public_processing_failure,
     trusted_sender_matches,
 )
+from backend.app.services.llm import TokenLimitReachedError
 from backend.app.services.nl_query import NaturalLanguageQueryEngine
 from backend.app.services.ranking import SupplierRanker
 
@@ -78,6 +80,56 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         attachments = [{"filename": "supplier-catalogue.jpeg", "ext": ".jpeg"}]
 
         self.assertTrue(self.service._has_supplier_catalogue_intent("", "", attachments))
+
+    def test_store_catalog_items_counts_duplicate_rows_in_same_document(self) -> None:
+        added = []
+        service = object.__new__(EmailIngestionService)
+        service.db = SimpleNamespace(add=lambda item: added.append(item))
+        service._existing_supplier_items_by_identity = lambda *args, **kwargs: {}
+        catalog_email = SimpleNamespace(id="email-id", tenant_id="tenant-id", duplicate_count=0, received_at=datetime(2026, 8, 8, tzinfo=UTC))
+        supplier = SimpleNamespace(id="supplier-id", tenant_id="tenant-id", email_domain="supplier.test")
+        item = ExtractedCatalogItem(
+            ingredient_name="Vitamin C",
+            price_per_unit=5.0,
+            currency="USD",
+            available_qty=100.0,
+            unit="kg",
+            notes="source=Vitamin C 100 kg USD 5/kg",
+        )
+
+        stored = service._store_catalog_items(
+            catalog_email,
+            supplier,
+            [item, item.model_copy()],
+            "Vitamin C 100 kg USD 5/kg",
+            tenant_id="tenant-id",
+        )
+
+        self.assertEqual(stored, 1)
+        self.assertEqual(catalog_email.duplicate_count, 1)
+        self.assertEqual(len(added), 1)
+
+    def test_email_body_preview_prefers_clean_plain_text_without_duplicate_html(self) -> None:
+        message = EmailMessage()
+        message["Subject"] = "LinkedIn update"
+        plain = (
+            "Bharath R shared a post: Can someone please refer me?\n"
+            "Read more: https://www.linkedin.com/tracking/example\n"
+            "Thanks,\nBharath\n"
+        )
+        html = (
+            "<html><body><p>Bharath R shared a post: Can someone please refer me?</p>"
+            "<a href='https://www.linkedin.com/tracking/example'>Read more</a>"
+            "<script>track()</script></body></html>"
+        )
+        message.set_content(plain)
+        message.add_alternative(html, subtype="html")
+
+        body = self.service._get_email_body_text(message)
+        preview = self.service._body_preview(body)
+
+        self.assertEqual(body, "Bharath R shared a post: Can someone please refer me?")
+        self.assertEqual(preview, "Bharath R shared a post: Can someone please refer me?")
 
     def test_item_identity_uses_ingredient_and_specification_only(self) -> None:
         previous = SimpleNamespace(
@@ -844,6 +896,15 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         response = engine.answer("Remind me at 3 PM")
 
         self.assertEqual(response.answer, "Set a reminder for 3 PM.")
+        self.assertEqual(response.rows, [])
+
+    def test_procuraai_returns_exact_token_limit_message(self) -> None:
+        engine = object.__new__(NaturalLanguageQueryEngine)
+        engine._understand_query = lambda question: (_ for _ in ()).throw(TokenLimitReachedError("quota exhausted"))
+
+        response = engine._answer("compare suppliers")
+
+        self.assertEqual(response.answer, "Token Limit Reached")
         self.assertEqual(response.rows, [])
 
     def test_supplier_country_detection_defaults_unknown_without_address(self) -> None:

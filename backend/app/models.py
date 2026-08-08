@@ -36,6 +36,7 @@ class CatalogEmail(Base):
     pdf_url: Mapped[str | None] = mapped_column(Text)
     body_preview: Mapped[str | None] = mapped_column(Text)
     processing_status: Mapped[str] = mapped_column(String(50), default="queued")
+    duplicate_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     supplier: Mapped[Supplier] = relationship(back_populates="emails")
 
