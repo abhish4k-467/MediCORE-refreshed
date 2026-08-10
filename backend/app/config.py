@@ -42,12 +42,6 @@ class Settings(BaseSettings):
     openrouter_site_url: str = ""
     openrouter_app_name: str = "MediCORE"
 
-    tesseract_cmd: str = ""
-    tesseract_lang: str = "eng"
-    tesseract_osd_lang: str = "osd"
-    tesseract_psm: int = 6
-    tesseract_enable_osd: bool = True
-
     email_mode: str = "imap"
     imap_host: str = "imap.gmail.com"
     imap_port: int = 993

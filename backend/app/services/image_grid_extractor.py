@@ -7,8 +7,7 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageOps
 
-from backend.app.config import get_settings
-from backend.app.services.ocr import OCRTextLine, preprocess_document_image, recognize_image
+from backend.app.services.ocr import OCRTextLine, preprocess_document_image, recognize_image, recognize_image_to_text
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +21,9 @@ HEADER_ALIASES = {
     "unit": ("unit", "uom"),
     "price": ("price", "rate", "quote", "cost"),
     "currency": ("currency", "curr"),
-    "moq": ("moq", "minimum"),
+    "moq": ("moq", "m.o.q", "minimum", "min order", "min qty", "pack", "packing", "packaging", "package", "pack size", "moq/packing", "packing/moq"),
     "lead_time": ("lead", "delivery", "dispatch"),
+    "pack": ("pack", "packing", "packaging", "package", "pack size", "moq", "m.o.q", "minimum", "min order", "min qty"),
 }
 
 
@@ -90,7 +90,7 @@ def extract_grid_table_from_pil_image(image: Image.Image, source_name: str = "im
 
         return _extract_unbordered_table(lines, source_name)
     except Exception:
-        logger.debug("Tesseract table extraction not applicable for %s", source_name, exc_info=True)
+        logger.debug("RapidOCR table extraction not applicable for %s", source_name, exc_info=True)
         return None
 
 
@@ -128,7 +128,7 @@ def _extract_bordered_table(
 
     table_text = rows_to_catalog_table_text(product_rows)
     logger.info(
-        "Tesseract bordered table extraction produced %s row(s) from %s",
+        "RapidOCR bordered table extraction produced %s row(s) from %s",
         len(product_rows),
         source_name,
     )
@@ -177,11 +177,6 @@ def _needs_cell_ocr(text: str, header: str) -> bool:
 
 def _ocr_grid_cell(image: Image.Image, left: int, top: int, right: int, bottom: int, header: str = "") -> str:
     try:
-        import pytesseract
-
-        settings = get_settings()
-        if settings.tesseract_cmd:
-            pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
         pad = 4
         crop = image.crop(
             (
@@ -192,19 +187,10 @@ def _ocr_grid_cell(image: Image.Image, left: int, top: int, right: int, bottom: 
             )
         )
         crop = ImageOps.autocontrast(crop.convert("L")).convert("RGB")
-        config = "--oem 1 --psm 7 -c preserve_interword_spaces=1"
-        if header == "price":
-            config += " -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789$./-"
-        elif header == "lead_time":
-            config += " -c tessedit_char_whitelist=0123456789DdAaYySsWwEeKkMmOoNnTtHh-~"
-        text = pytesseract.image_to_string(
-            crop,
-            lang=settings.tesseract_lang,
-            config=config,
-        )
+        text = recognize_image_to_text(crop, f"grid cell {header or 'unknown'}")
         return clean_text(text)
     except Exception:
-        logger.debug("Cell OCR failed", exc_info=True)
+        logger.debug("RapidOCR cell OCR failed", exc_info=True)
         return ""
 
 
@@ -221,6 +207,10 @@ def _extract_unbordered_table(lines: list[OCRTextLine], source_name: str) -> Gri
     if len(table_rows) < 2:
         return None
 
+    product_spec_result = _extract_unbordered_product_spec_blocks(table_rows, lines, source_name)
+    if product_spec_result:
+        return product_spec_result
+
     header_index = _best_header_row_index(table_rows)
     if header_index is None:
         return None
@@ -236,15 +226,119 @@ def _extract_unbordered_table(lines: list[OCRTextLine], source_name: str) -> Gri
             headers[index]: cells[index] if index < len(cells) else ""
             for index in range(len(headers))
         }
-        if _row_has_catalogue_signal(mapped):
+        if _row_has_catalogue_signal(mapped) and not _is_table_noise_text(" ".join(mapped.values())):
             rows.append({"row_number": row_number, "bbox": {}, "cells": mapped})
 
     if not rows:
         return None
 
     table_text = rows_to_catalog_table_text(rows)
-    logger.info("Tesseract unbordered table extraction produced %s row(s) from %s", len(rows), source_name)
+    logger.info("RapidOCR unbordered table extraction produced %s row(s) from %s", len(rows), source_name)
     return GridExtractionResult([], [int(boundary) for boundary in boundaries], rows, table_text)
+
+
+def _extract_unbordered_product_spec_blocks(
+    table_rows: list[list[OCRTextLine]],
+    all_lines: list[OCRTextLine],
+    source_name: str,
+) -> GridExtractionResult | None:
+    header_index = None
+    header_pairs: list[tuple[OCRTextLine, OCRTextLine]] = []
+    for index, row in enumerate(table_rows[:10]):
+        pairs = _product_spec_header_pairs(row)
+        if pairs:
+            header_index = index
+            header_pairs = pairs
+            break
+    if header_index is None or not header_pairs:
+        return None
+
+    rows: list[dict[str, Any]] = []
+    header_centers = sorted([line.center_x for pair in header_pairs for line in pair])
+    min_left = min(line.box[0] for line in all_lines)
+    max_right = max(line.box[2] for line in all_lines)
+
+    for block_index, (product_header, spec_header) in enumerate(header_pairs):
+        previous_center = header_centers[header_centers.index(product_header.center_x) - 1] if header_centers.index(product_header.center_x) > 0 else min_left
+        next_header_position = header_centers.index(spec_header.center_x) + 1
+        next_center = header_centers[next_header_position] if next_header_position < len(header_centers) else max_right
+        block_left = (previous_center + product_header.center_x) / 2 if previous_center != min_left else min_left
+        split = (product_header.center_x + spec_header.center_x) / 2
+        block_right = (spec_header.center_x + next_center) / 2 if next_center != max_right else max_right
+
+        empty_streak = 0
+        for row_number, row in enumerate(table_rows[header_index + 1 :], start=1):
+            product_parts: list[OCRTextLine] = []
+            spec_parts: list[OCRTextLine] = []
+            for line in row:
+                if not (block_left <= line.center_x <= block_right):
+                    continue
+                if line.center_x <= split:
+                    product_parts.append(line)
+                else:
+                    spec_parts.append(line)
+
+            product = clean_text(" ".join(line.text for line in product_parts))
+            specification = clean_text(" ".join(line.text for line in spec_parts))
+            row_text = clean_text(f"{product} {specification}")
+            if not row_text:
+                empty_streak += 1
+                if empty_streak >= 3:
+                    break
+                continue
+            empty_streak = 0
+            if _is_table_noise_text(row_text):
+                continue
+
+            mapped = {"product": product, "specification": specification}
+            if _row_has_catalogue_signal(mapped):
+                row_lines = product_parts + spec_parts
+                rows.append(
+                    {
+                        "row_number": len(rows) + 1,
+                        "block_number": block_index + 1,
+                        "bbox": _bbox_from_lines(row_lines),
+                        "cells": mapped,
+                    }
+                )
+
+    if not rows:
+        return None
+
+    table_text = rows_to_catalog_table_text(rows)
+    boundaries = sorted({int(value) for pair in header_pairs for value in (pair[0].center_x, pair[1].center_x)})
+    logger.info(
+        "RapidOCR product/spec table extraction produced %s row(s) from %s",
+        len(rows),
+        source_name,
+    )
+    return GridExtractionResult([], boundaries, rows, table_text)
+
+
+def _product_spec_header_pairs(row: list[OCRTextLine]) -> list[tuple[OCRTextLine, OCRTextLine]]:
+    pairs: list[tuple[OCRTextLine, OCRTextLine]] = []
+    sorted_row = sorted(row, key=lambda value: value.center_x)
+    product_header: OCRTextLine | None = None
+    for line in sorted_row:
+        column = column_name_from_header(line.text, "")
+        if column == "product":
+            product_header = line
+            continue
+        if column == "specification" and product_header is not None:
+            pairs.append((product_header, line))
+            product_header = None
+    return pairs
+
+
+def _bbox_from_lines(lines: list[OCRTextLine]) -> dict[str, float]:
+    if not lines:
+        return {}
+    return {
+        "left": min(line.box[0] for line in lines),
+        "top": min(line.box[1] for line in lines),
+        "right": max(line.box[2] for line in lines),
+        "bottom": max(line.box[3] for line in lines),
+    }
 
 
 def _cluster_lines_by_y(lines: list[OCRTextLine]) -> list[list[OCRTextLine]]:
@@ -356,29 +450,63 @@ def extract_quantity_parts(text: str) -> tuple[str, str, str, str]:
     quantity_unit = ""
     moq = ""
     pack_size = ""
-    quantity_value = number_from_text(text)
-    if quantity_value is not None:
-        quantity = f"{quantity_value:g}"
-    unit_match = re.search(r"\d[\d,]*(?:\.\d+)?\s*(kg|g|mg|l|ml|unit|units|pack|packs|bags?)\b", text or "", flags=re.IGNORECASE)
-    if unit_match:
-        quantity_unit = unit_match.group(1).lower().rstrip("s")
 
+    # 1. Look for explicit MOQ / Packing expressions first
     moq_match = re.search(
-        r"\bMOQ\s*:?\s*(\d[\d,]*(?:\.\d+)?)\s*(kg|g|mg|l|ml|unit|pack|bag)?",
+        r"\b(?:MOQ|M\.?O\.?Q\.?|Packing|Packaging|Pack\s*size|Pack)\s*:?\s*(\d[\d,]*(?:\.\d+)?)\s*(kg|g|mg|l|ml|unit|pack|bag|drum|carton)?\s*(fibre drum|fiber drum|drum|bag|carton|strip|box|bottle|packing|packaging|pack)?",
         text or "",
         flags=re.IGNORECASE,
     )
     if moq_match:
+        val = moq_match.group(1)
         unit = moq_match.group(2) or ""
-        moq = f"{moq_match.group(1)}{unit}"
+        container = (moq_match.group(3) or "").strip()
+        moq = f"{val}{unit}"
+        if container and container.lower() not in unit.lower():
+            pack_size = f"{val} {unit} {container}".strip() if unit else f"{val} {container}".strip()
+        else:
+            pack_size = f"{val} {unit}".strip()
 
-    pack_match = re.search(
-        r"(\d[\d,]*(?:\.\d+)?\s*(?:kg|g|mg|l|ml)\s+packing)",
-        text or "",
-        flags=re.IGNORECASE,
-    )
-    if pack_match:
-        pack_size = pack_match.group(1)
+    # 2. Look for standalone pack size expressions if pack_size is not set yet
+    if not pack_size:
+        pack_match = re.search(
+            r"(\d[\d,]*(?:\.\d+)?\s*(?:kg|g|mg|l|ml|units?|packs?)\s+(?:fibre drum|fiber drum|drum|bag|carton|strip|box|bottle|packing|packaging|pack))",
+            text or "",
+            flags=re.IGNORECASE,
+        )
+        if pack_match:
+            pack_size = pack_match.group(1).strip()
+
+    # 3. MOQ and packing are the same thing: sync them
+    if not moq and pack_size:
+        num_m = re.search(r"(\d[\d,]*(?:\.\d+)?)", pack_size)
+        if num_m:
+            u_m = re.search(r"(kg|g|mg|l|ml|unit|pack|bag|drum|carton)", pack_size, flags=re.IGNORECASE)
+            unit_str = u_m.group(1).lower() if u_m else ""
+            moq = f"{num_m.group(1)}{unit_str}"
+
+    if not pack_size and moq:
+        pack_size = moq
+
+    # 4. Quantity logic (available stock qty)
+    cleaned_text_for_qty = text or ""
+    if moq_match:
+        cleaned_text_for_qty = cleaned_text_for_qty[:moq_match.start()] + cleaned_text_for_qty[moq_match.end():]
+
+    quantity_value = number_from_text(cleaned_text_for_qty)
+    if quantity_value is not None:
+        quantity = f"{quantity_value:g}"
+        unit_match = re.search(r"\d[\d,]*(?:\.\d+)?\s*(kg|g|mg|l|ml|unit|units|pack|packs|bags?)\b", cleaned_text_for_qty, flags=re.IGNORECASE)
+        if unit_match:
+            quantity_unit = unit_match.group(1).lower().rstrip("s")
+    else:
+        quantity_value = number_from_text(text)
+        if quantity_value is not None:
+            quantity = f"{quantity_value:g}"
+        unit_match = re.search(r"\d[\d,]*(?:\.\d+)?\s*(kg|g|mg|l|ml|unit|units|pack|packs|bags?)\b", text or "", flags=re.IGNORECASE)
+        if unit_match:
+            quantity_unit = unit_match.group(1).lower().rstrip("s")
+
     return quantity, quantity_unit, moq, pack_size
 
 
@@ -443,8 +571,15 @@ def rows_to_catalog_table_text(rows: list[dict[str, Any]]) -> str:
         price_text = clean_text(cells.get("price", ""))
         currency_text = clean_text(cells.get("currency", ""))
         lead_text = normalize_lead_time_text(cells.get("lead_time", ""))
-        moq_text = clean_text(cells.get("moq", ""))
-        quantity, quantity_unit, moq, pack_size = extract_quantity_parts(" ".join([quantity_text, moq_text]))
+
+        # MOQ and packing are the same thing: check moq, pack, packing, packaging cell keys
+        moq_cell = clean_text(cells.get("moq", "") or cells.get("pack", "") or cells.get("packing", "") or cells.get("packaging", "") or cells.get("pack_size", ""))
+        pack_cell = clean_text(cells.get("pack", "") or cells.get("packing", "") or cells.get("packaging", "") or cells.get("pack_size", "") or cells.get("moq", ""))
+
+        quantity, quantity_unit, moq, pack_size = extract_quantity_parts(" ".join([quantity_text, moq_cell, pack_cell]))
+        final_moq = moq or moq_cell or pack_cell or pack_size
+        final_pack = pack_size or pack_cell or moq_cell or final_moq
+
         price, currency = extract_price_parts(" ".join([price_text, currency_text]).strip())
         header_unit = "kg" if clean_text(cells.get("quantity_kg", "")) else ""
         notes = []
@@ -466,8 +601,8 @@ def rows_to_catalog_table_text(rows: list[dict[str, Any]]) -> str:
                     price,
                     currency or currency_text,
                     lead_text,
-                    moq or moq_text,
-                    pack_size,
+                    final_moq,
+                    final_pack,
                     "; ".join(notes),
                 ]
             )
@@ -490,16 +625,40 @@ def split_inline_specification(product: str, specification: str) -> tuple[str, s
 
 def _row_has_catalogue_signal(cells: dict[str, str]) -> bool:
     product = cells.get("product") or cells.get("product_2") or ""
-    if len(product.strip()) < 3:
+    product = clean_text(product)
+    if len(product.strip()) < 3 or _is_table_noise_text(product):
         return False
     commercial = " ".join(str(value) for key, value in cells.items() if key != "product")
-    return bool(re.search(r"\d|USD|INR|Rs\.?|\$|MOQ|kg|g\b|price|rate", commercial, flags=re.IGNORECASE))
+    commercial = clean_text(commercial)
+    if _is_table_noise_text(commercial):
+        return False
+    if cells.get("specification") and len(clean_text(cells.get("specification", ""))) >= 2:
+        return True
+    return bool(
+        re.search(r"\d|USD|INR|Rs\.?|\$|MOQ|kg|g\b|price|rate", commercial, flags=re.IGNORECASE)
+        or re.search(r"\b(?:grade|hplc|usp|fcc|nf|extract|ratio|vegan|assay|purity|content)\b", commercial, flags=re.IGNORECASE)
+    )
+
+
+def _is_table_noise_text(text: str) -> bool:
+    cleaned = clean_text(text).lower()
+    if not cleaned:
+        return False
+    if re.search(r"\bused\s+for\b", cleaned, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\boem\s+services?\b", cleaned, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\b(?:hard\s+capsules?|soft\s+gels?|tablets?)\b", cleaned, flags=re.IGNORECASE):
+        return True
+    if cleaned in {"product name", "specification", "product", "spec"}:
+        return True
+    return False
 
 
 def extract_grid_table_from_image(file_path: Path) -> GridExtractionResult | None:
     try:
         image = Image.open(file_path)
     except Exception:
-        logger.debug("Unable to open %s for Tesseract table extraction", file_path, exc_info=True)
+        logger.debug("Unable to open %s for RapidOCR table extraction", file_path, exc_info=True)
         return None
     return extract_grid_table_from_pil_image(image, file_path.name)

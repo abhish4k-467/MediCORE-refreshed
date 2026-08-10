@@ -6,48 +6,46 @@ from unittest.mock import patch
 from PIL import Image
 
 
-class TesseractOCRConfigTest(unittest.TestCase):
-    def test_tesseract_ocr_uses_table_friendly_config_and_boxes(self) -> None:
+class RapidOCRConfigTest(unittest.TestCase):
+    def test_rapidocr_lines_are_used_for_image_ocr(self) -> None:
         from backend.app.services import ocr
 
-        captured: dict[str, object] = {}
+        class FakeRapidOCR:
+            def __call__(self, image):
+                return (
+                    [
+                        (
+                            [(10, 20), (75, 20), (75, 35), (10, 35)],
+                            "Vitamin",
+                            0.92,
+                        ),
+                        (
+                            [(82, 20), (100, 20), (100, 35), (82, 35)],
+                            "C",
+                            0.91,
+                        ),
+                        (
+                            [(180, 20), (222, 20), (222, 35), (180, 35)],
+                            "USD",
+                            0.90,
+                        ),
+                        (
+                            [(232, 20), (282, 20), (282, 35), (232, 35)],
+                            "5/kg",
+                            0.89,
+                        ),
+                    ],
+                    None,
+                )
 
-        class FakePytesseractModule:
-            tesseract_cmd = ""
+        fake_module = types.SimpleNamespace(RapidOCR=lambda: FakeRapidOCR())
 
-        def fake_image_to_osd(*args, **kwargs):
-            return "Rotate: 0\n"
-
-        def fake_image_to_data(*args, **kwargs):
-            captured.update(kwargs)
-            return {
-                "text": ["Vitamin", "C", "USD", "5/kg"],
-                "conf": ["92", "91", "90", "89"],
-                "left": [10, 82, 180, 232],
-                "top": [20, 20, 20, 20],
-                "width": [65, 18, 42, 50],
-                "height": [15, 15, 15, 15],
-                "block_num": [1, 1, 1, 1],
-                "par_num": [1, 1, 1, 1],
-                "line_num": [1, 1, 1, 1],
-            }
-
-        fake_module = types.SimpleNamespace(
-            Output=types.SimpleNamespace(DICT="dict"),
-            pytesseract=FakePytesseractModule(),
-            image_to_osd=fake_image_to_osd,
-            image_to_data=fake_image_to_data,
-        )
-
-        with patch.dict(sys.modules, {"pytesseract": fake_module}):
+        with patch.dict(sys.modules, {"rapidocr_onnxruntime": fake_module}):
+            if hasattr(ocr.recognize_image, "_rapidocr_engine"):
+                delattr(ocr.recognize_image, "_rapidocr_engine")
             lines = ocr.recognize_image(Image.new("RGB", (320, 120), "white"), "sample.png")
 
         self.assertEqual([line.text for line in lines], ["Vitamin", "C", "USD", "5/kg"])
-        self.assertEqual(captured["lang"], "eng")
-        self.assertIn("--oem 1", captured["config"])
-        self.assertIn("--psm 6", captured["config"])
-        self.assertIn("preserve_interword_spaces=1", captured["config"])
-        self.assertIn("textord_tablefind_recognize_tables=1", captured["config"])
 
 
 if __name__ == "__main__":

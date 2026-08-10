@@ -45,7 +45,7 @@ class PdfInspectorExtractionTest(unittest.TestCase):
 
         def fake_ocr(path, pages=None):
             captured["pages"] = pages
-            return "[TESSERACT OCR]\nScanned page text"
+            return "[RAPIDOCR OCR]\nScanned page text"
 
         with patch.object(pdf_extract, "_extract_with_ocr", fake_ocr):
             text = pdf_extract.extract_pdf_text(Path("mixed.pdf"))
@@ -69,7 +69,7 @@ class PdfInspectorExtractionTest(unittest.TestCase):
 
         def fake_ocr(path, pages=None):
             captured["pages"] = pages
-            return "[TESSERACT OCR]\nScanned document text"
+            return "[RAPIDOCR OCR]\nScanned document text"
 
         with patch.object(pdf_extract, "_extract_with_ocr", fake_ocr):
             text = pdf_extract.extract_pdf_text(Path("scan.pdf"))
@@ -77,6 +77,16 @@ class PdfInspectorExtractionTest(unittest.TestCase):
         self.assertIsNone(captured["pages"])
         self.assertIn("Scanned document text", text)
 
+    def test_gmft_extraction_included_in_output(self) -> None:
+        with patch.object(pdf_extract, "_extract_with_gmft", return_value="[GMFT TABLE MARKDOWN Page 1 Table 1]\n| Ingredient | Price |\n| --- | --- |\n| Paracetamol | 10 USD |"):
+            with patch.object(pdf_extract, "_extract_with_pdf_inspector", return_value=None):
+                with patch.object(pdf_extract, "_extract_with_ocr", return_value=""):
+                    text = pdf_extract.extract_pdf_text(Path("catalogue.pdf"))
+
+        self.assertIn("[GMFT TABLE MARKDOWN Page 1 Table 1]", text)
+        self.assertIn("Paracetamol | 10 USD", text)
+
 
 if __name__ == "__main__":
     unittest.main()
+

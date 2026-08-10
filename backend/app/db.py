@@ -181,3 +181,47 @@ def get_db() -> Iterator[Session]:
 
 def get_supabase() -> Client:
     return create_client(str(settings.supabase_url), settings.supabase_service_role_key)
+
+
+def ensure_supabase_storage_bucket(bucket_name: str | None = None) -> None:
+    bucket = (bucket_name or settings.supabase_storage_bucket or "").strip()
+    if not bucket:
+        return
+
+    supabase = get_supabase()
+    try:
+        supabase.storage.get_bucket(bucket)
+        return
+    except Exception as exc:
+        message = str(exc).lower()
+        if not any(term in message for term in ("not found", "nosuchbucket", "no such bucket", "404")):
+            logger.warning("Could not verify Supabase storage bucket %s before upload: %s", bucket, exc)
+
+    try:
+        supabase.storage.create_bucket(
+            bucket,
+            options={
+                "public": False,
+                "file_size_limit": "52428800",
+                "allowed_mime_types": [
+                    "application/pdf",
+                    "text/plain",
+                    "text/csv",
+                    "application/vnd.ms-excel",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "application/msword",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "image/png",
+                    "image/jpeg",
+                    "image/webp",
+                    "image/bmp",
+                    "image/tiff",
+                ],
+            },
+        )
+        logger.info("Created Supabase storage bucket %s", bucket)
+    except Exception as exc:
+        message = str(exc).lower()
+        if any(term in message for term in ("already exists", "duplicate", "23505")):
+            return
+        raise

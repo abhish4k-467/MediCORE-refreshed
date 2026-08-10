@@ -69,9 +69,18 @@ def test_extraction_chunks_are_sized_for_primary_groq_route() -> None:
 
     chunks = client._chunk_text(text)
 
-    assert EXTRACTION_CHUNK_CHARS == 50000
+    assert EXTRACTION_CHUNK_CHARS == 5000
     assert len(chunks) > 1
     assert all(len(chunk) <= EXTRACTION_CHUNK_CHARS + 1000 for chunk in chunks)
+
+
+def test_catalogue_extraction_prompt_stays_compact() -> None:
+    client = object.__new__(OpenRouterClient)
+    prompt = client._catalogue_extraction_system_prompt()
+
+    assert len(prompt) < 1600
+    assert "price_per_unit" in prompt
+    assert "available_qty" in prompt
 
 
 def test_model_router_raises_token_limit_for_rate_limit_exhaustion() -> None:
@@ -111,3 +120,25 @@ def test_json_chat_falls_back_when_primary_returns_invalid_json() -> None:
     payload = client._json_chat("Return JSON", "catalogue text")
 
     assert payload["items"][0]["ingredient_name"] == "Citric Acid"
+
+
+def test_catalogue_extraction_keeps_openrouter_fallback() -> None:
+    client = object.__new__(OpenRouterClient)
+    client.providers = [
+        ModelProviderConfig("groq", "groq-key", "groq-model", "https://groq.test"),
+        ModelProviderConfig("openrouter", "openrouter-key", "openrouter-model", "https://openrouter.test"),
+    ]
+    called = []
+
+    def fake_chat_with_provider(provider, messages, *, temperature=0, json_mode=False):
+        called.append(provider.name)
+        if provider.name == "groq":
+            raise RuntimeError("429 rate limit quota exhausted")
+        return '{"items":[{"ingredient_name":"L-Carnitine","price_per_unit":22.7,"currency":"USD","unit":"kg"}]}'
+
+    client._chat_with_provider = fake_chat_with_provider
+
+    items = client.extract_catalog_items("Price: USD22.7/kg for L-Carnitine")
+    assert called == ["groq", "openrouter"]
+    assert len(items) == 1
+    assert items[0].ingredient_name == "L-Carnitine"

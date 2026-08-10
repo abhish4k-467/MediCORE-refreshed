@@ -96,7 +96,7 @@ export default function LoginPage() {
       } else if (role === "admin") {
         router.push("/admin");
       } else {
-        router.push("/");
+        router.push("/employee");
       }
       router.refresh();
     } catch (err) {

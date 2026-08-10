@@ -24,6 +24,8 @@ dependencies = [
     "email-validator>=2.2.0",
     "python-dotenv>=1.2.2",
     "firecrawl-anydoc>=0.1.7",
+    "gmft>=0.3.0",
+    "rapidocr-onnxruntime>=1.4.4",
 ]
 
 [project.optional-dependencies]

@@ -37,33 +37,32 @@ def list_suppliers(
     settings = get_settings()
     try:
         user_uuid = UUID(current_user["tenant_id"])
-        stmt = (
-            select(
-                Supplier,
-                func.count(CatalogItem.id).label("item_count"),
-                func.max(CatalogEmail.received_at).label("last_catalog_at"),
-            )
-            .join(CatalogEmail, CatalogEmail.supplier_id == Supplier.id)
-            .join(CatalogItem, CatalogItem.catalog_email_id == CatalogEmail.id)
+        item_count_subq = (
+            select(func.count(CatalogItem.id))
             .where(
-                Supplier.tenant_id == user_uuid,
-                CatalogEmail.processing_status.in_(["completed", "partial", "partially_processed"]),
+                CatalogItem.supplier_id == Supplier.id,
                 CatalogItem.tenant_id == user_uuid,
             )
-            .group_by(
-                Supplier.id,
-                Supplier.tenant_id,
-                Supplier.name,
-                Supplier.email_domain,
-                Supplier.country,
-                Supplier.last_email_date,
-                Supplier.certifications,
-            )
+            .scalar_subquery()
         )
+        last_catalog_subq = (
+            select(func.max(CatalogEmail.received_at))
+            .where(
+                CatalogEmail.supplier_id == Supplier.id,
+                CatalogEmail.tenant_id == user_uuid,
+            )
+            .scalar_subquery()
+        )
+        stmt = select(
+            Supplier,
+            item_count_subq.label("item_count"),
+            last_catalog_subq.label("last_catalog_at"),
+        ).where(Supplier.tenant_id == user_uuid)
+
         if not settings.mock_data_enabled:
             stmt = stmt.where(Supplier.email_domain.not_like("%.example"))
-            stmt = stmt.where(CatalogEmail.raw_email_id.not_like("core-mock-catalog-%"))
-        rows = db.execute(stmt.order_by(func.max(CatalogEmail.received_at).desc().nullslast()))
+
+        rows = db.execute(stmt.order_by(Supplier.name.asc()))
         return [
             {
                 "id": str(row.id),

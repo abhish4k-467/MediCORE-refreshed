@@ -1,11 +1,7 @@
 import logging
-import os
-import re
 from dataclasses import dataclass
 from typing import Any
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
-
-from backend.app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -39,95 +35,55 @@ def preprocess_document_image(image: Image.Image, *, scale_small_images: bool = 
     return gray.convert("RGB")
 
 
+def _words_from_rapidocr_result(result: Any) -> list[OCRTextLine]:
+    if not result:
+        return []
+    words: list[OCRTextLine] = []
+    for item in result:
+        if not item or len(item) < 3:
+            continue
+        box_points, text, conf = item[0], str(item[1] or "").strip(), float(item[2] or 0.0)
+        if not text or conf < 0.15:
+            continue
+        xs = [float(pt[0]) for pt in box_points]
+        ys = [float(pt[1]) for pt in box_points]
+        left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+        words.append(OCRTextLine(text, conf, (left, top, right, bottom)))
+    return sorted(words, key=lambda line: (line.center_y, line.center_x))
+
+
 def recognize_image(image: Image.Image, source_name: str = "image", *, preprocess: bool = True) -> list[OCRTextLine]:
     prepared = preprocess_document_image(image) if preprocess else ImageOps.exif_transpose(image).convert("RGB")
-    prepared = _correct_orientation(prepared, source_name)
+
     try:
-        import pytesseract
-        from pytesseract import Output
-    except ImportError as exc:  # pragma: no cover - environment dependency
-        raise RuntimeError("pytesseract is not installed; OCR cannot run.") from exc
+        from rapidocr_onnxruntime import RapidOCR
+        import numpy as np
 
-    settings = get_settings()
-    if settings.tesseract_cmd:
-        pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
+        if not hasattr(recognize_image, "_rapidocr_engine"):
+            setattr(recognize_image, "_rapidocr_engine", RapidOCR())
+        engine = getattr(recognize_image, "_rapidocr_engine")
+        np_img = np.array(prepared)
+        result, _ = engine(np_img)
+        lines = _words_from_rapidocr_result(result)
+        if lines:
+            logger.info("RapidOCR recognized %s text line(s) from %s", len(lines), source_name)
+            return lines
+    except Exception as rapid_err:
+        logger.debug("RapidOCR failed for %s: %s", source_name, rapid_err)
 
-    config = _tesseract_config(settings.tesseract_psm)
-    try:
-        data = pytesseract.image_to_data(
-            prepared,
-            lang=settings.tesseract_lang,
-            config=config,
-            output_type=Output.DICT,
-        )
-    except Exception:
-        logger.warning("Tesseract OCR failed for %s", source_name, exc_info=True)
-        return []
-
-    lines = _words_from_tesseract_data(data)
-    logger.info("Tesseract OCR recognized %s text line(s) from %s", len(lines), source_name)
-    return lines
+    logger.warning("RapidOCR returned 0 lines for %s", source_name)
+    return []
 
 
 def recognize_image_to_text(image: Image.Image, source_name: str = "image") -> str:
     lines = recognize_image(image, source_name)
-    rows = _cluster_lines_by_y(lines)
-    return "\n".join(" ".join(line.text for line in row).strip() for row in rows if row).strip()
+    if lines:
+        rows = _cluster_lines_by_y(lines)
+        text = "\n".join(" ".join(line.text for line in row).strip() for row in rows if row).strip()
+        if text:
+            return text
 
-
-def _correct_orientation(image: Image.Image, source_name: str) -> Image.Image:
-    settings = get_settings()
-    if not settings.tesseract_enable_osd:
-        return image
-    try:
-        import pytesseract
-
-        if settings.tesseract_cmd:
-            pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
-        osd = pytesseract.image_to_osd(image, lang=settings.tesseract_osd_lang)
-        match = re.search(r"Rotate:\s*(\d+)", osd)
-        angle = int(match.group(1)) if match else 0
-        if angle:
-            logger.info("Tesseract OSD rotating %s by %s degrees", source_name, angle)
-            return image.rotate(-angle, expand=True)
-    except Exception:
-        logger.debug("Tesseract OSD orientation check failed for %s; using original orientation", source_name, exc_info=True)
-    return image
-
-
-def _tesseract_config(psm: int) -> str:
-    return " ".join(
-        [
-            "--oem 1",
-            f"--psm {psm}",
-            "-c preserve_interword_spaces=1",
-            "-c textord_tablefind_recognize_tables=1",
-            "-c textord_tabfind_find_tables=1",
-        ]
-    )
-
-
-def _words_from_tesseract_data(data: dict[str, list[Any]]) -> list[OCRTextLine]:
-    words: list[OCRTextLine] = []
-    total = len(data.get("text", []))
-    for index in range(total):
-        text = str(data["text"][index] or "").strip()
-        if not text:
-            continue
-        try:
-            conf = float(data["conf"][index])
-        except (TypeError, ValueError):
-            conf = -1.0
-        if conf < 0:
-            continue
-        left = float(data["left"][index])
-        top = float(data["top"][index])
-        right = left + float(data["width"][index])
-        bottom = top + float(data["height"][index])
-        words.append(OCRTextLine(text, conf, (left, top, right, bottom)))
-
-    return sorted(words, key=lambda line: (line.center_y, line.center_x))
-
+    return ""
 
 def _cluster_lines_by_y(lines: list[OCRTextLine]) -> list[list[OCRTextLine]]:
     rows: list[list[OCRTextLine]] = []

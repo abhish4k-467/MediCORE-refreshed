@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 @celery_app.task(name="backend.app.tasks.poll_inbox")
-def poll_inbox() -> dict:
+def poll_inbox(force: bool = False, retry_skipped: bool = False) -> dict:
     from datetime import datetime, UTC
     from backend.app.models import EmailAccount, EmailSyncSetting, Profile
     logger.info("Starting batch scheduled IMAP inbox poll task")
@@ -51,9 +51,13 @@ def poll_inbox() -> dict:
                 if diff_seconds >= (interval * 60):
                     should_sync = True
 
-            if should_sync:
-                logger.info("Account %s is due for sync (interval=%s min)", account.email_address, interval)
-                processed_total += service.poll_account_inbox(account.id)
+            if should_sync or force:
+                reason = "forced manual sync" if force and not should_sync else f"due for sync (interval={interval} min)"
+                logger.info("Account %s is %s", account.email_address, reason)
+                processed_total += service.poll_account_inbox(
+                    account.id,
+                    retry_skipped=retry_skipped,
+                )
 
     logger.info("Finished batch IMAP inbox poll task; checked=%s processed total=%s", checked_total, processed_total)
     return {"checked": checked_total, "processed": processed_total}

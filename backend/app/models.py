@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -11,6 +11,9 @@ from backend.app.db import Base
 
 class Supplier(Base):
     __tablename__ = "suppliers"
+    __table_args__ = (
+        Index("idx_suppliers_tenant_email_domain", "tenant_id", "email_domain"),
+    )
 
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
     tenant_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), index=True)
@@ -25,7 +28,12 @@ class Supplier(Base):
 
 class CatalogEmail(Base):
     __tablename__ = "catalog_emails"
-    __table_args__ = (UniqueConstraint("tenant_id", "raw_email_id", name="uq_catalog_emails_tenant_raw_email_id"),)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "raw_email_id", name="uq_catalog_emails_tenant_raw_email_id"),
+        Index("idx_catalog_emails_tenant_received", "tenant_id", "received_at"),
+        Index("idx_catalog_emails_supplier_id", "supplier_id"),
+        Index("idx_catalog_emails_status", "tenant_id", "processing_status"),
+    )
 
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
     tenant_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), index=True)
@@ -43,6 +51,11 @@ class CatalogEmail(Base):
 
 class CatalogItem(Base):
     __tablename__ = "catalog_items"
+    __table_args__ = (
+        Index("idx_catalog_items_catalog_email_id", "catalog_email_id"),
+        Index("idx_catalog_items_tenant_supplier", "tenant_id", "supplier_id"),
+        Index("idx_catalog_items_ingredient", "tenant_id", "ingredient_name"),
+    )
 
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
     tenant_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), index=True)
@@ -61,6 +74,9 @@ class CatalogItem(Base):
 
 class Profile(Base):
     __tablename__ = "profiles"
+    __table_args__ = (
+        Index("idx_profiles_tenant_id", "tenant_id"),
+    )
 
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
     full_name: Mapped[str | None] = mapped_column(Text)
@@ -73,6 +89,9 @@ class Profile(Base):
 
 class EmailAccount(Base):
     __tablename__ = "email_accounts"
+    __table_args__ = (
+        Index("idx_email_accounts_user_id", "user_id"),
+    )
 
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)

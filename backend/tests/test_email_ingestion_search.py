@@ -3,6 +3,7 @@ from email.message import EmailMessage
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+from backend.app.models import CatalogItem
 from backend.app.schemas import ExtractedCatalogItem
 from backend.app.services.catalog_table_parser import parse_catalog_table_text
 from backend.app.services.country_detection import detect_supplier_country
@@ -131,6 +132,20 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         self.assertEqual(body, "Bharath R shared a post: Can someone please refer me?")
         self.assertEqual(preview, "Bharath R shared a post: Can someone please refer me?")
 
+    def test_email_body_cleaning_keeps_thank_you_offer_content_before_signature(self) -> None:
+        body = self.service._clean_email_body(
+            "Dear Mr.Karim,\n\n"
+            "Thank you for your interest in our L-Carnitine.\n\n"
+            "Please find our offer below:\n\n"
+            "Price: USD22.7/kg CIF by sea\n\n"
+            "The COA is attached for your reference.\n"
+            "Best regards,\nSupplier\n"
+        )
+
+        self.assertIn("Thank you for your interest in our L-Carnitine.", body)
+        self.assertIn("Price: USD22.7/kg CIF by sea", body)
+        self.assertNotIn("Best regards", body)
+
     def test_item_identity_uses_ingredient_and_specification_only(self) -> None:
         previous = SimpleNamespace(
             ingredient_name="Ashwagandha Extract",
@@ -165,6 +180,74 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         self.assertEqual(updates["currency"], "USD")
         self.assertEqual(updates["moq"], 25.0)
         self.assertEqual(updates["lead_time_days"], 14)
+
+    def test_commercial_reply_update_extracts_inline_usd_cif_price(self) -> None:
+        updates = self.service._commercial_updates_from_text(
+            "Please find our offer below:\n\nPrice: USD22.7/kg CIF by sea\n\nThe COA is attached."
+        )
+
+        self.assertEqual(updates["price_per_unit"], 22.7)
+        self.assertEqual(updates["currency"], "USD")
+
+    def test_thread_reply_update_matches_recent_supplier_item_mentioned_in_body(self) -> None:
+        tenant_id = "tenant-id"
+        supplier = SimpleNamespace(id="supplier-id", email_domain="supplier.example")
+        previous_item = SimpleNamespace(
+            id="item-id",
+            tenant_id=tenant_id,
+            supplier_id=supplier.id,
+            catalog_email_id="previous-email-id",
+            ingredient_name="L-Carnitine",
+            price_per_unit=25.0,
+            currency="USD",
+            moq=None,
+            lead_time_days=None,
+            raw_payload={},
+        )
+        catalog_email = SimpleNamespace(
+            id="current-email-id",
+            tenant_id=tenant_id,
+            supplier_id=supplier.id,
+            subject="Offer",
+            raw_email_id="email-id",
+            received_at=datetime(2026, 8, 9, tzinfo=UTC),
+        )
+
+        class FakeQuery:
+            def __init__(self, *models):
+                self.models = models
+
+            def join(self, *args, **kwargs):
+                return self
+
+            def filter(self, *args, **kwargs):
+                return self
+
+            def order_by(self, *args, **kwargs):
+                return self
+
+            def limit(self, *args, **kwargs):
+                return self
+
+            def all(self):
+                if self.models and self.models[0] is CatalogItem:
+                    return [previous_item]
+                return []
+
+        service = object.__new__(EmailIngestionService)
+        service.db = SimpleNamespace(query=lambda *models: FakeQuery(*models), add=lambda item: None)
+
+        updated = service._apply_thread_reply_update(
+            catalog_email,
+            supplier,
+            "Thank you for your interest in our L-Carnitine.\nPrice: USD22.7/kg CIF by sea",
+            tenant_id,
+        )
+
+        self.assertEqual(updated, 1)
+        self.assertEqual(previous_item.price_per_unit, 22.7)
+        self.assertEqual(previous_item.catalog_email_id, "current-email-id")
+        self.assertTrue(previous_item.raw_payload["conversation_update"])
 
     def test_parser_preserves_lead_time_range_text(self) -> None:
         rows = parse_catalog_table_text(
@@ -319,6 +402,19 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         self.assertEqual(rows[0].currency, "USD")
         self.assertEqual(rows[0].unit, "kg")
         self.assertIn("original_price=$6/kg", rows[0].notes or "")
+
+    def test_email_body_direct_price_sentence_extracts_catalogue_item_with_moq(self) -> None:
+        rows = parse_catalog_table_text(
+            "Price of Ashwagandha 20% Content is $60/kg with MOQ 20kg"
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].ingredient_name, "Ashwagandha")
+        self.assertEqual(rows[0].specification, "20% Content")
+        self.assertEqual(rows[0].price_per_unit, 60.0)
+        self.assertEqual(rows[0].currency, "USD")
+        self.assertEqual(rows[0].unit, "kg")
+        self.assertEqual(rows[0].moq, 20.0)
 
     def test_product_code_column_is_not_mapped_as_ingredient_name(self) -> None:
         rows = parse_catalog_table_text(
@@ -980,11 +1076,42 @@ class EmailIngestionSearchCriteriaTest(unittest.TestCase):
         self.assertEqual(certificate.material_hint, "Vitamin C USP 99%")
         self.assertEqual(other.category, OTHER)
 
+    def test_document_classifier_treats_product_specification_brochure_page_as_catalogue(self) -> None:
+        document = classify_document(
+            "sample 3-2.pdf",
+            ".pdf",
+            "Used For Sports Nutrition\n"
+            "Product Name        Specification\n"
+            "Beta Alanine        All Grade\n"
+            "BCAA Instantized    Vegan; 2:1:1; 4:1:1; 8:1:1\n"
+            "Creatine Monohydrate        99%\n"
+            "HMB Calcium        98%\n"
+            "L-Citrulline Malate        99%\n"
+            "Used For Dietary Supplements\n"
+            "Product Name        Specification\n"
+            "Quercetin        95% HPLC\n"
+            "Rutin        NF II Grade\n"
+            "Black Ginger Extract        5,7 Dimethoxyflavone\n"
+            "Turmeric Extract        Total curcuminoids 5%-95% HPLC\n"
+            "OEM Services(Hard Capsules,Tablets & Soft Gels Form)",
+        )
+
+        self.assertEqual(document.category, CATALOGUE)
+
     def test_document_classifier_treats_body_price_update_as_catalogue(self) -> None:
         result = classify_document(
             "email_body.txt",
             ".txt",
             "hi abhishek,\n\nthe price of Zinc Sulfate is updated to $6/kg.\n\nthanks,\nPrince",
+        )
+
+        self.assertEqual(result.category, CATALOGUE)
+
+    def test_document_classifier_treats_body_direct_price_as_catalogue(self) -> None:
+        result = classify_document(
+            "email_body.txt",
+            ".txt",
+            "Price of Ashwagandha 20% Content is $60/kg with MOQ 20kg",
         )
 
         self.assertEqual(result.category, CATALOGUE)

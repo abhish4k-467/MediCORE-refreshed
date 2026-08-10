@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
@@ -12,9 +13,13 @@ from backend.app.schemas import ExtractedCatalogItem, QueryPlan
 
 logger = logging.getLogger(__name__)
 
-MAX_EXTRACTION_CONTEXT_CHARS = 50000
-EXTRACTION_CHUNK_CHARS = 12000
-EXTRACTION_CHUNK_OVERLAP_LINES = 4
+MAX_EXTRACTION_CONTEXT_CHARS = 30000
+EXTRACTION_CHUNK_CHARS = 5000
+EXTRACTION_CHUNK_OVERLAP_LINES = 2
+LLM_ERROR_BODY_PREVIEW_CHARS = 500
+LLM_RESPONSE_PREVIEW_CHARS = 500
+LLM_RESPONSE_MAX_BYTES = 2_000_000
+LLM_RESPONSE_WALL_TIMEOUT_SECONDS = 75
 
 
 class TokenLimitReachedError(RuntimeError):
@@ -57,7 +62,7 @@ class ModelRouterClient:
                 model=settings.groq_model,
                 base_url=settings.groq_base_url.rstrip("/"),
                 max_tokens_field="max_completion_tokens",
-                max_output_tokens=4000,
+                max_output_tokens=1200,
             ),
             ModelProviderConfig(
                 name="openrouter",
@@ -65,7 +70,7 @@ class ModelRouterClient:
                 model=settings.openrouter_model,
                 base_url=settings.openrouter_base_url.rstrip("/"),
                 max_tokens_field="max_tokens",
-                max_output_tokens=8000,
+                max_output_tokens=1500,
                 site_url=settings.openrouter_site_url or settings.frontend_origin,
                 app_name=settings.openrouter_app_name or settings.app_name,
             ),
@@ -78,6 +83,7 @@ class ModelRouterClient:
         headers = {
             "Authorization": f"Bearer {provider.api_key}",
             "Content-Type": "application/json",
+            "Connection": "close",
         }
         if provider.site_url:
             headers["HTTP-Referer"] = provider.site_url
@@ -85,10 +91,30 @@ class ModelRouterClient:
             headers["X-Title"] = provider.app_name
         return headers
 
+    def _messages_char_count(self, messages: list[dict[str, Any]]) -> int:
+        total = 0
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, str):
+                total += len(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        for value in part.values():
+                            if isinstance(value, str):
+                                total += len(value)
+                            elif isinstance(value, dict):
+                                total += sum(len(str(nested)) for nested in value.values())
+                    else:
+                        total += len(str(part))
+            elif content is not None:
+                total += len(str(content))
+        return total
+
     def _chat_with_provider(
         self,
         provider: ModelProviderConfig,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         temperature: float = 0,
         json_mode: bool = False,
@@ -102,15 +128,77 @@ class ModelRouterClient:
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
 
-        with httpx.Client(timeout=90) as client:
-            response = client.post(
+        input_chars = self._messages_char_count(messages)
+        estimated_input_tokens = max(1, int(input_chars / 4))
+        logger.info(
+            "LLM request provider=%s model=%s messages=%s input_chars=%s estimated_input_tokens=%s max_output_tokens=%s json_mode=%s",
+            provider.name,
+            provider.model,
+            len(messages),
+            input_chars,
+            estimated_input_tokens,
+            provider.max_output_tokens,
+            json_mode,
+        )
+        timeout = httpx.Timeout(90.0, connect=20.0, read=45.0, write=30.0, pool=10.0)
+        with httpx.Client(timeout=timeout) as client:
+            with client.stream(
+                "POST",
                 f"{provider.base_url}/chat/completions",
                 headers=self._headers(provider),
                 json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
-        return data["choices"][0]["message"].get("content") or ""
+            ) as response:
+                logger.info(
+                    "LLM response headers provider=%s status=%s content_length=%s",
+                    provider.name,
+                    response.status_code,
+                    response.headers.get("content-length", "unknown"),
+                )
+                body = self._read_llm_response_body(response)
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError:
+                    logger.warning(
+                        "LLM provider=%s failed status=%s input_chars=%s response=%s",
+                        provider.name,
+                        response.status_code,
+                        input_chars,
+                        body.decode("utf-8", errors="replace")[:LLM_ERROR_BODY_PREVIEW_CHARS],
+                    )
+                    raise
+            logger.info("LLM response received provider=%s status=%s response_bytes=%s", provider.name, response.status_code, len(body))
+            data = json.loads(body.decode("utf-8", errors="replace"))
+        content = data["choices"][0]["message"].get("content") or ""
+        logger.info(
+            "LLM content decoded provider=%s output_chars=%s preview=%s",
+            provider.name,
+            len(content),
+            content[:LLM_RESPONSE_PREVIEW_CHARS].replace("\n", " "),
+        )
+        return content
+
+    def _read_llm_response_body(self, response: httpx.Response) -> bytes:
+        chunks: list[bytes] = []
+        total = 0
+        started_at = time.monotonic()
+        for chunk in response.iter_bytes():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if len(chunks) == 0:
+                logger.info("LLM response body started provider_status=%s first_chunk_bytes=%s", response.status_code, len(chunk))
+            if total > LLM_RESPONSE_MAX_BYTES:
+                raise RuntimeError(f"LLM response exceeded {LLM_RESPONSE_MAX_BYTES} bytes")
+            chunks.append(chunk)
+            body = b"".join(chunks)
+            try:
+                json.loads(body.decode("utf-8", errors="strict"))
+                return body
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+            if time.monotonic() - started_at > LLM_RESPONSE_WALL_TIMEOUT_SECONDS:
+                raise TimeoutError(f"LLM response body did not complete within {LLM_RESPONSE_WALL_TIMEOUT_SECONDS} seconds")
+        return b"".join(chunks)
 
     def _chat(
         self,
@@ -119,10 +207,14 @@ class ModelRouterClient:
         temperature: float = 0,
         json_mode: bool = False,
         validate: Callable[[str], None] | None = None,
+        provider_names: tuple[str, ...] | None = None,
     ) -> str:
         providers = self._available_providers()
+        if provider_names is not None:
+            allowed = set(provider_names)
+            providers = [provider for provider in providers if provider.name in allowed]
         if not providers:
-            raise ValueError("GROQ_API_KEY or OPENROUTER_API_KEY is required for LLM processing.")
+            raise ValueError("No configured LLM provider is available for this operation.")
 
         last_error: Exception | None = None
         token_limit_seen = False
@@ -135,9 +227,13 @@ class ModelRouterClient:
                     json_mode=json_mode,
                 )
                 if validate:
+                    logger.info("Validating LLM response provider=%s", provider.name)
                     validate(content)
+                    logger.info("Validated LLM response provider=%s", provider.name)
                 if provider.name != providers[0].name:
                     logger.info("LLM request completed with fallback provider=%s", provider.name)
+                else:
+                    logger.info("LLM request completed provider=%s", provider.name)
                 return content
             except Exception as exc:
                 last_error = exc
@@ -149,7 +245,7 @@ class ModelRouterClient:
             raise TokenLimitReachedError("Token Limit Reached") from last_error
         raise last_error
 
-    def _json_chat(self, system: str, user: str) -> dict[str, Any]:
+    def _json_chat(self, system: str, user: str, *, provider_names: tuple[str, ...] | None = None) -> dict[str, Any]:
         parsed_payload: dict[str, Any] | None = None
 
         def validate_json(content: str) -> None:
@@ -164,6 +260,7 @@ class ModelRouterClient:
             temperature=0,
             json_mode=True,
             validate=validate_json,
+            provider_names=provider_names,
         )
         return parsed_payload or self._parse_json_response(content)
 
@@ -358,6 +455,7 @@ class ModelRouterClient:
             "8. OCR Robustness: Correct obvious OCR confusions only when context is clear, e.g. O/0 in numbers, l/1 in quantities, broken table spacing. "
             "If a row is ambiguous, omit that row instead of guessing."
         )
+        system = self._catalogue_extraction_system_prompt(reference_date)
         payload = self._json_chat(system, pdf_text)
         extracted = []
         for item in payload.get("items", []):
@@ -366,6 +464,25 @@ class ModelRouterClient:
             except Exception as e:
                 logger.warning("Skipping invalid catalog item: %s. Error: %s", item, e)
         return extracted
+
+    def _catalogue_extraction_system_prompt(self, reference_date: datetime | None = None) -> str:
+        date_context = ""
+        if reference_date:
+            date_context = f" Reference date: {reference_date.strftime('%Y-%m-%d')}; resolve relative validity dates from it."
+        return (
+            "Extract supplier catalogue items from the user text. Return only minified JSON: "
+            "{\"items\":[{ingredient_name,specification,price_per_unit,currency,available_qty,unit,valid_until,lead_time_days,lead_time_text,moq,notes}]}.\n"
+            "Use null for missing values; no markdown; no guessed data. Extract every visible product and price tier. "
+            "ingredient_name is product/material name. specification is grade, purity, assay, content, CAS, or row description. "
+            "price_per_unit is numeric price only from price/rate text or columns; never use quantity as price. "
+            "currency: $/USD=USD, Rs/INR=INR, EUR=EUR, GBP=GBP. Do not convert currency or units. "
+            "available_qty is stock/quantity from Qty/Quantity columns. unit is kg/g/mg/l/ml/bag/pack/drum/etc. "
+            "moq is numeric minimum order quantity. lead_time_days only for one exact lead time; put ranges in lead_time_text. "
+            "valid_until is ISO date only when stated. Put source phrase, Incoterms, packing, origin, and original price strings in notes. "
+            "For tables, obey headers: quantity columns are not prices, and price columns are not quantities. "
+            "For emails, map product, price, MOQ, quantity, and terms from conversation text."
+            f"{date_context}"
+        )
 
     def _chunk_text(self, text: str) -> list[str]:
         normalized = text.strip()
@@ -377,7 +494,7 @@ class ModelRouterClient:
         lines = normalized.splitlines()
         header_lines: list[str] = []
         for line in lines[:20]:
-            if line.startswith(("Sheet:", "[EXCEL TABLE]", "[CSV TABLE]", "[PDF INSPECTOR MARKDOWN]", "[TESSERACT TABLE OCR]")) or "," in line or "|" in line or "\t" in line:
+            if line.startswith(("Sheet:", "[EXCEL TABLE]", "[CSV TABLE]", "[PDF INSPECTOR MARKDOWN]", "[RAPIDOCR TABLE OCR]")) or "," in line or "|" in line or "\t" in line:
                 header_lines.append(line)
                 if len(header_lines) >= 2:
                     break
@@ -520,7 +637,6 @@ class ModelRouterClient:
         if not name:
             return None
         return f"{name} (U)" if row.get("is_updated") else str(name)
-
 
 class OpenRouterClient(ModelRouterClient):
     """Backward-compatible name for the routed LLM client."""

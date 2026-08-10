@@ -47,6 +47,7 @@ type ChatMessage = {
 type CertificatePdf = {
   name: string;
   url: string;
+  storage_path?: string | null;
   type?: string | null;
 };
 
@@ -264,7 +265,7 @@ function inboxStatusTone(status: string | null | undefined, itemCount: number): 
   if (normalized === "empty" || normalized.startsWith("skipped") || normalized.startsWith("ignored")) {
     return "skipped";
   }
-  if (normalized === "completed" || itemCount > 0) {
+  if (normalized === "completed" || normalized === "certificate" || itemCount > 0) {
     return "processed";
   }
   return "pending";
@@ -283,6 +284,9 @@ function inboxStatusLabel(status: string | null | undefined, itemCount: number):
   }
   if (normalized === "processing" || normalized === "queued") {
     return "Processing";
+  }
+  if (normalized === "certificate") {
+    return "Certificate Processed";
   }
   if (normalized === "completed" || itemCount > 0) {
     return "Processed";
@@ -358,7 +362,7 @@ function syncEventFromEmail(email: CatalogEmailRow, observedAt?: number): SyncAc
       timestamp,
     };
   }
-  if (status === "completed" || status === "partial" || itemCount > 0) {
+  if (status === "completed" || status === "partial" || status === "certificate" || itemCount > 0) {
     return {
       id: `email-${email.id}`,
       emailId: email.id,
@@ -381,10 +385,13 @@ function syncEventFromEmail(email: CatalogEmailRow, observedAt?: number): SyncAc
 
 function isProcurementCatalogEmail(email: CatalogEmailRow): boolean {
   const status = normalizedProcessingStatus(email.processing_status);
+  if (status === "certificate") {
+    return false;
+  }
   const hasUsableItems = Number(email.item_count || 0) > 0;
   const isSuccessfulProcurementStatus =
     status === "completed" || status === "partial" || status === "partially_processed";
-  return isSuccessfulProcurementStatus && hasUsableItems;
+  return isSuccessfulProcurementStatus || hasUsableItems;
 }
 
 function getBasePrice(price: number, currency: string): number {
@@ -604,10 +611,18 @@ function certificatePdfs(row: Pick<SupplierItem, "certificate_pdfs"> | Record<st
   const values = (row as { certificate_pdfs?: unknown }).certificate_pdfs;
   if (!Array.isArray(values)) return [];
   return values
-    .filter((item): item is CertificatePdf => Boolean(item && typeof item === "object" && typeof (item as CertificatePdf).url === "string" && (item as CertificatePdf).url))
+    .filter((item): item is CertificatePdf => Boolean(
+      item
+      && typeof item === "object"
+      && (
+        (typeof (item as CertificatePdf).url === "string" && (item as CertificatePdf).url)
+        || (typeof (item as CertificatePdf).storage_path === "string" && (item as CertificatePdf).storage_path)
+      )
+    ))
     .map((item) => ({
       name: item.name || "Certificate PDF",
-      url: item.url,
+      url: item.url || "",
+      storage_path: item.storage_path || null,
       type: item.type || "Certificate",
     }));
 }
@@ -964,13 +979,15 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   const chatMessagesEndRef = useRef<HTMLDivElement | null>(null);
   const supplierCountryFilterRef = useRef<HTMLDivElement | null>(null);
   const syncActivityListRef = useRef<HTMLDivElement | null>(null);
-  const dataLoadInFlightRef = useRef(false);
+  const supplierRowsRequestIdRef = useRef(0);
+  const inboxItemsRequestIdRef = useRef(0);
   const completedSyncRefreshRef = useRef<string | null>(null);
   const syncEmailBaselineRef = useRef<Map<string, string>>(new Map());
   const syncEmailObservedRef = useRef<Map<string, string>>(new Map());
 
   // Initial load tracking ref
   const initialLoadRef = useRef(false);
+  const profileFetchedRef = useRef(false);
 
   useEffect(() => {
     if (syncSettings) {
@@ -1095,7 +1112,11 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       }
     }
 
-    return catalogEmails.map((email) => {
+    return catalogEmails
+      // The API omits these as well, but keep the Inbox clean during a rolling
+      // deployment or when it receives cached certificate-only records.
+      .filter((email) => normalizedProcessingStatus(email.processing_status) !== "certificate")
+      .map((email) => {
       const items = inboxItemsByEmail[email.id] ?? itemsByEmail.get(email.id) ?? [];
       const sortedItems = [...items].sort((left, right) => displayItemName(left).localeCompare(displayItemName(right)));
       const meta = supplierMeta.get(supplierKey(email.supplier_name, email.email_domain));
@@ -1124,7 +1145,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         body_preview: email.body_preview,
         subject: email.subject
       };
-    }).sort((left, right) => {
+      }).sort((left, right) => {
       const leftTime = new Date(left.received_at ?? 0).getTime();
       const rightTime = new Date(right.received_at ?? 0).getTime();
       return rightTime - leftTime;
@@ -1326,11 +1347,31 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     );
   };
 
+  const openCertificatePdf = async (pdf: CertificatePdf) => {
+    if (pdf.storage_path) {
+      try {
+        const response = await authFetch(`${apiBaseUrl}/api/catalogs/certificate-url?storage_path=${encodeURIComponent(pdf.storage_path)}`);
+        if (response.ok) {
+          const payload: { url?: string } = await response.json();
+          if (payload.url) {
+            window.open(payload.url, "_blank", "noopener,noreferrer");
+            return;
+          }
+        }
+      } catch (error) {
+        console.warn("Could not open signed certificate URL", error);
+      }
+    }
+    if (pdf.url) {
+      window.open(pdf.url, "_blank", "noopener,noreferrer");
+    }
+  };
+
   const openCertificatePdfs = (row: Pick<SupplierItem, "certificate_pdfs"> | Record<string, unknown>) => {
     const pdfs = certificatePdfs(row);
     if (pdfs.length === 0) return;
     if (pdfs.length === 1) {
-      window.open(pdfs[0].url, "_blank", "noopener,noreferrer");
+      void openCertificatePdf(pdfs[0]);
       return;
     }
     setCertificateModalItems(pdfs);
@@ -1341,7 +1382,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     if (pdfs.length > 0) {
       return (
         <button className="certificate-view-button" type="button" onClick={() => openCertificatePdfs(row)}>
-          View
+          View Certificate
         </button>
       );
     }
@@ -1512,6 +1553,8 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     if (typeof window === "undefined") return;
 
     const loadProfileDetails = async (sessionToken: string) => {
+      if (profileFetchedRef.current) return;
+      profileFetchedRef.current = true;
       try {
         const res = await fetch(`${apiBaseUrl}/api/profile`, {
           headers: {
@@ -1520,11 +1563,17 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
         });
         if (res.ok) {
           const profileData = await res.json();
-          setAuthUser(prev => prev ? {
-            ...prev,
-            name: profileData.full_name,
-            organisation: profileData.organisation
-          } : null);
+          setAuthUser(prev => {
+            if (!prev) return null;
+            if (prev.name === profileData.full_name && prev.organisation === profileData.organisation) {
+              return prev;
+            }
+            return {
+              ...prev,
+              name: profileData.full_name,
+              organisation: profileData.organisation
+            };
+          });
         }
       } catch (err) {
         console.error("Failed to load profile details:", err);
@@ -1677,7 +1726,7 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
     if (authChecked && authUser) {
       checkEmailAccountOnboarding();
     }
-  }, [authUser, authChecked, apiBaseUrl, router]);
+  }, [authUser?.email, authChecked, apiBaseUrl, router]);
 
   useEffect(() => {
     if (!selectedInboxThreadId && inboxThreads[0]) {
@@ -1697,39 +1746,35 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       return;
     }
 
-    let cancelled = false;
     const emailId = selectedEmailId;
+    const reqId = ++inboxItemsRequestIdRef.current;
     setInboxItemsLoadingId(emailId);
     setInboxItemsErrorId(null);
 
     authFetch(
-      `${apiBaseUrl}/api/catalogs/items?limit=10000&latest_only=false&catalog_email_id=${encodeURIComponent(emailId)}`
+      `${apiBaseUrl}/api/catalogs/items?limit=500&latest_only=false&catalog_email_id=${encodeURIComponent(emailId)}`
     )
       .then(async (response) => {
         if (!response.ok) {
           throw new Error("Unable to load extracted items.");
         }
         const items: SupplierTableRow[] = await response.json();
-        if (!cancelled) {
+        if (reqId === inboxItemsRequestIdRef.current) {
           setInboxItemsByEmail((current) => ({ ...current, [emailId]: items }));
         }
       })
       .catch((error) => {
         console.error("Inbox item detail refresh failed", error);
-        if (!cancelled) {
+        if (reqId === inboxItemsRequestIdRef.current) {
           setInboxItemsErrorId(emailId);
         }
       })
       .finally(() => {
-        if (!cancelled) {
+        if (reqId === inboxItemsRequestIdRef.current) {
           setInboxItemsLoadingId((current) => current === emailId ? null : current);
         }
       });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeTab, apiBaseUrl, authUser, inboxItemsByEmail, selectedCatalogEmailId, selectedInboxThreadId]);
+  }, [activeTab, apiBaseUrl, authUser?.email, inboxItemsByEmail, selectedCatalogEmailId, selectedInboxThreadId]);
 
   useEffect(() => {
     if (sidebarCollapsed) {
@@ -1740,17 +1785,13 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
   }, [sidebarCollapsed]);
 
   useEffect(() => {
-    let cancelled = false;
-
     async function loadSupplierRows() {
       if (!authUser) {
         setSupplierLoading(false);
         return;
       }
-      if (dataLoadInFlightRef.current) {
-        return;
-      }
-      dataLoadInFlightRef.current = true;
+
+      const reqId = ++supplierRowsRequestIdRef.current;
 
       if (!initialLoadRef.current) {
         setSupplierLoading(true);
@@ -1758,58 +1799,59 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
       setSupplierError(null);
 
       try {
-        const [suppliersRes, itemsRes, emailsRes] = await Promise.all([
+        // Step 1: Instantly unblock Inbox and Dashboard by loading emails and supplier metadata
+        const [suppliersRes, emailsRes] = await Promise.all([
           authFetch(`${apiBaseUrl}/api/suppliers`),
-          authFetch(`${apiBaseUrl}/api/catalogs/items?limit=10000&latest_only=false`),
           authFetch(`${apiBaseUrl}/api/catalogs/emails?limit=100`),
         ]);
+
+        if (reqId !== supplierRowsRequestIdRef.current) return;
 
         if (!emailsRes.ok) {
           throw new Error("Failed to fetch supplier emails from backend.");
         }
 
         const suppliers: SupplierApiRow[] = suppliersRes.ok ? await suppliersRes.json() : [];
-        const items: Array<SupplierItem & { supplier_name: string; email_domain?: string | null }> = itemsRes.ok ? await itemsRes.json() : [];
         const emails: CatalogEmailRow[] = await emailsRes.json();
 
-        const supplierMeta = new Map(
-          suppliers.map((supplier) => [supplierKey(supplier.name, supplier.email_domain), supplier])
-        );
+        setSupplierMetaRows(suppliers);
+        setCatalogEmails(emails);
+        setSupplierError(!suppliersRes.ok ? "Showing fetched emails. Catalogue details are loading." : null);
+        setSupplierLoading(false);
+        initialLoadRef.current = true;
 
-        const mergedRows: SupplierTableRow[] = items.map((item) => {
-          const meta = supplierMeta.get(supplierKey(item.supplier_name, item.email_domain));
-          return {
-            ...item,
-            email_domain: item.email_domain ?? meta?.email_domain ?? "-",
-            country: (item as any).country ?? meta?.country ?? "Unknown",
-            certifications: meta?.certifications ?? null,
-          };
-        });
-
-        if (!cancelled) {
-          setSupplierMetaRows(suppliers);
-          setSupplierRows(mergedRows);
-          setCatalogEmails(emails);
-          setSupplierError(!suppliersRes.ok || !itemsRes.ok ? "Showing fetched emails. Catalogue item details are still loading or unavailable." : null);
-          setSupplierLoading(false);
-          initialLoadRef.current = true;
+        // Step 2: Fetch catalog items in background to unblock Inbox instantly
+        try {
+          const itemsRes = await authFetch(`${apiBaseUrl}/api/catalogs/items?limit=1000&latest_only=true`);
+          if (itemsRes.ok && reqId === supplierRowsRequestIdRef.current) {
+            const items: Array<SupplierItem & { supplier_name: string; email_domain?: string | null }> = await itemsRes.json();
+            const supplierMeta = new Map(
+              suppliers.map((supplier) => [supplierKey(supplier.name, supplier.email_domain), supplier])
+            );
+            const mergedRows: SupplierTableRow[] = items.map((item) => {
+              const meta = supplierMeta.get(supplierKey(item.supplier_name, item.email_domain));
+              return {
+                ...item,
+                email_domain: item.email_domain ?? meta?.email_domain ?? "-",
+                country: (item as any).country ?? meta?.country ?? "Unknown",
+                certifications: meta?.certifications ?? null,
+              };
+            });
+            setSupplierRows(mergedRows);
+          }
+        } catch (itemErr) {
+          console.warn("Background catalog items fetch error:", itemErr);
         }
       } catch (error) {
-        if (!cancelled) {
+        if (reqId === supplierRowsRequestIdRef.current) {
           setSupplierError(error instanceof Error ? error.message : "Unable to load supplier table.");
           setSupplierLoading(false);
         }
-      } finally {
-        dataLoadInFlightRef.current = false;
       }
     }
 
     loadSupplierRows();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [apiBaseUrl, authUser, dataRefreshKey]);
+  }, [apiBaseUrl, authUser?.email, dataRefreshKey]);
 
   useEffect(() => {
     if (!authUser || syncActivityJob?.status !== "running") return;
@@ -4748,10 +4790,10 @@ export default function Home({ params }: { params: Promise<{ tab?: string[] }> }
             <div className="certificate-modal-list">
               {certificateModalItems.map((pdf) => (
                 <button
-                  key={`${pdf.url}-${pdf.name}`}
+                  key={`${pdf.storage_path || pdf.url}-${pdf.name}`}
                   type="button"
                   onClick={() => {
-                    window.open(pdf.url, "_blank", "noopener,noreferrer");
+                    void openCertificatePdf(pdf);
                     setCertificateModalItems(null);
                   }}
                 >

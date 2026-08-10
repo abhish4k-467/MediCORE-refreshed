@@ -74,14 +74,23 @@ PRICE_UPDATE_SENTENCE_PATTERNS = (
         r"(?P<price>\d[\d,]*(?:\.\d+)?)\s*/\s*(?P<price_unit>[A-Za-z]+)",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"\b(?:price|rate)\s+(?:of|for)\s+"
+        r"(?P<product>[A-Za-z0-9][A-Za-z0-9 %().,+/'-]{2,120}?)\s+"
+        r"(?:is|:|-)\s*"
+        r"(?:(?P<currency>US\$|\$|USD|INR|Rs\.?|â‚¹|EUR|â‚¬|GBP|Â£)\s*)?"
+        r"(?P<price>\d[\d,]*(?:\.\d+)?)\s*/\s*(?P<price_unit>[A-Za-z]+)",
+        re.IGNORECASE,
+    ),
 )
 HEADER_UNIT_PATTERN = re.compile(r"(?:quantity|qty|stock|available)\s*(?:\(\s*|\bin\s+)?(?P<unit>[A-Za-z]+)\s*\)?", re.IGNORECASE)
 HEADER_CURRENCY_PATTERN = re.compile(r"(?:price|rate|quote|cost|unit price)\s*\(\s*(?P<currency>[A-Z$â‚¹â‚¬]+)\s*\)", re.IGNORECASE)
-HEADER_MOQ_UNIT_PATTERN = re.compile(r"(?:MOQ|M\.?O\.?Q\.?|minimum order|min qty|minimum quantity)\s*(?:\(\s*|\bin\s+)?(?P<unit>[A-Za-z]+)\s*\)?", re.IGNORECASE)
+HEADER_MOQ_UNIT_PATTERN = re.compile(r"(?:MOQ|M\.?O\.?Q\.?|minimum order|min qty|minimum quantity|packing|packaging|pack size|pack)\s*(?:\(\s*|\bin\s+)?(?P<unit>[A-Za-z]+)\s*\)?", re.IGNORECASE)
 HEADER_LEAD_TIME_UNIT_PATTERN = re.compile(r"(?:lead\s*time|lead|delivery|dispatch|delivery\s*time)\s*(?:\(\s*|\bin\s+)?(?P<unit>days?|weeks?|months?)\s*\)?", re.IGNORECASE)
 HEADER_CURRENCY_PATTERN = re.compile(r"(?:price|rate|quote|cost|unit price|fob|cif|exw|cnf|c&f|ddp|dap)?\s*\(\s*(?P<currency>US\$|USD|INR|Rs\.?|\$|â‚¹|EUR|â‚¬|GBP|Â£|CAD|AUD|SGD|CHF|AED|CNY|JPY)(?:\s*/\s*(?P<unit>[A-Za-z]+))?\s*\)", re.IGNORECASE)
 MOQ_PATTERN = re.compile(
-    r"\b(?:MOQ|M\.?O\.?Q\.?)\s*:?\s*(?P<moq>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>kg|g|mg|ml|l|units?|packs?)\b",
+    r"\b(?:MOQ|M\.?O\.?Q\.?|minimum\s+order|min\s+qty|minimum\s+quantity|packing|packaging|pack\s+size|pack)\s*:?\s*(?P<moq>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>kg|g|mg|ml|l|units?|packs?|bags?|drums?|cartons?)\b"
+    r"|\b(?P<moq2>\d[\d,]*(?:\.\d+)?)\s*(?P<unit2>kg|g|mg|ml|l|units?|packs?|bags?|drums?|cartons?)\s*(?:packing|packaging|pack|bag|drum|carton)\b",
     re.IGNORECASE,
 )
 PRODUCT_CODE_PATTERN = re.compile(r"^[A-Z]{2,}\d{3,}[A-Z0-9-]*$")
@@ -423,6 +432,9 @@ def _parse_price_update_sentence(line: str, context: dict[str, str | None]) -> E
         product = _clean_price_update_product(match.group("product"))
         if not product or _looks_like_header(product):
             continue
+        product_name, specification = _split_product_specification(product)
+        if not product_name:
+            continue
 
         price = _number(match.group("price"))
         if price is None:
@@ -431,13 +443,20 @@ def _parse_price_update_sentence(line: str, context: dict[str, str | None]) -> E
         price_unit = _normalize_unit(match.group("price_unit"))
         currency = _currency_code(match.group("currency") or context.get("currency") or "USD")
         original_price = _display_price_with_header_currency(match.group("price"), currency, price_unit)
+        moq, moq_unit = _extract_moq(line)
         return ExtractedCatalogItem(
-            ingredient_name=product,
+            ingredient_name=product_name,
+            specification=specification,
             price_per_unit=price,
             currency=currency,
             available_qty=None,
             unit=price_unit,
-            notes=_notes(original_price=original_price, source=line[:500].replace(";", ",")),
+            moq=moq,
+            notes=_notes(
+                original_price=original_price,
+                moq_unit=moq_unit,
+                source=line[:500].replace(";", ","),
+            ),
         )
     return None
 
@@ -703,9 +722,9 @@ def _header_map(parts: list[str]) -> dict[str, int]:
         ("unit", ("unit of measure", "pack unit", "pkg unit", "uom", "unit")),
         ("specification", ("product specification description", "specification description", "specification", "spec", "description", "assay", "purity", "grade", "content", "quality", "standard")),
         ("currency", ("currency", "curr")),
-        ("moq", ("moq", "m.o.q", "minimum order", "min order", "min qty", "minimum quantity", "minimum order quantity", "moq (kg)")),
+        ("moq", ("moq", "m.o.q", "minimum order", "min order", "min qty", "minimum quantity", "minimum order quantity", "moq (kg)", "pack", "packing", "packaging", "package", "pack size", "packing (moq)", "moq / packing")),
         ("lead_time", ("lead", "delivery", "dispatch", "lead time", "delivery time", "dispatch time", "ship time", "shipping time", "turnaround")),
-        ("pack", ("pack", "packing", "packaging", "package", "pack size")),
+        ("pack", ("pack", "packing", "packaging", "package", "pack size", "moq", "m.o.q", "minimum order", "min order", "min qty", "minimum quantity", "minimum order quantity", "packing (moq)", "moq / packing")),
     ]
     mapped: dict[str, int] = {}
     for index, part in enumerate(parts):
@@ -744,7 +763,7 @@ def _header_cell_metadata(header: str | None) -> dict[str, str | None]:
 
     if re.search(r"\b(?:fob|cif|exw|cnf|c&f|ddp|dap|price|rate|quote|cost)\b|[$â‚¹â‚¬Â£]\s*/|(?:usd|inr|eur|gbp|cad|aud|sgd|chf|aed|cny|jpy)\s*/", lowered, re.IGNORECASE):
         field = "price"
-    elif re.search(r"\b(?:moq|m\.?\s*o\.?\s*q\.?|minimum\s+order|minimum\s+quantity|min\s+qty|min\s+order)\b", lowered):
+    elif re.search(r"\b(?:moq|m\.?\s*o\.?\s*q\.?|minimum\s+order|minimum\s+quantity|min\s+qty|min\s+order|pack|packing|packaging|pack\s*size)\b", lowered):
         field = "moq"
     elif re.search(r"\b(?:lead|delivery|dispatch|shipping|ship\s*time|turnaround)\b", lowered):
         field = "lead_time"
@@ -1040,10 +1059,20 @@ def _display_price_with_header_currency(value: str, currency: str, unit: str | N
 
 
 def _extract_moq(text: str) -> tuple[float | None, str | None]:
-    match = MOQ_PATTERN.search(text or "")
-    if not match:
+    if not text:
         return None, None
-    return _number(match.group("moq")), _normalize_unit(match.group("unit"))
+    match = MOQ_PATTERN.search(text)
+    if match:
+        moq_str = match.group("moq") or match.group("moq2")
+        unit_str = match.group("unit") or match.group("unit2")
+        return _number(moq_str), _normalize_unit(unit_str) if unit_str else None
+    pack_sz = extract_pack_size(text)
+    if pack_sz:
+        num_m = re.search(r"(\d[\d,]*(?:\.\d+)?)", pack_sz)
+        unit_m = re.search(r"(kg|g|mg|ml|l|units?|packs?|bags?|drums?|cartons?)", pack_sz, re.IGNORECASE)
+        if num_m:
+            return _number(num_m.group(1)), _normalize_unit(unit_m.group(1)) if unit_m else None
+    return None, None
 
 
 def _lead_time_days(text: str) -> int | None:
