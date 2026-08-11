@@ -4,33 +4,38 @@ version = "0.1.0"
 description = "AI-powered supplier catalog ingestion, ranking, and chat system"
 requires-python = ">=3.12,<3.14"
 dependencies = [
-    "celery>=5.4.0",
-    "fastapi>=0.115.0",
-    "google-api-python-client>=2.149.0",
-    "google-auth>=2.35.0",
-    "httpx>=0.27.0",
-    "pdf-inspector>=0.2.6",
-    "psycopg[binary]>=3.2.0",
-    "pydantic-settings>=2.5.0",
-    "pymupdf>=1.24.10",
-    "pytesseract>=0.3.13",
-    "python-multipart>=0.0.9",
-    "redis>=5.0.8",
-    "sqlalchemy>=2.0.35",
-    "supabase>=2.8.0",
-    "uvicorn[standard]==0.30.6",
-    "pandas",
-    "pydantic[email]",
-    "email-validator>=2.2.0",
-    "python-dotenv>=1.2.2",
-    "firecrawl-anydoc>=0.1.7",
-    "gmft>=0.3.0",
-    "rapidocr-onnxruntime>=1.4.4",
+    "celery>=5.4.0", # Owned by backend/app/tasks: async background processing
+    "fastapi>=0.115.0", # Owned by backend/app/api: web API framework
+    "google-api-python-client>=2.149.0", # Owned by backend/app/services/gmail_api.py: Gmail integration
+    "google-auth>=2.35.0", # Owned by backend/app/services/gmail_api.py: authentication
+    "httpx>=0.27.0", # Owned by backend/app/services/llm.py: HTTP client for OpenRouter/APIs
+    "psycopg[binary]>=3.2.0", # Owned by backend/app/database.py: PostgreSQL database driver
+    "pydantic-settings>=2.5.0", # Owned by backend/app/config.py: app configuration management
+    "pymupdf>=1.24.10", # Owned by pipeline/ingestion/loader_pdf.py & classification/page_classifier.py: PDF rendering and text density
+    "python-multipart>=0.0.9", # Owned by backend/app/api: form parsing in FastAPI
+    "redis>=5.0.8", # Owned by backend/app/tasks: Celery message broker and cache
+    "sqlalchemy>=2.0.35", # Owned by backend/app/database.py: ORM and database queries
+    "supabase>=2.8.0", # Owned by backend/app/services/supabase_client.py: Supabase client
+    "uvicorn[standard]==0.30.6", # Owned by backend/app/main.py: ASGI web server
+    "pandas>=2.0.0", # Owned by pipeline/ingestion/loader_xlsx.py & extraction/tables.py: tabular data manipulation
+    "tabulate>=0.9.0", # Owned by pipeline/extraction/tables.py: markdown table formatting
+    "openpyxl>=3.1.0", # Owned by pipeline/ingestion/loader_xlsx.py: Excel (.xlsx) file loader
+    "xlrd>=2.0.1", # Owned by pipeline/ingestion/loader_xlsx.py: Legacy Excel (.xls) file loader
+    "mammoth>=1.8.0", # Owned by pipeline/ingestion/loader_docx.py: Word (.docx) document loader
+    "pillow>=10.0.0", # Owned by pipeline/ingestion/loader_image.py & preprocessing: image manipulation
+    "opencv-contrib-python-headless>=4.10.0", # Owned by pipeline/extraction/tables.py: image contouring for img2table
+    "rich>=13.0.0", # Owned by backend/app/services/terminal_sync_status.py: terminal status reporting
+    "pydantic[email]", # Owned by backend/app/schemas.py: data validation models
+    "email-validator>=2.2.0", # Owned by backend/app/schemas.py: email format validation
+    "python-dotenv>=1.2.2", # Owned by backend/app/config.py: .env file loading
+    "rapidocr-onnxruntime>=1.4.4", # Owned by pipeline/extraction/text_ocr.py: ONNX-based CPU OCR engine
+    "img2table>=2.0.0", # Owned by pipeline/extraction/tables.py: rule-based CPU table extraction
 ]
 
 [project.optional-dependencies]
 dev = [
-    "ruff>=0.6.8",
+    "pytest>=8.0.0", # Owned by tests/: test execution framework
+    "ruff>=0.6.8", # Owned by CI/dev: Python linter and formatter
 ]
 
 [tool.uv]

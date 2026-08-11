@@ -1971,11 +1971,12 @@ class EmailIngestionService:
 
     def _extract_anydoc_embedded_image_text(self, file_path: Path, fallback_format: str | None = None) -> str:
         try:
-            import anydoc
+            from backend.app.pipeline.pipeline import process_document
 
-            document = anydoc.to_document(file_path.read_bytes(), fallback_format)
+            result = process_document(file_path)
+            return result.full_text()
         except Exception:
-            logger.debug("Anydoc embedded asset extraction failed for %s", file_path.name, exc_info=True)
+            logger.debug("Pipeline embedded extraction failed for %s", file_path.name, exc_info=True)
             return ""
 
         image_assets = [
@@ -2283,19 +2284,14 @@ class EmailIngestionService:
 
     def _extract_with_anydoc(self, file_path: Path, fallback_format: str | None = None) -> str:
         try:
-            import anydoc
+            from backend.app.pipeline.pipeline import process_document
 
-            try:
-                text = anydoc.to_markdown(str(file_path))
-            except Exception:
-                if not fallback_format:
-                    raise
-                text = anydoc.to_markdown_bytes(file_path.read_bytes(), fallback_format)
-            text = self._clean_anydoc_markdown(text)
-            logger.info("Anydoc extracted %s characters from %s", len(text), file_path.name)
+            result = process_document(file_path)
+            text = self._clean_anydoc_markdown(result.full_text())
+            logger.info("Pipeline extracted %s characters from %s", len(text), file_path.name)
             return text
         except Exception:
-            logger.exception("Anydoc extraction failed for %s", file_path.name)
+            logger.exception("Pipeline extraction failed for %s", file_path.name)
             return ""
 
     def _clean_anydoc_markdown(self, text: str | None) -> str:

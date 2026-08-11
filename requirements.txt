@@ -1,23 +1,52 @@
+# Owned by backend/app/tasks: async background processing
 celery>=5.4.0
+# Owned by backend/app/api: web API framework
 fastapi>=0.115.0
+# Owned by backend/app/services/gmail_api.py: Gmail integration
 google-api-python-client>=2.149.0
+# Owned by backend/app/services/gmail_api.py: authentication
 google-auth>=2.35.0
+# Owned by backend/app/services/llm.py: HTTP client for OpenRouter/APIs
 httpx>=0.27.0
-markitdown>=0.1.2
-pdf-inspector>=0.2.6
+# Owned by backend/app/database.py: PostgreSQL database driver
 psycopg[binary]>=3.2.0
+# Owned by backend/app/config.py: app configuration management
 pydantic-settings>=2.5.0
+# Owned by pipeline/ingestion/loader_pdf.py & classification/page_classifier.py: PDF rendering and text density
 pymupdf>=1.24.10
+# Owned by backend/app/api: form parsing in FastAPI
 python-multipart>=0.0.9
+# Owned by backend/app/tasks: Celery message broker and cache
 redis>=5.0.8
+# Owned by backend/app/database.py: ORM and database queries
 sqlalchemy>=2.0.35
+# Owned by backend/app/services/supabase_client.py: Supabase client
 supabase>=2.8.0
+# Owned by backend/app/main.py: ASGI web server
 uvicorn[standard]==0.30.6
-pandas
-openpyxl
-xlrd
-mammoth
+# Owned by pipeline/ingestion/loader_xlsx.py & extraction/tables.py: tabular data manipulation
+pandas>=2.0.0
+# Owned by pipeline/extraction/tables.py: markdown table formatting
+tabulate>=0.9.0
+# Owned by pipeline/ingestion/loader_xlsx.py: Excel (.xlsx) file loader
+openpyxl>=3.1.0
+# Owned by pipeline/ingestion/loader_xlsx.py: Legacy Excel (.xls) file loader
+xlrd>=2.0.1
+# Owned by pipeline/ingestion/loader_docx.py: Word (.docx) document loader
+mammoth>=1.8.0
+# Owned by pipeline/ingestion/loader_image.py & preprocessing: image manipulation
+pillow>=10.0.0
+# Owned by pipeline/extraction/tables.py: image contouring for img2table
+opencv-contrib-python-headless>=4.10.0
+# Owned by backend/app/services/terminal_sync_status.py: terminal status reporting
+rich>=13.0.0
+# Owned by backend/app/schemas.py: data validation models
 pydantic[email]
+# Owned by backend/app/schemas.py: email format validation
 email-validator>=2.2.0
-python-dotenv
-gmft>=0.3.0
+# Owned by backend/app/config.py: .env file loading
+python-dotenv>=1.2.2
+# Owned by pipeline/extraction/text_ocr.py: ONNX-based CPU OCR engine
+rapidocr-onnxruntime>=1.4.4
+# Owned by pipeline/extraction/tables.py: rule-based CPU table extraction
+img2table>=2.0.0
